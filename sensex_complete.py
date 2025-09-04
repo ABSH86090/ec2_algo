@@ -272,14 +272,48 @@ class StrategyEngine:
         return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / sum(volumes[-period:])
 
     def detect_pattern(self, candles):
-        if len(candles) < 5: return False
-        last5 = list(candles)[-5:]
-        def is_red(c): return c["close"] <= c["open"]
-        def is_green(c): return c["close"] > c["open"]
-        if not (is_red(last5[0]) and is_green(last5[1]) and is_red(last5[2]) and is_green(last5[3]) and is_red(last5[4])):
+        
+        """
+        Pattern (last 6 candles):
+        R, R, G, R, G, R
+        Constraint:
+        close[2nd red] < close[1st red]
+        Additional filter (built-in here):
+        For each of these 6 candles, EMA5 < VWMA20 when computed on data up to that candle.
+        """
+        n = len(candles)
+        if n < 6:
             return False
-        lowest4 = min(c["close"] for c in last5[:4])
-        return last5[4]["close"] < lowest4
+
+        # Color checks on the last 6 candles
+        last6 = list(candles)[-6:]
+        def is_red(c):   return c["close"] <= c["open"]
+        def is_green(c): return c["close"] > c["open"]
+
+        c0, c1, c2, c3, c4, c5 = last6  # oldest -> newest
+        if not (is_red(c0) and is_red(c1) and is_green(c2) and is_red(c3) and is_green(c4) and is_red(c5)):
+            return False
+
+        # 2nd red close < 1st red close
+        if not (c1["close"] < c0["close"]):
+            return False
+
+        # Ensure EMA5 < VWMA20 at EACH step of these 6 candles.
+        # We compute indicators using all data up to that candle (inclusive).
+        # Need enough history for VWMA20; if not available at any step, fail.
+        closes = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        start_idx = n - 6  # index of c0 in the full series
+        for i in range(start_idx, n):  # iterate c0..c5 (inclusive)
+            ema5  = self.compute_ema(closes[:i+1], 5)
+            vwma20 = self.compute_vwma(closes[:i+1], volumes[:i+1], 20)
+            if ema5 is None or vwma20 is None:
+                return False  # not enough history to validate the rule
+            if not (ema5 < vwma20):
+                return False
+
+        return True
 
     def detect_new_short_strategy(self, candles, ema5, vwma20):
         if len(candles) < 3: return None
@@ -294,6 +328,12 @@ class StrategyEngine:
             vwma20 > ema5 and
             is_red(c3) and c3["high"] >= vwma20 and
             c3["close"] < ema5 and c3["close"] < vwma20):
+            entry = c3["close"]
+            sl    = c3["high"] + 5
+
+            if (sl - entry) > 60:
+                logging.info(f"[STRAT2] Skipped due to wide SL: {sl-entry:.2f} pts")
+                return None
             return {"entry": c3["close"], "sl": c3["high"] + 5}
         return None
 
@@ -338,16 +378,19 @@ class StrategyEngine:
         if position is None and self.detect_pattern(candles) and ema5 < vwma20:
             entry_price = candles[-1]["close"]
             sl_price = candles[-1]["high"] + 2
-            self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
-            sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
-            # Store entry & SL for later comparison/journaling
-            self.positions[symbol] = {
-                "sl_order": sl_resp,
-                "strategy": "strat1",
-                "entry_price": entry_price,
-                "sl_price": sl_price
-            }
-            log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price)
+            if (sl_price - entry_price) > 60:
+                logging.info(f"[STRAT1] Skipped due to wide SL: {sl_price-entry_price:.2f} pts")
+            else:
+                self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
+                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
+                # Store entry & SL for later comparison/journaling
+                self.positions[symbol] = {
+                    "sl_order": sl_resp,
+                    "strategy": "strat1",
+                    "entry_price": entry_price,
+                    "sl_price": sl_price
+                }
+                log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price)
 
         # STRAT2
         if position is None:
