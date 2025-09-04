@@ -1,0 +1,7 @@
+timestamp,symbol,action,strategy,entry_price,sl_price,exit_price,remarks
+2025-09-04 11:09:02,BSE:SENSEX2590481100CE,ENTRY,strat1,93.05,115.45,,
+2025-09-04 11:30:01,BSE:SENSEX2590481100CE,EXIT,strat1,,,107.2,Exit condition met
+2025-09-04 13:24:02,BSE:SENSEX2590481100PE,ENTRY,strat2,164.5,207.25,,
+2025-09-04 13:36:01,BSE:SENSEX2590481100PE,SL_HIT,strat2,,,,"{'s': 'ok', 'trades': {'tradeNumber': '25090400345554-47135650', 'orderNumber': '25090400345554', 'tradedQty': 20, 'tradePrice': 189.5, 'tradeValue': 3790, 'productType': 'INTRADAY', 'clientId': 'XA08720', 'exchangeOrderNo': '1756973081868433827', 'orderType': 1, 'side': 1, 'symbol': 'BSE:SENSEX2590481100PE', 'orderDateTime': '04-09-2025 13:36:02', 'fyToken': '1211250904857100', 'exchange': 12, 'segment': 11, 'orderTag': '1:EXITCOND'}}"
+2025-09-04 14:57:02,BSE:SENSEX2590481100PE,ENTRY,strat1,273.35,384.6,,
+2025-09-04 15:04:47,BSE:SENSEX2590481100PE,SL_HIT,strat1,,,,"{'s': 'ok', 'trades': {'tradeNumber': '25090400453504-55082600', 'orderNumber': '25090400453504', 'tradedQty': 20, 'tradePrice': 384.85, 'tradeValue': 7697, 'productType': 'INTRADAY', 'clientId': 'XA08720', 'exchangeOrderNo': '1756977948639392310', 'orderType': 1, 'side': 1, 'symbol': 'BSE:SENSEX2590481100PE', 'orderDateTime': '04-09-2025 15:04:48', 'fyToken': '1211250904857100', 'exchange': 12, 'segment': 11, 'orderTag': '1:STRAT1SL'}}"
