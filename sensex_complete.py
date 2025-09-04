@@ -226,6 +226,8 @@ class StrategyEngine:
         self.positions = {}
         self.sl_count = 0
         self.candles = defaultdict(lambda: deque(maxlen=200))
+        # Track if Strategy 3 has been fired for a symbol on a given date
+        self.s3_fired_date = {}  # { symbol: date }
 
     def prefill_history(self, symbols, days_back=1):
         """Prefill candles with historical data for warm start."""
@@ -272,50 +274,41 @@ class StrategyEngine:
         return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / sum(volumes[-period:])
 
     def detect_pattern(self, candles):
-        
         """
-        Pattern (last 6 candles):
-        R, R, G, R, G, R
-        Constraint:
-        close[2nd red] < close[1st red]
-        Additional filter (built-in here):
-        For each of these 6 candles, EMA5 < VWMA20 when computed on data up to that candle.
+        Strategy 1 pattern (last 6 candles):
+        R, R, G, R, G, R and close[2nd red] < close[1st red]; EMA5 < VWMA20 for each of the 6.
         """
         n = len(candles)
         if n < 6:
             return False
 
-        # Color checks on the last 6 candles
         last6 = list(candles)[-6:]
         def is_red(c):   return c["close"] <= c["open"]
         def is_green(c): return c["close"] > c["open"]
 
-        c0, c1, c2, c3, c4, c5 = last6  # oldest -> newest
+        c0, c1, c2, c3, c4, c5 = last6
         if not (is_red(c0) and is_red(c1) and is_green(c2) and is_red(c3) and is_green(c4) and is_red(c5)):
             return False
 
-        # 2nd red close < 1st red close
         if not (c1["close"] < c0["close"]):
             return False
 
-        # Ensure EMA5 < VWMA20 at EACH step of these 6 candles.
-        # We compute indicators using all data up to that candle (inclusive).
-        # Need enough history for VWMA20; if not available at any step, fail.
         closes = [c["close"] for c in candles]
         volumes = [c["volume"] for c in candles]
 
-        start_idx = n - 6  # index of c0 in the full series
-        for i in range(start_idx, n):  # iterate c0..c5 (inclusive)
+        start_idx = n - 6
+        for i in range(start_idx, n):
             ema5  = self.compute_ema(closes[:i+1], 5)
             vwma20 = self.compute_vwma(closes[:i+1], volumes[:i+1], 20)
             if ema5 is None or vwma20 is None:
-                return False  # not enough history to validate the rule
+                return False
             if not (ema5 < vwma20):
                 return False
 
         return True
 
     def detect_new_short_strategy(self, candles, ema5, vwma20):
+        # Strategy 2 (existing)
         if len(candles) < 3: return None
         if ema5 is None or vwma20 is None:
             return None
@@ -336,6 +329,63 @@ class StrategyEngine:
                 return None
             return {"entry": c3["close"], "sl": c3["high"] + 5}
         return None
+
+    # -------- Strategy 3 detection (9:15 green, 9:18 red, EMA<VWMA) --------
+    def detect_strategy3(self, symbol, candles):
+        today = datetime.date.today()
+        # Avoid re-firing multiple times in the same day for the same symbol
+        if self.s3_fired_date.get(symbol) == today:
+            return None
+
+        # Filter today's candles from 9:15 onwards
+        todays = [c for c in candles if c["time"].date() == today and c["time"].time() >= TRADING_START]
+        if len(todays) < 2:
+            return None
+
+        c1 = todays[0]  # expected 9:15
+        c2 = todays[1]  # expected 9:18
+
+        if not (c1["time"].time() == datetime.time(9, 15) and c2["time"].time() == datetime.time(9, 18)):
+            return None
+
+        # Color checks
+        if not (c1["close"] > c1["open"]):  # first candle green
+            return None
+        if not (c2["close"] < c2["open"]):  # second candle red
+            return None
+
+        # Indicator checks at c1 close and c2 close
+        closes = [c["close"] for c in candles]
+        volumes = [c["volume"] for c in candles]
+
+        try:
+            idx1 = candles.index(c1)
+            idx2 = candles.index(c2)
+        except ValueError:
+            return None
+
+        ema1 = self.compute_ema(closes[:idx1+1], 5)
+        vw1  = self.compute_vwma(closes[:idx1+1], volumes[:idx1+1], 20)
+        if ema1 is None or vw1 is None or not (ema1 < vw1):
+            return None  # VWMA must be higher than EMA at 9:15 close
+
+        ema2 = self.compute_ema(closes[:idx2+1], 5)
+        vw2  = self.compute_vwma(closes[:idx2+1], volumes[:idx2+1], 20)
+        if ema2 is None or vw2 is None:
+            return None
+
+        # 9:18 red candle close must be below both EMA and VWMA
+        if not (c2["close"] < ema2 and c2["close"] < vw2):
+            return None
+
+        entry = c2["low"]
+        sl    = c2["high"] + 5
+
+        if (sl - entry) > 60:
+            logging.info(f"[STRAT3] Skipped due to wide SL: {sl-entry:.2f} pts")
+            return None
+
+        return {"entry": entry, "sl": sl, "date": today}
 
     def reconcile_position(self, symbol):
         """Check broker positions to ensure internal state is correct."""
@@ -374,7 +424,24 @@ class StrategyEngine:
 
         position = self.positions.get(symbol)
 
-        # STRAT1
+        # -------- STRATEGY 3 (runs as soon as we have the 9:18 candle) --------
+        if position is None:
+            s3 = self.detect_strategy3(symbol, candles)
+            if s3:
+                self.fyers.place_limit_sell(symbol, self.lot_size, s3["entry"], "STRAT3ENTRY")
+                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, s3["sl"], "STRAT3SL")
+                self.positions[symbol] = {
+                    "sl_order": sl_resp,
+                    "strategy": "strat3",
+                    "entry_price": s3["entry"],
+                    "sl_price": s3["sl"]
+                }
+                self.s3_fired_date[symbol] = s3["date"]
+                log_to_journal(symbol, "ENTRY", "strat3", entry=s3["entry"], sl=s3["sl"])
+                logging.info(f"[STRAT3] ENTRY @{s3['entry']} SL @{s3['sl']} for {symbol}")
+
+        # -------- STRATEGY 1 --------
+        position = self.positions.get(symbol)
         if position is None and self.detect_pattern(candles) and ema5 < vwma20:
             entry_price = candles[-1]["close"]
             sl_price = candles[-1]["high"] + 2
@@ -383,7 +450,6 @@ class StrategyEngine:
             else:
                 self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
                 sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
-                # Store entry & SL for later comparison/journaling
                 self.positions[symbol] = {
                     "sl_order": sl_resp,
                     "strategy": "strat1",
@@ -392,7 +458,8 @@ class StrategyEngine:
                 }
                 log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price)
 
-        # STRAT2
+        # -------- STRATEGY 2 --------
+        position = self.positions.get(symbol)
         if position is None:
             strat2 = self.detect_new_short_strategy(candles, ema5, vwma20)
             if strat2:
@@ -406,7 +473,7 @@ class StrategyEngine:
                 }
                 log_to_journal(symbol, "ENTRY", "strat2", entry=strat2["entry"], sl=strat2["sl"])
 
-        # EXIT conditions
+        # -------- EXIT conditions (common) --------
         position = self.positions.get(symbol)
         if position and candle["close"] > ema5 and candle["close"] > vwma20 and candle["close"] > candle["open"]:
             sl_order_id = position["sl_order"].get("id") if position["sl_order"] else None
@@ -415,11 +482,10 @@ class StrategyEngine:
                 cancel_resp = self.fyers.cancel_order(sl_order_id)
                 if cancel_resp.get("s") == "ok":
                     self.fyers.place_market_buy(symbol, self.lot_size, "EXITCOND")
-                    # --- Treat exit as SL if exit_price > entry_price (loss on short) ---
                     entry_price = position.get("entry_price")
                     sl_price = position.get("sl_price")
                     if entry_price is not None and exit_price > entry_price:
-                        # Count as SL hit
+                        # Treat as SL if loss on short
                         self.sl_count += 1
                         log_to_journal(
                             symbol, "SL_HIT", position["strategy"],
@@ -435,7 +501,6 @@ class StrategyEngine:
                     self.positions[symbol] = None
                 else:
                     logging.warning(f"[EXIT SKIPPED] {symbol} - Cancel failed: {cancel_resp}")
-                    # ✅ Reconcile with broker
                     self.reconcile_position(symbol)
 
     def on_trade(self, msg):
@@ -444,7 +509,6 @@ class StrategyEngine:
         side = msg["trades"].get("side")
         position = self.positions.get(symbol)
         if position and side == 1:  # SL Buy executed
-            # Keep existing SL logging; include stored entry/sl for completeness
             log_to_journal(
                 symbol, "SL_HIT", position["strategy"],
                 entry=position.get("entry_price"), sl=position.get("sl_price"),
