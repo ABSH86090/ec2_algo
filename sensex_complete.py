@@ -308,27 +308,88 @@ class StrategyEngine:
         return True
 
     def detect_new_short_strategy(self, candles, ema5, vwma20):
-        # Strategy 2 (existing)
-        if len(candles) < 3: return None
+        """
+        Strategy 2 (updated):
+        - Global: require ema5 < vwma20 (no % gap globally)
+        - Per-candle:
+            * c1 (green): EMA5 < VWMA (no gap)
+            * c2 (green): VWMA(c2) >= EMA(c2) * (1 + 0.01)
+        - Additional: VWMA(c2) > VWMA(c3)
+        - Red candle: VWMA(c3) >= EMA(c3) * (1 + 0.02)
+        - Keep: c3 touches VWMA, and closes below both EMA & VWMA; SL width <= 60
+        - Logs all intermediate EMA/VWMA values for debugging
+        """
+        GAP_GREEN2 = 0.01  # 1% gap for 2nd green candle
+        GAP_RED = 0.02     # 2% gap for red candle
+
+        if len(candles) < 3:
+            return None
         if ema5 is None or vwma20 is None:
             return None
-        if not (ema5 < vwma20 and vwma20 >= ema5 * 1.02):
+
+        # Global trend filter (no percentage gap required here)
+        if not (ema5 < vwma20):
+            logging.info(f"[STRAT2] blocked: global ema5={ema5:.2f} >= vwma20={vwma20:.2f}")
             return None
+
         c1, c2, c3 = candles[-3], candles[-2], candles[-1]
         is_green = lambda c: c["close"] > c["open"]
-        is_red = lambda c: c["close"] < c["open"]
-        if (is_green(c1) and is_green(c2) and
-            vwma20 > ema5 and
-            is_red(c3) and c3["high"] >= vwma20 and
-            c3["close"] < ema5 and c3["close"] < vwma20):
-            entry = c3["close"]
-            sl    = c3["high"] + 5
+        is_red   = lambda c: c["close"] < c["open"]
 
-            if (sl - entry) > 60:
-                logging.info(f"[STRAT2] Skipped due to wide SL: {sl-entry:.2f} pts")
-                return None
-            return {"entry": c3["close"], "sl": c3["high"] + 5}
-        return None
+        if not (is_green(c1) and is_green(c2) and is_red(c3)):
+            logging.info(f"[STRAT2] blocked: pattern mismatch -> c1({c1['open']},{c1['close']}), c2({c2['open']},{c2['close']}), c3({c3['open']},{c3['close']})")
+            return None
+
+        closes = [c["close"] for c in candles]
+        vols   = [c.get("volume", 0) for c in candles]
+
+        idx1, idx2, idx3 = len(closes) - 3, len(closes) - 2, len(closes) - 1
+
+        ema_c1 = self.compute_ema(closes[:idx1+1], 5)
+        vw_c1  = self.compute_vwma(closes[:idx1+1], vols[:idx1+1], 20)
+        ema_c2 = self.compute_ema(closes[:idx2+1], 5)
+        vw_c2  = self.compute_vwma(closes[:idx2+1], vols[:idx2+1], 20)
+        ema_c3 = self.compute_ema(closes[:idx3+1], 5)
+        vw_c3  = self.compute_vwma(closes[:idx3+1], vols[:idx3+1], 20)
+
+        logging.info(f"[STRAT2] c1: ema={ema_c1}, vwma={vw_c1}; c2: ema={ema_c2}, vwma={vw_c2}; c3: ema={ema_c3}, vwma={vw_c3}")
+
+        if None in (ema_c1, vw_c1, ema_c2, vw_c2, ema_c3, vw_c3):
+            logging.info("[STRAT2] blocked: missing indicator values")
+            return None
+
+        if not (ema_c1 < vw_c1):
+            logging.info(f"[STRAT2] blocked: c1 ema>=vwma (ema={ema_c1}, vwma={vw_c1})")
+            return None
+
+        if not (vw_c2 >= ema_c2 * (1 + GAP_GREEN2)):
+            logging.info(f"[STRAT2] blocked: c2 gap failed (ema={ema_c2}, vwma={vw_c2})")
+            return None
+
+        if not (vw_c2 > vw_c3):
+            logging.info(f"[STRAT2] blocked: vwma(c2)={vw_c2} <= vwma(c3)={vw_c3}")
+            return None
+
+        if not (vw_c3 >= ema_c3 * (1 + GAP_RED)):
+            logging.info(f"[STRAT2] blocked: red candle gap failed (ema={ema_c3}, vwma={vw_c3})")
+            return None
+
+        if not (c3["high"] >= vwma20):
+            logging.info(f"[STRAT2] blocked: c3.high {c3['high']} < vwma20 {vwma20}")
+            return None
+        if not (c3["close"] < ema5 and c3["close"] < vwma20):
+            logging.info(f"[STRAT2] blocked: c3.close {c3['close']} not below ema5 {ema5}, vwma20 {vwma20}")
+            return None
+
+        entry = c3["close"]
+        sl    = c3["high"] + 5
+
+        if (sl - entry) > 60:
+            logging.info(f"[STRAT2] Skipped due to wide SL: {sl-entry:.2f} pts")
+            return None
+
+        logging.info(f"[STRAT2] Triggered: entry={entry}, sl={sl}")
+        return {"entry": entry, "sl": sl}
 
     # -------- Strategy 3 detection (9:15 green, 9:18 red, EMA<VWMA) --------
     def detect_strategy3(self, symbol, candles):
