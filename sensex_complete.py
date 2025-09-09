@@ -2,6 +2,7 @@ import datetime
 import logging
 import csv
 import os
+import time
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
@@ -37,7 +38,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-# ---------------- JOURNAL FUNCTION ----------------
+# ---------------- Helpers ----------------
 def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None, remarks=""):
     with open(JOURNAL_FILE, mode="a", newline="") as f:
         writer = csv.writer(f)
@@ -46,12 +47,57 @@ def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None
             symbol, action, strategy, entry, sl, exit, remarks
         ])
 
+def _extract_order_id(resp):
+    """Try common places where fyers place_order/cancel may return an id."""
+    if not isinstance(resp, dict):
+        return None
+    # direct id
+    if "id" in resp and resp.get("id"):
+        return str(resp.get("id"))
+    # nested orders dict
+    orders = resp.get("orders")
+    if isinstance(orders, dict):
+        if "id" in orders and orders.get("id"):
+            return str(orders.get("id"))
+        # sometimes 'orders' is a list
+        if "order" in orders and isinstance(orders.get("order"), dict) and orders["order"].get("id"):
+            return str(orders["order"].get("id"))
+    # orderNumStatus like "25090900232324:1"
+    ons = resp.get("orderNumStatus") or resp.get("orderNumStatusMessage")
+    if isinstance(ons, str):
+        if ":" in ons:
+            return ons.split(":")[0]
+        return ons
+    # Sometimes inside 'data' / 'd' structures:
+    if "d" in resp:
+        try:
+            d = resp["d"]
+            if isinstance(d, list) and len(d) > 0 and isinstance(d[0], dict) and d[0].get("id"):
+                return str(d[0].get("id"))
+        except Exception:
+            pass
+    return None
+
+def _is_cancel_success(resp):
+    """Return True if response indicates cancel succeeded (including broker quirks)."""
+    if not resp:
+        return False
+    if isinstance(resp, dict):
+        # canonical success
+        if resp.get("s") == "ok":
+            return True
+        # broker-specific returned message/code that still means cancelled
+        msg = str(resp.get("message") or "").lower()
+        code = resp.get("code")
+        if "order cancelled" in msg or "already cancelled" in msg or code == -99:
+            return True
+    return False
+
 # ---------------- EXPIRY & SYMBOL UTILS ----------------
 def get_next_expiry():
     """Return expiry date (Thursday) for SENSEX options."""
     today = datetime.date.today()
     weekday = today.weekday()  # Monday=0 ... Sunday=6
-
     if weekday == 3:  # Thursday
         expiry = today
     else:
@@ -68,26 +114,6 @@ def format_expiry(expiry_date):
         return f"{yy}{m}{d:02d}"   # YYMDD
     else:
         return f"{yy}{m:02d}{d:02d}"  # YYMMDD
-
-def get_atm_symbols(fyers_client):
-    """Fetch SENSEX spot, round to ATM strike, and build CE/PE option symbols."""
-    data = {"symbols": "BSE:SENSEX-INDEX"}
-    resp = fyers_client.client.quotes(data)
-    if not resp.get("d"):
-        raise Exception(f"Failed to fetch SENSEX spot: {resp}")
-
-    ltp = float(resp["d"][0]["v"]["lp"])  # last traded price
-    atm_strike = round(ltp / 100) * 100   # nearest 100
-
-    expiry = get_next_expiry()
-    expiry_str = format_expiry(expiry)
-
-    ce_symbol = f"BSE:SENSEX{expiry_str}{atm_strike}CE"
-    pe_symbol = f"BSE:SENSEX{expiry_str}{atm_strike}PE"
-
-    print(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
-    logging.info(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
-    return [ce_symbol, pe_symbol]
 
 # ---------------- FYERS CLIENT ----------------
 class FyersClient:
@@ -135,18 +161,27 @@ class FyersClient:
         return self._log_order_resp("Market Buy", self.client.place_order(data))
 
     def cancel_order(self, order_id: str):
-        return self._log_order_resp("Cancel Order", self.client.cancel_order({"id": order_id}))
+        resp = self.client.cancel_order({"id": order_id})
+        logging.info(f"Cancel Order Response: {resp}")
+        print(f"Cancel Order Response: {resp}")
+        return resp
 
     def start_order_socket(self):
         def on_order(msg):
             logging.info(f"Order update: {msg}")
             for cb in self.order_callbacks:
-                cb(msg)
+                try:
+                    cb(msg)
+                except Exception as e:
+                    logging.exception(f"order callback exception: {e}")
 
         def on_trade(msg):
             logging.info(f"Trade update: {msg}")
             for cb in self.trade_callbacks:
-                cb(msg)
+                try:
+                    cb(msg)
+                except Exception as e:
+                    logging.exception(f"trade callback exception: {e}")
 
         def on_open():
             fyers.subscribe(data_type="OnOrders,OnTrades")
@@ -223,10 +258,9 @@ class StrategyEngine:
     def __init__(self, fyers_client: FyersClient, lot_size: int = 20):
         self.fyers = fyers_client
         self.lot_size = lot_size
-        self.positions = {}
+        self.positions = {}  # { symbol: { strategy, sl_order: {id, resp}, entry_order: {...}, entry_price, sl_price } }
         self.sl_count = 0
         self.candles = defaultdict(lambda: deque(maxlen=200))
-        # Track if Strategy 3 has been fired for a symbol on a given date
         self.s3_fired_date = {}  # { symbol: date }
 
     def prefill_history(self, symbols, days_back=1):
@@ -271,7 +305,10 @@ class StrategyEngine:
 
     def compute_vwma(self, closes, volumes, period):
         if len(closes) < period: return None
-        return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / sum(volumes[-period:])
+        denom = sum(volumes[-period:])
+        if denom == 0:
+            return None
+        return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / denom
 
     def detect_pattern(self, candles):
         """
@@ -308,28 +345,12 @@ class StrategyEngine:
         return True
 
     def detect_new_short_strategy(self, candles, ema5, vwma20):
-        """
-        Strategy 2 (updated):
-        - Global: require ema5 < vwma20 (no % gap globally)
-        - Per-candle:
-            * c1 (green): EMA5 < VWMA (no gap)
-            * c2 (green): VWMA(c2) >= EMA(c2) * (1 + 0.01)
-        - Additional: VWMA(c2) > VWMA(c3)
-        - Red candle: VWMA(c3) >= EMA(c3) * (1 + 0.02)
-        - Keep: c3 touches VWMA, and closes below both EMA & VWMA; SL width <= 60
-        - Logs all intermediate EMA/VWMA values for debugging
-        """
         GAP_GREEN2 = 0.01  # 1% gap for 2nd green candle
         GAP_RED = 0.02     # 2% gap for red candle
 
         if len(candles) < 3:
             return None
         if ema5 is None or vwma20 is None:
-            return None
-
-        # Global trend filter (no percentage gap required here)
-        if not (ema5 < vwma20):
-            logging.info(f"[STRAT2] blocked: global ema5={ema5:.2f} >= vwma20={vwma20:.2f}")
             return None
 
         c1, c2, c3 = candles[-3], candles[-2], candles[-1]
@@ -391,31 +412,26 @@ class StrategyEngine:
         logging.info(f"[STRAT2] Triggered: entry={entry}, sl={sl}")
         return {"entry": entry, "sl": sl}
 
-    # -------- Strategy 3 detection (9:15 green, 9:18 red, EMA<VWMA) --------
     def detect_strategy3(self, symbol, candles):
         today = datetime.date.today()
-        # Avoid re-firing multiple times in the same day for the same symbol
         if self.s3_fired_date.get(symbol) == today:
             return None
 
-        # Filter today's candles from 9:15 onwards
         todays = [c for c in candles if c["time"].date() == today and c["time"].time() >= TRADING_START]
         if len(todays) < 2:
             return None
 
-        c1 = todays[0]  # expected 9:15
-        c2 = todays[1]  # expected 9:18
+        c1 = todays[0]
+        c2 = todays[1]
 
         if not (c1["time"].time() == datetime.time(9, 15) and c2["time"].time() == datetime.time(9, 18)):
             return None
 
-        # Color checks
-        if not (c1["close"] > c1["open"]):  # first candle green
+        if not (c1["close"] > c1["open"]):
             return None
-        if not (c2["close"] < c2["open"]):  # second candle red
+        if not (c2["close"] < c2["open"]):
             return None
 
-        # Indicator checks at c1 close and c2 close
         closes = [c["close"] for c in candles]
         volumes = [c["volume"] for c in candles]
 
@@ -428,14 +444,13 @@ class StrategyEngine:
         ema1 = self.compute_ema(closes[:idx1+1], 5)
         vw1  = self.compute_vwma(closes[:idx1+1], volumes[:idx1+1], 20)
         if ema1 is None or vw1 is None or not (ema1 < vw1):
-            return None  # VWMA must be higher than EMA at 9:15 close
+            return None
 
         ema2 = self.compute_ema(closes[:idx2+1], 5)
         vw2  = self.compute_vwma(closes[:idx2+1], volumes[:idx2+1], 20)
         if ema2 is None or vw2 is None:
             return None
 
-        # 9:18 red candle close must be below both EMA and VWMA
         if not (c2["close"] < ema2 and c2["close"] < vw2):
             return None
 
@@ -456,7 +471,7 @@ class StrategyEngine:
                 net_positions = resp.get("netPositions", [])
                 open_qty = 0
                 for pos in net_positions:
-                    if pos["symbol"] == symbol:
+                    if pos.get("symbol") == symbol or pos.get("symbol", "").startswith(symbol):
                         open_qty = pos.get("netQty", 0)
                         break
                 if open_qty == 0:
@@ -472,7 +487,8 @@ class StrategyEngine:
         volumes = [c["volume"] for c in candles]
         ema5 = self.compute_ema(closes, 5)
         vwma20 = self.compute_vwma(closes, volumes, 20)
-        if ema5 is None or vwma20 is None: return
+        if ema5 is None or vwma20 is None:
+            return
 
         logging.info(
             f"[Candle] {symbol} {candle['time']} EMA5={ema5:.2f}, "
@@ -480,8 +496,10 @@ class StrategyEngine:
         )
 
         now = datetime.datetime.now().time()
-        if not (TRADING_START <= now <= TRADING_END): return
-        if self.sl_count >= MAX_SLS_PER_DAY: return
+        if not (TRADING_START <= now <= TRADING_END):
+            return
+        if self.sl_count >= MAX_SLS_PER_DAY:
+            return
 
         position = self.positions.get(symbol)
 
@@ -489,10 +507,13 @@ class StrategyEngine:
         if position is None:
             s3 = self.detect_strategy3(symbol, candles)
             if s3:
-                self.fyers.place_limit_sell(symbol, self.lot_size, s3["entry"], "STRAT3ENTRY")
-                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, s3["sl"], "STRAT3SL")
+                raw_entry_resp = self.fyers.place_limit_sell(symbol, self.lot_size, s3["entry"], "STRAT3ENTRY")
+                raw_sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, s3["sl"], "STRAT3SL")
+                sl_order_id = _extract_order_id(raw_sl_resp)
+                entry_order_id = _extract_order_id(raw_entry_resp)
                 self.positions[symbol] = {
-                    "sl_order": sl_resp,
+                    "sl_order": {"id": sl_order_id, "resp": raw_sl_resp},
+                    "entry_order": {"id": entry_order_id, "resp": raw_entry_resp},
                     "strategy": "strat3",
                     "entry_price": s3["entry"],
                     "sl_price": s3["sl"]
@@ -509,10 +530,13 @@ class StrategyEngine:
             if (sl_price - entry_price) > 60:
                 logging.info(f"[STRAT1] Skipped due to wide SL: {sl_price-entry_price:.2f} pts")
             else:
-                self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
-                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
+                raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
+                raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
+                sl_order_id = _extract_order_id(raw_sl)
+                entry_order_id = _extract_order_id(raw_entry)
                 self.positions[symbol] = {
-                    "sl_order": sl_resp,
+                    "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                    "entry_order": {"id": entry_order_id, "resp": raw_entry},
                     "strategy": "strat1",
                     "entry_price": entry_price,
                     "sl_price": sl_price
@@ -524,10 +548,13 @@ class StrategyEngine:
         if position is None:
             strat2 = self.detect_new_short_strategy(candles, ema5, vwma20)
             if strat2:
-                self.fyers.place_limit_sell(symbol, self.lot_size, strat2["entry"], "STRAT2ENTRY")
-                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, strat2["sl"], "STRAT2SL")
+                raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, strat2["entry"], "STRAT2ENTRY")
+                raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, strat2["sl"], "STRAT2SL")
+                sl_order_id = _extract_order_id(raw_sl)
+                entry_order_id = _extract_order_id(raw_entry)
                 self.positions[symbol] = {
-                    "sl_order": sl_resp,
+                    "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                    "entry_order": {"id": entry_order_id, "resp": raw_entry},
                     "strategy": "strat2",
                     "entry_price": strat2["entry"],
                     "sl_price": strat2["sl"]
@@ -537,57 +564,91 @@ class StrategyEngine:
         # -------- EXIT conditions (common) --------
         position = self.positions.get(symbol)
         if position and candle["close"] > ema5 and candle["close"] > vwma20 and candle["close"] > candle["open"]:
-            sl_order_id = position["sl_order"].get("id") if position["sl_order"] else None
+            sl_order_info = position.get("sl_order") or {}
+            sl_order_id = sl_order_info.get("id")
             exit_price = candle["close"]
+
+            cancel_resp = None
             if sl_order_id:
                 cancel_resp = self.fyers.cancel_order(sl_order_id)
-                if cancel_resp.get("s") == "ok":
-                    self.fyers.place_market_buy(symbol, self.lot_size, "EXITCOND")
-                    entry_price = position.get("entry_price")
-                    sl_price = position.get("sl_price")
-                    if entry_price is not None and exit_price > entry_price:
-                        # Treat as SL if loss on short
-                        self.sl_count += 1
-                        log_to_journal(
-                            symbol, "SL_HIT", position["strategy"],
-                            entry=entry_price, sl=sl_price, exit=exit_price,
-                            remarks="Exit condition; Exit>Entry so treated as SL"
-                        )
-                    else:
-                        log_to_journal(
-                            symbol, "EXIT", position["strategy"],
-                            entry=entry_price, sl=sl_price, exit=exit_price,
-                            remarks="Exit condition met"
-                        )
-                    self.positions[symbol] = None
+            else:
+                logging.info(f"[EXIT] No SL order id found in position for {symbol}; attempting reconcile and exit.")
+
+            if sl_order_id and _is_cancel_success(cancel_resp):
+                # proceed with market buy exit
+                self.fyers.place_market_buy(symbol, self.lot_size, "EXITCOND")
+                entry_price = position.get("entry_price")
+                sl_price = position.get("sl_price")
+                if entry_price is not None and exit_price > entry_price:
+                    # Treat as SL if loss on short
+                    self.sl_count += 1
+                    log_to_journal(
+                        symbol, "SL_HIT", position["strategy"],
+                        entry=entry_price, sl=sl_price, exit=exit_price,
+                        remarks=f"Exit after cancel (interpreted success). cancel_resp={cancel_resp}"
+                    )
                 else:
-                    logging.warning(f"[EXIT SKIPPED] {symbol} - Cancel failed: {cancel_resp}")
-                    self.reconcile_position(symbol)
+                    log_to_journal(
+                        symbol, "EXIT", position["strategy"],
+                        entry=entry_price, sl=sl_price, exit=exit_price,
+                        remarks=f"Exit condition met. cancel_resp={cancel_resp}"
+                    )
+                self.positions[symbol] = None
+            else:
+                logging.warning(f"[EXIT SKIPPED] {symbol} - Cancel failed or unknown: {cancel_resp}")
+                # Attempt broker reconcile to see if order was cancelled/executed asynchronously
+                self.reconcile_position(symbol)
 
     def on_trade(self, msg):
-        if not msg.get("trades"): return
-        symbol = msg["trades"].get("symbol")
-        side = msg["trades"].get("side")
-        position = self.positions.get(symbol)
-        if position and side == 1:  # SL Buy executed
-            log_to_journal(
-                symbol, "SL_HIT", position["strategy"],
-                entry=position.get("entry_price"), sl=position.get("sl_price"),
-                remarks=str(msg)
-            )
-            self.sl_count += 1
-            self.positions[symbol] = None
+        # msg may contain trades in different shapes; guard defensively
+        try:
+            trades = msg.get("trades") or msg.get("data") or msg
+            if not trades:
+                return
+            # try to extract symbol & side
+            symbol = None
+            side = None
+            if isinstance(trades, dict):
+                symbol = trades.get("symbol") or trades.get("s") or trades.get("sym")
+                side = trades.get("side")
+            # sometimes trades is a list
+            if isinstance(trades, list) and len(trades) > 0 and isinstance(trades[0], dict):
+                t0 = trades[0]
+                symbol = symbol or t0.get("symbol")
+                side = side or t0.get("side")
+
+            if not symbol:
+                return
+
+            position = self.positions.get(symbol)
+            # SL Buy executed -> side == 1 (buy)
+            if position and side == 1:
+                log_to_journal(
+                    symbol, "SL_HIT", position["strategy"],
+                    entry=position.get("entry_price"), sl=position.get("sl_price"),
+                    remarks=str(msg)
+                )
+                self.sl_count += 1
+                self.positions[symbol] = None
+        except Exception as e:
+            logging.exception(f"Error in on_trade processing: {e}")
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     fyers_client = FyersClient(CLIENT_ID, ACCESS_TOKEN, LOT_SIZE)
     engine = StrategyEngine(fyers_client, LOT_SIZE)
 
-    # Wait until 9:15 AM
+    # Wait until 9:15 AM (light sleep to avoid busy-loop)
     while datetime.datetime.now().time() < TRADING_START:
-        pass
+        time.sleep(1)
 
-    option_symbols = get_atm_symbols(fyers_client)
+    option_symbols = []
+    try:
+        option_symbols = get_atm_symbols(fyers_client)
+    except Exception as e:
+        logging.exception(f"Failed to build ATM symbols: {e}")
+        raise
+
     engine.prefill_history(option_symbols, days_back=1)
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
