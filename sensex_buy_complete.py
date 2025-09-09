@@ -1,0 +1,1014 @@
+import datetime
+import logging
+import os
+import csv
+import time
+import json
+import re
+from collections import defaultdict, deque
+
+from dotenv import load_dotenv
+from fyers_apiv3 import fyersModel
+from fyers_apiv3.FyersWebsocket import order_ws, data_ws
+
+# ---------------- CONFIG ----------------
+load_dotenv()
+
+CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
+ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
+LOT_SIZE = int(os.getenv("LOT_SIZE", "20"))  # tweak via env or edit constant
+TICK_SIZE = 0.05  # NSE options tick size
+
+TRADING_START = datetime.time(9,15)
+TRADING_END = datetime.time(15, 0)
+
+# --- W-pattern config ---
+PIVOT_K = 2
+MIN_BARS_BETWEEN_LOWS = 5
+EMA_PERIOD = 5
+VWMA_PERIOD = 20
+
+# Trigger conditions
+EMA_OVER_VWMA_MIN_GAP = 0.02  # 2% relative gap at trigger candle
+EMA_OVER_VWMA_MAX_GAP = 0.06  # 6% maximum allowed relative gap at trigger candle
+MAX_RISK_POINTS = 60          # skip if entry - SL > 60
+
+# ADX filter
+ADX_PERIOD = 14
+ADX_MIN = 20  # only take trade if ADX >= 20
+
+# Exit throttle (milliseconds) to avoid spamming cancel/market orders on rapid ticks
+EXIT_THROTTLE_MS = int(os.getenv("EXIT_THROTTLE_MS", "500"))
+
+# Logging verbosity can be controlled via env var, e.g., EXIT_LOG_LEVEL=DEBUG
+EXIT_LOG_LEVEL = os.getenv("EXIT_LOG_LEVEL", "INFO").upper()
+
+# Reset logging handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+logging.basicConfig(
+    filename="sensex_wpattern_strategy.log",
+    level=getattr(logging, EXIT_LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# convenience logger
+logger = logging.getLogger(__name__)
+
+# ---------------- UTILS ----------------
+def round_to_tick(price, tick_size=TICK_SIZE):
+    """Round a price to the nearest tick size (default = 0.05)."""
+    return round(round(price / tick_size) * tick_size, 2)
+
+
+def _safe(v, fmt="{:.2f}"):
+    try:
+        return fmt.format(v)
+    except Exception:
+        return "None"
+
+# ---------------- JOURNAL LOGGING ----------------
+def log_trade(symbol, side, entry, sl, target, exit_price, pnl, file="trades.csv"):
+    file_exists = os.path.isfile(file)
+    with open(file, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["date","symbol","side","entry","sl","target","exit","pnl"])
+        writer.writerow([
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            symbol, side, entry, sl, target, exit_price, pnl
+        ])
+# ---------------- EXPIRY & SYMBOL UTILS ----------------
+def get_next_expiry():
+    """Return expiry date (Thursday) for SENSEX options."""
+    today = datetime.date.today()
+    weekday = today.weekday()  # Monday=0 ... Sunday=6
+
+    if weekday == 3:  # Thursday
+        expiry = today
+    else:
+        days_to_thu = (3 - weekday) % 7
+        expiry = today + datetime.timedelta(days=days_to_thu)
+    return expiry
+
+def format_expiry(expiry_date):
+    """Format expiry date based on month rule (YYMDD if month<10, YYMMDD otherwise)."""
+    yy = expiry_date.strftime("%y")
+    m = expiry_date.month
+    d = expiry_date.day
+    if m < 10:
+        return f"{yy}{m}{d:02d}"   # YYMDD
+    else:
+        return f"{yy}{m:02d}{d:02d}"  # YYMMDD
+
+def get_atm_symbols(fyers_client):
+    """Fetch SENSEX spot, round to ATM strike, and build CE/PE option symbols."""
+    data = {"symbols": "BSE:SENSEX-INDEX"}
+    resp = fyers_client.client.quotes(data)
+    if not resp.get("d"):
+        raise Exception(f"Failed to fetch SENSEX spot: {resp}")
+
+    ltp = float(resp["d"][0]["v"]["lp"])  # last traded price
+    atm_strike = round(ltp / 100) * 100   # nearest 100
+
+    expiry = get_next_expiry()
+    expiry_str = format_expiry(expiry)
+    ce_strike = atm_strike - 200
+    pe_strike = atm_strike + 200
+    ce_symbol = f"BSE:SENSEX{expiry_str}{ce_strike}CE"
+    pe_symbol = f"BSE:SENSEX{expiry_str}{pe_strike}PE"
+
+    print(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
+    logging.info(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
+    return [ce_symbol, pe_symbol]
+
+
+# ---------------- FYERS CLIENT ----------------
+class FyersClient:
+    def __init__(self, client_id: str, access_token: str, lot_size: int = 20):
+        self.client_id = client_id
+        self.access_token = access_token
+        self.auth_token = f"{client_id}:{access_token}"
+        self.lot_size = lot_size
+        self.client = fyersModel.FyersModel(
+            client_id=client_id,
+            token=access_token,
+            is_async=False,
+            log_path=""
+        )
+        self.order_callbacks = []
+        self.trade_callbacks = []
+
+    # tag sanitizer placed inside client so logger is available
+    def _sanitize_tag(self, tag: str, max_len: int = 20):
+        """Remove any non-alphanumeric characters. Truncate to max_len.
+        FYERS appears to accept only letters + digits in orderTag.
+        """
+        if not tag:
+            return ""
+        s = re.sub(r'[^A-Za-z0-9]', '', str(tag))
+        if len(s) > max_len:
+            s = s[:max_len]
+        if s != tag:
+            logger.warning(f"Order tag sanitized: original='{tag}' -> sanitized='{s}'")
+        return s
+
+    def _log_order_resp(self, action, resp):
+        # Try to stringify resp for logs (safe): extract id/status/message if present
+        try:
+            if isinstance(resp, dict):
+                # Try to surface common id/message keys into top-level for caller convenience
+                resp_copy = dict(resp)  # shallow copy
+                # nested common places
+                if not resp_copy.get('id'):
+                    if isinstance(resp_copy.get('raw'), dict) and resp_copy['raw'].get('id'):
+                        resp_copy['id'] = resp_copy['raw']['id']
+                    elif isinstance(resp_copy.get('orders'), dict) and resp_copy['orders'].get('id'):
+                        resp_copy['id'] = resp_copy['orders']['id']
+                if not resp_copy.get('message') and isinstance(resp_copy.get('raw'), dict):
+                    resp_copy['message'] = resp_copy['raw'].get('message')
+                info = {'id': resp_copy.get('id'), 'status': resp_copy.get('status'), 'message': resp_copy.get('message'), 'raw': resp_copy.get('raw') if 'raw' in resp_copy else resp_copy}
+            else:
+                info = {'raw': str(resp)}
+            logger.info(f"{action} Response: {json.dumps(info)}")
+            print(f"{action} Response: {info}")
+        except Exception:
+            logger.info(f"{action} Response: {resp}")
+            print(f"{action} Response: {resp}")
+        return resp
+
+    def place_limit_buy(self, symbol: str, qty: int, price: float, tag: str = ""):
+        price = round_to_tick(price)
+        tag_clean = self._sanitize_tag(tag)
+        data = {
+            "symbol": symbol,
+            "qty": qty,
+            "type": 1,
+            "side": 1,  # BUY
+            "productType": "INTRADAY",
+            "limitPrice": price,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": tag_clean
+        }
+        resp = self.client.place_order(data)
+        return self._log_order_resp("Limit Buy", resp)
+
+    def place_market_buy(self, symbol: str, qty: int, tag: str = ""):
+        tag_clean = self._sanitize_tag(tag)
+        data = {
+            "symbol": symbol,
+            "qty": qty,
+            "type": 2,      # MARKET
+            "side": 1,      # BUY
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": tag_clean
+        }
+        resp = self.client.place_order(data)
+        return self._log_order_resp("Market Buy", resp)
+
+    def place_stoploss_sell(self, symbol: str, qty: int, stop_price: float, tag: str = ""):
+        stop_price = round_to_tick(stop_price)
+        tag_clean = self._sanitize_tag(tag)
+        data = {
+            "symbol": symbol,
+            "qty": qty,
+            "type": 3,  # SL-M
+            "side": -1,  # SELL
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": stop_price,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": tag_clean
+        }
+        resp = self.client.place_order(data)
+        return self._log_order_resp("SL Sell", resp)
+
+    def place_market_sell(self, symbol: str, qty: int, tag: str = ""):
+        tag_clean = self._sanitize_tag(tag)
+        data = {
+            "symbol": symbol,
+            "qty": qty,
+            "type": 2,  # MARKET
+            "side": -1,  # SELL
+            "productType": "INTRADAY",
+            "limitPrice": 0,
+            "stopPrice": 0,
+            "validity": "DAY",
+            "disclosedQty": 0,
+            "offlineOrder": False,
+            "orderTag": tag_clean
+        }
+        resp = self.client.place_order(data)
+        return self._log_order_resp("Market Sell", resp)
+
+    def cancel_order(self, order_id: str):
+        try:
+            resp = self.client.cancel_order({"id": order_id})
+            return self._log_order_resp("Cancel Order", resp)
+        except Exception as e:
+            logger.error(f"Cancel order exception: {e}")
+            raise
+
+    def start_order_socket(self):
+        def on_order(msg):
+            logger.info(f"Order update: {msg}")
+            for cb in self.order_callbacks:
+                cb(msg)
+
+        def on_trade(msg):
+            logger.info(f"Trade update: {msg}")
+            for cb in self.trade_callbacks:
+                cb(msg)
+
+        def on_open():
+            fyers.subscribe(data_type="OnOrders,OnTrades")
+            fyers.keep_running()
+
+        fyers = order_ws.FyersOrderSocket(
+            access_token=self.auth_token,
+            write_to_file=False,
+            log_path="",
+            on_connect=on_open,
+            on_close=lambda m: logger.info(f"Order socket closed: {m}"),
+            on_error=lambda m: logger.error(f"Order socket error: {m}"),
+            on_orders=on_order,
+            on_trades=on_trade
+        )
+        fyers.connect()
+
+    def register_order_callback(self, cb):
+        self.order_callbacks.append(cb)
+
+    def register_trade_callback(self, cb):
+        self.trade_callbacks.append(cb)
+
+    def subscribe_market_data(self, instrument_ids, on_candle_callback, on_tick_callback=None):
+        """
+        instrument_ids: list of symbols
+        on_candle_callback(symbol, candle) -> called when a 3-min candle completes
+        on_tick_callback(symbol, ltp, ts) -> called for every tick (immediate exit logic can live here)
+        """
+        candle_buffers = defaultdict(lambda: None)
+
+        def on_message(tick):
+            try:
+                if "symbol" not in tick or "ltp" not in tick:
+                    return
+                symbol = tick["symbol"]
+                ltp = float(tick["ltp"])
+                ts = int(tick.get("last_traded_time", datetime.datetime.now().timestamp()))
+                cum_vol = int(tick.get("vol_traded_today", 0))  # cumulative volume
+            except Exception as e:
+                logger.error(f"Bad tick: {tick}, {e}")
+                return
+
+            # First: call tick-level callback so strategy can react immediately (e.g., target touched)
+            if on_tick_callback:
+                try:
+                    on_tick_callback(symbol, ltp, ts)
+                except Exception as e:
+                    logger.error(f"on_tick_callback error for {symbol}: {e}")
+
+            # Then update the 3-min candle aggregation and possibly emit a completed candle
+            dt = datetime.datetime.fromtimestamp(ts)
+            bucket_minute = (dt.minute // 3) * 3
+            candle_time = dt.replace(second=0, microsecond=0, minute=bucket_minute)
+
+            c = candle_buffers[symbol]
+            if c is None or c["time"] != candle_time:
+                if c is not None:
+                    # previous candle completed -> notify
+                    try:
+                        on_candle_callback(symbol, c)
+                    except Exception as e:
+                        logger.error(f"on_candle_callback error for {symbol}: {e}")
+                candle_buffers[symbol] = {
+                    "time": candle_time,
+                    "open": ltp,
+                    "high": ltp,
+                    "low": ltp,
+                    "close": ltp,
+                    "volume": 0,
+                    "start_cum_vol": cum_vol
+                }
+            else:
+                c["high"] = max(c["high"], ltp)
+                c["low"] = min(c["low"], ltp)
+                c["close"] = ltp
+                c["volume"] = max(0, cum_vol - c["start_cum_vol"])
+
+        def on_open():
+            fyers.subscribe(symbols=instrument_ids, data_type="SymbolUpdate")
+            fyers.keep_running()
+
+        fyers = data_ws.FyersDataSocket(
+            access_token=self.auth_token,
+            log_path="",
+            on_connect=on_open,
+            on_close=lambda m: logger.info(f"Data socket closed: {m}"),
+            on_error=lambda m: logger.error(f"Data socket error: {m}"),
+            on_message=on_message
+        )
+        fyers.connect()
+
+# ---------------- STRATEGY ENGINE ----------------
+class NiftyBuyStrategy:
+    def __init__(self, fyers_client: FyersClient, lot_size: int = 20):
+        self.fyers = fyers_client
+        self.lot_size = lot_size
+        self.candles = defaultdict(lambda: deque(maxlen=400))
+        self.positions = {}       # Active positions per symbol
+        self.state = defaultdict(lambda: {
+            "w_span": None,
+            "post_breakout": False,
+            "pullback_count": 0,
+            "last_trade_idx": -1
+        })
+
+    # --- history prefill ---
+    def prefill_history(self, symbols, days_back=1):
+        for symbol in symbols:
+            try:
+                to_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                from_date = (datetime.datetime.now() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+                params = {
+                    "symbol": symbol,
+                    "resolution": "3",
+                    "date_format": "1",
+                    "range_from": from_date,
+                    "range_to": to_date,
+                    "cont_flag": "1"
+                }
+                hist = self.fyers.client.history(params)
+
+                if hist.get("candles"):
+                    for c in hist["candles"]:
+                        ts = datetime.datetime.fromtimestamp(c[0])
+                        candle = {
+                            "time": ts,
+                            "open": c[1],
+                            "high": c[2],
+                            "low": c[3],
+                            "close": c[4],
+                            "volume": c[5],
+                        }
+                        self.candles[symbol].append(candle)
+
+                    closes = [c["close"] for c in self.candles[symbol]]
+                    volumes = [c["volume"] for c in self.candles[symbol]]
+                    highs = [c["high"] for c in self.candles[symbol]]
+                    lows = [c["low"] for c in self.candles[symbol]]
+                    ema5 = self.ema_series(closes, EMA_PERIOD)[-1]
+                    vwma20 = self.vwma_series(closes, volumes, VWMA_PERIOD)[-1]
+                    adx = self.adx_series(highs, lows, closes, ADX_PERIOD)[-1]
+                    logger.info(f"[Init] {symbol} EMA5={_safe(ema5)}, VWMA20={_safe(vwma20)}, ADX={_safe(adx)}")
+            except Exception as e:
+                logger.error(f"History fetch fail {symbol}: {e}")
+
+    # --- indicator series ---
+    def ema_series(self, prices, period):
+        out = [None]*len(prices)
+        if len(prices) < 1:
+            return out
+        k = 2/(period+1)
+        ema = prices[0]
+        for i,p in enumerate(prices):
+            if i == 0:
+                ema = p
+            else:
+                ema = p*k + ema*(1-k)
+            out[i] = ema
+        return out
+
+    def vwma_series(self, closes, volumes, period):
+        out = [None]*len(closes)
+        if len(closes) < period:
+            return out
+        for i in range(len(closes)):
+            if i+1 >= period:
+                c = closes[i-period+1:i+1]
+                v = volumes[i-period+1:i+1]
+                denom = sum(v)
+                out[i] = (sum([ci*vi for ci,vi in zip(c,v)]) / denom) if denom > 0 else None
+        return out
+
+    def adx_series(self, highs, lows, closes, period=14):
+        """
+        Compute ADX series using Wilder's smoothing.
+        Returns list of ADX values aligned with input length (None for indices where not computable).
+        """
+        n = len(closes)
+        if n < period + 1:
+            return [None] * n
+
+        tr = [None] * n
+        plus_dm = [0.0] * n
+        minus_dm = [0.0] * n
+
+        for i in range(1, n):
+            high = highs[i]
+            low = lows[i]
+            prev_high = highs[i-1]
+            prev_low = lows[i-1]
+            prev_close = closes[i-1]
+
+            tr_val = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            tr[i] = tr_val
+
+            up_move = high - prev_high
+            down_move = prev_low - low
+            if up_move > down_move and up_move > 0:
+                plus_dm[i] = up_move
+            else:
+                plus_dm[i] = 0.0
+            if down_move > up_move and down_move > 0:
+                minus_dm[i] = down_move
+            else:
+                minus_dm[i] = 0.0
+
+        # Wilder smoothing: initial ATR, +DM, -DM are simple sums over first 'period' bars (indexes 1..period)
+        tr_smooth = [None] * n
+        plus_smooth = [None] * n
+        minus_smooth = [None] * n
+
+        tr_sum = sum([tr[i] for i in range(1, period+1) if tr[i] is not None])
+        plus_sum = sum([plus_dm[i] for i in range(1, period+1)])
+        minus_sum = sum([minus_dm[i] for i in range(1, period+1)])
+
+        tr_smooth[period] = tr_sum
+        plus_smooth[period] = plus_sum
+        minus_smooth[period] = minus_sum
+
+        for i in range(period+1, n):
+            tr_smooth[i] = tr_smooth[i-1] - (tr_smooth[i-1] / period) + tr[i]
+            plus_smooth[i] = plus_smooth[i-1] - (plus_smooth[i-1] / period) + plus_dm[i]
+            minus_smooth[i] = minus_smooth[i-1] - (minus_smooth[i-1] / period) + minus_dm[i]
+
+        # Calculate +DI, -DI, DX, then ADX (smoothed DX)
+        plus_di = [None] * n
+        minus_di = [None] * n
+        dx = [None] * n
+        adx = [None] * n
+
+        for i in range(period, n):
+            if tr_smooth[i] and tr_smooth[i] > 0:
+                plus_di[i] = 100.0 * (plus_smooth[i] / tr_smooth[i])
+                minus_di[i] = 100.0 * (minus_smooth[i] / tr_smooth[i])
+                denom = plus_di[i] + minus_di[i]
+                if denom != 0:
+                    dx[i] = 100.0 * (abs(plus_di[i] - minus_di[i]) / denom)
+                else:
+                    dx[i] = 0.0
+
+        # ADX: average of DX values using Wilder smoothing. First ADX at index = 2*period - 1 (using period DX values)
+        first_adx_index = 2 * period
+        if first_adx_index < n:
+            # arithmetic mean of DX at indices [period .. 2*period-1]
+            dx_sum = sum([dx[i] for i in range(period, first_adx_index) if dx[i] is not None])
+            count = len([i for i in range(period, first_adx_index) if dx[i] is not None])
+            if count > 0:
+                adx[first_adx_index] = dx_sum / count
+                # Wilder smoothing for subsequent ADX values
+                for i in range(first_adx_index + 1, n):
+                    if dx[i] is None:
+                        adx[i] = adx[i-1]
+                    else:
+                        adx[i] = ((adx[i-1] * (period - 1)) + dx[i]) / period
+
+        return adx
+
+    # --- helpers ---
+    @staticmethod
+    def is_green(c): return c["close"] > c["open"]
+    @staticmethod
+    def is_red(c): return c["close"] < c["open"]
+
+    def is_pivot_low(self, lows, idx, k=PIVOT_K):
+        if idx - k < 0 or idx + k >= len(lows):
+            return False
+        center = lows[idx]
+        for i in range(idx-k, idx+k+1):
+            if i == idx: continue
+            if center > lows[i]:
+                return False
+        return True
+
+    def find_recent_w(self, candles, ema5_arr, vwma_arr):
+        n = len(candles)
+        if n < (2*PIVOT_K + 1) + MIN_BARS_BETWEEN_LOWS:
+            return None
+
+        lows = [c["low"] for c in candles]
+        for i2 in range(n-1-PIVOT_K, 2*PIVOT_K, -1):
+            if not self.is_pivot_low(lows, i2, PIVOT_K):
+                continue
+            jmax = i2 - MIN_BARS_BETWEEN_LOWS
+            for i1 in range(jmax, 2*PIVOT_K-1, -1):
+                if not self.is_pivot_low(lows, i1, PIVOT_K):
+                    continue
+                if lows[i2] + 1e-9 < lows[i1]:
+                    continue
+                ok = True
+                for k in range(i1, i2+1):
+                    if ema5_arr[k] is None or vwma_arr[k] is None or not (ema5_arr[k] < vwma_arr[k]):
+                        ok = False
+                        break
+                if ok:
+                    return (i1, i2)
+        return None
+
+    def is_bullish_pinbar(self, c):
+        body = abs(c["close"] - c["open"])
+        upper = c["high"] - max(c["close"], c["open"])
+        lower = min(c["close"], c["open"]) - c["low"]
+        return (c["close"] > c["open"]) and (lower >= 2*body) and (upper <= body)
+
+    def is_bullish_engulfing(self, prev, curr):
+        return (prev["close"] < prev["open"] and
+                curr["close"] > curr["open"] and
+                curr["open"] <= prev["close"] and
+                curr["close"] >= prev["open"])
+
+    def is_strong_green_close_near_high(self, c, pct=0.01):
+        if c["close"] <= c["open"]:
+            return False
+        return (c["high"] - c["close"]) <= pct * c["high"]
+
+    # --- NEW: upper-wick helpers ---
+    def upper_wick_ratio(self, c):
+        """Return ratio upper_wick / body. If body is tiny, return a large number."""
+        body = abs(c["close"] - c["open"])
+        upper = c["high"] - max(c["close"], c["open"])
+        if body <= 1e-9:
+            # avoid division by zero: treat as very large wick ratio so it fails short-wick tests
+            return float("inf")
+        return upper / body
+
+    def has_short_upper_wick(self, c, max_ratio=0.5):
+        """
+        True if the upper wick is <= max_ratio * body.
+        max_ratio default 0.5 means upper wick must be at most 50% of body.
+        """
+        return self.upper_wick_ratio(c) <= max_ratio
+
+    def on_candle(self, symbol, candle):
+        try:
+            self.candles[symbol].append(candle)
+            candles = list(self.candles[symbol])
+            idx = len(candles) - 1
+
+            closes = [c["close"] for c in candles]
+            volumes = [c["volume"] for c in candles]
+            highs = [c["high"] for c in candles]
+            lows = [c["low"] for c in candles]
+
+            ema5_arr = self.ema_series(closes, EMA_PERIOD)
+            vwma20_arr = self.vwma_series(closes, volumes, VWMA_PERIOD)
+            adx_arr = self.adx_series(highs, lows, closes, ADX_PERIOD)
+
+            ema5 = ema5_arr[idx]
+            vwma20 = vwma20_arr[idx]
+            adx = adx_arr[idx] if idx < len(adx_arr) else None
+
+            # --- SNAPSHOT: log indicators for all tracked symbols at this 3-min close ---
+            try:
+                snapshot = {s: {
+                    'time': str(self.candles[s][-1]['time']) if len(self.candles[s])>0 else None,
+                    'close': _safe(self.candles[s][-1]['close']),
+                    'EMA5': _safe(self.ema_series([c['close'] for c in self.candles[s]], EMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
+                    'VWMA20': _safe(self.vwma_series([c['close'] for c in self.candles[s]], [c['volume'] for c in self.candles[s]], VWMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
+                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s]], ADX_PERIOD)[-1]) if len(self.candles[s])>0 else None
+                } for s in list(self.candles.keys())}
+                logger.info(f"Indicators snapshot at {candle['time']}: {json.dumps(snapshot)}")
+            except Exception as e:
+                logger.debug(f"Failed to log indicators snapshot: {e}")
+
+            if ema5 is None or vwma20 is None:
+                logger.debug(f"Not enough data for indicators for {symbol} at idx={idx} (EMA5={ema5}, VWMA20={vwma20}, ADX={adx})")
+                return
+
+            now = datetime.datetime.now().time()
+            if not (TRADING_START <= now <= TRADING_END):
+                logger.debug(f"Outside trading hours: now={now}")
+                return
+
+            st = self.state[symbol]
+            pos = self.positions.get(symbol)
+
+            # Log candle summary
+            logger.info(json.dumps({
+                'event': 'candle_close',
+                'symbol': symbol,
+                'time': str(candle['time']),
+                'idx': idx,
+                'open': candle['open'],
+                'high': candle['high'],
+                'low': candle['low'],
+                'close': candle['close'],
+                'volume': candle['volume'],
+                'EMA5': _safe(ema5),
+                'VWMA20': _safe(vwma20),
+                'ADX': _safe(adx),
+                'w_span': st.get('w_span'),
+                'post_breakout': st.get('post_breakout'),
+                'pullback_count': st.get('pullback_count'),
+                'in_position': bool(pos)
+            }))
+
+            # 1) If in a position: candle-close fallback
+            if pos:
+                # Candle-close fallback: if high >= target, attempt exit (throttled & idempotent)
+                if candle["high"] >= pos["target"] and not pos.get("exit_initiated"):
+                    self._attempt_target_exit(symbol, pos, reason="candle_fallback")
+                return  # don't seek new entries while in position
+
+            # 2) Not in a position: build W context and hunt setup
+            w_span = self.find_recent_w(candles, ema5_arr, vwma20_arr)
+            if w_span:
+                if st["w_span"] != w_span:
+                    st["w_span"] = w_span
+                    st["post_breakout"] = False
+                    st["pullback_count"] = 0
+                    # log the detected W
+                    i1, i2 = w_span
+                    logger.info(json.dumps({
+                        'event': 'w_detected',
+                        'symbol': symbol,
+                        'w_span': w_span,
+                        'low1_time': str(candles[i1]['time']),
+                        'low1_price': candles[i1]['low'],
+                        'low2_time': str(candles[i2]['time']),
+                        'low2_price': candles[i2]['low'],
+                        'ema5_low1': _safe(ema5_arr[i1]),
+                        'vwma20_low1': _safe(vwma20_arr[i1]),
+                        'ema5_low2': _safe(ema5_arr[i2]),
+                        'vwma20_low2': _safe(vwma20_arr[i2])
+                    }))
+
+            if not st["w_span"]:
+                return
+
+            low1_idx, low2_idx = st["w_span"]
+            if idx <= low2_idx:
+                return  # still within the W
+
+            if not st["post_breakout"]:
+                if self.is_green(candle) and candle["close"] > ema5 and candle["close"] > vwma20:
+                    st["post_breakout"] = True
+                    st["pullback_count"] = 0
+                    logger.info(f"Post-breakout set for {symbol} at idx={idx}")
+                return
+
+            if st["post_breakout"] and st["pullback_count"] == 0:
+                if self.is_red(candle):
+                    st["pullback_count"] = 1
+                    logger.debug(f"Pullback started for {symbol} (count=1)")
+                return
+            elif st["post_breakout"] and st["pullback_count"] >= 1:
+                if self.is_red(candle):
+                    st["pullback_count"] += 1
+                    logger.debug(f"Pullback incremented for {symbol} (count={st['pullback_count']})")
+                    return
+
+                prev = candles[idx-1] if idx-1 >= 0 else None
+                is_trigger_pattern = self.is_strong_green_close_near_high(candle, pct=0.01)
+                if prev:
+                    is_trigger_pattern = (
+                        is_trigger_pattern
+                        or self.is_bullish_pinbar(candle)
+                        or self.is_bullish_engulfing(prev, candle)
+                    )
+
+                # Compute relative gap between EMA5 and VWMA20
+                rel_gap = None
+                if vwma20 and vwma20 != 0:
+                    rel_gap = (ema5 - vwma20) / vwma20
+
+                # FINAL ENTRY CHECK booleans
+                green_ok = self.is_green(candle)
+                close_above_ema_vwma = (candle['close'] > ema5 and candle['close'] > vwma20)
+                gap_ok = (rel_gap is not None and rel_gap >= EMA_OVER_VWMA_MIN_GAP and rel_gap <= EMA_OVER_VWMA_MAX_GAP)
+                adx_ok = (adx is not None and adx >= ADX_MIN)
+                trigger_ok = is_trigger_pattern
+                wick_ok = self.has_short_upper_wick(candle, max_ratio=0.5)
+
+                if (green_ok and close_above_ema_vwma and gap_ok and adx_ok and trigger_ok and wick_ok):
+
+                    entry = round_to_tick(candle["close"])
+                    sl = round_to_tick(candle["low"] - 5.0)  # low - 5 per spec
+                    risk = entry - sl
+                    if risk <= 0:
+                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'non_positive_risk', 'entry': entry, 'sl': sl}))
+                        st["post_breakout"] = False
+                        st["pullback_count"] = 0
+                        return
+                    if risk > MAX_RISK_POINTS:
+                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'risk_too_large', 'risk': risk, 'max_allowed': MAX_RISK_POINTS}))
+                        st["post_breakout"] = False
+                        st["pullback_count"] = 0
+                        return
+
+                    target = round_to_tick(entry + 2.0 * risk)
+
+                    # Place market buy then SL-M
+                    buy_resp = self.fyers.place_market_buy(symbol, self.lot_size, tag="NIFTYBUYENTRY")
+                    sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, sl, tag="NIFTYSL")
+
+                    # Store position; do NOT log exit until trade fills reported by on_trade
+                    self.positions[symbol] = {
+                        "entry": entry,
+                        "sl": sl,
+                        "target": target,
+                        "sl_order": sl_resp,
+                        "exit_initiated": False,
+                        "last_exit_attempt_ms": 0,
+                        "exit_requested_at": None  # timestamp when exit requested
+                    }
+                    logger.info(json.dumps({
+                        'event': 'entry_assumed',
+                        'symbol': symbol,
+                        'entry': entry,
+                        'sl': sl,
+                        'target': target,
+                        'rel_gap': rel_gap,
+                        'ADX': _safe(adx),
+                        'buy_resp': str(buy_resp),
+                        'sl_resp': str(sl_resp)
+                    }))
+
+                    # Reset sequence so we don't double-trigger
+                    st["post_breakout"] = False
+                    st["pullback_count"] = 0
+                    st["last_trade_idx"] = idx
+                else:
+                    # Build reasons list for easier tuning
+                    reasons = []
+                    if not green_ok:
+                        reasons.append('not_green')
+                    if not close_above_ema_vwma:
+                        reasons.append('close_below_ema_or_vwma')
+                    if not gap_ok:
+                        if rel_gap is None:
+                            reasons.append('gap_na')
+                        else:
+                            reasons.append(f'gap_out_of_range(rel_gap={rel_gap:.4f})')
+                    if not adx_ok:
+                        reasons.append(f'adx_too_low(adx={_safe(adx)})')
+                    if not trigger_ok:
+                        reasons.append('no_trigger_pattern')
+                    if not wick_ok:
+                        reasons.append(f'upper_wick_too_long(ratio={_safe(self.upper_wick_ratio(candle))})')
+
+                    logger.debug(json.dumps({
+                        'event': 'candidate_rejected',
+                        'symbol': symbol,
+                        'idx': idx,
+                        'reasons': reasons,
+                        'EMA5': _safe(ema5),
+                        'VWMA20': _safe(vwma20),
+                        'ADX': _safe(adx),
+                        'rel_gap': _safe(rel_gap)
+                    }))
+                    # reset the sequence to avoid repeated noisy candidates
+                    st["post_breakout"] = False
+                    st["pullback_count"] = 0
+        except Exception as e:
+            logger.error(f"on_candle unexpected error for {symbol}: {e}")
+
+    # --- helper to attempt a throttled target exit (idempotent) ---
+    def _attempt_target_exit(self, symbol, pos, reason="tick_target"):
+        """
+        Attempt to cancel SL and place market sell in a throttled, idempotent way.
+        We DO NOT log the final exit here; we wait for on_trade to report the actual fill price from the broker.
+        """
+        now_ms = int(time.time() * 1000)
+        last_ms = pos.get("last_exit_attempt_ms", 0)
+        if pos.get("exit_initiated"):
+            logger.debug(f"Exit already initiated for {symbol}; skipping duplicate attempt.")
+            return
+        if (now_ms - last_ms) < EXIT_THROTTLE_MS:
+            logger.debug(f"Throttle active for {symbol} exit attempts (wait {(EXIT_THROTTLE_MS - (now_ms-last_ms))} ms).")
+            return
+
+        pos["last_exit_attempt_ms"] = now_ms
+        pos["exit_initiated"] = True
+        pos["exit_requested_at"] = now_ms
+        logger.info(f"Attempting target exit for {symbol} (reason={reason}) at {now_ms}ms")
+
+        # Attempt to cancel SL order if it exists
+        try:
+            sl_order = pos.get("sl_order")
+            # sl_order may be a dict returned by place_stoploss_sell; try to extract id
+            sl_order_id = None
+            if sl_order and isinstance(sl_order, dict):
+                sl_order_id = sl_order.get("id") or (sl_order.get("raw") and sl_order.get("raw").get("id"))
+
+            if sl_order_id:
+                try:
+                    cancel_resp = self.fyers.cancel_order(sl_order_id)
+                    logger.debug(f"Cancel response for {symbol}: {cancel_resp}")
+                except Exception as e:
+                    logger.error(f"Cancel attempt failed for {symbol}: {e}")
+            # Place market sell (tag so on_trade can identify)
+            try:
+                self.fyers.place_market_sell(symbol, self.lot_size, tag="TARGETEXITTICK")
+            except Exception as e:
+                logger.error(f"Market sell attempt failed for {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"_attempt_target_exit error for {symbol}: {e}")
+
+    # --- tick-level handler for immediate exits ---
+    def on_tick(self, symbol, ltp, ts):
+        """
+        Called for every incoming tick. We use this to check target-hit intra-candle
+        and request an immediate market exit (throttled & idempotent). Actual exit logging
+        will be done when on_trade reports the fill price from the broker.
+        """
+        try:
+            pos = self.positions.get(symbol)
+            if not pos:
+                return
+            entry = pos["entry"]
+            orig_sl = pos["sl"]
+
+            # --- NEW: Trailing SL logic ---
+            if ltp > entry:
+                move_up = ltp - entry
+                steps = int(move_up // 10)   # how many 10-pt steps
+                new_sl = round_to_tick(entry - (entry - orig_sl) + steps * 5)
+                if new_sl > pos["sl"]:  # only trail upwards
+                    pos["sl"] = new_sl
+                    logger.info(f"Trailing SL for {symbol}: moved to {new_sl} (ltp={ltp})")
+                    try:
+                        # Cancel old SL order & place new one
+                        sl_order = pos.get("sl_order")
+                        sl_order_id = None
+                        if sl_order and isinstance(sl_order, dict):
+                            sl_order_id = sl_order.get("id") or (sl_order.get("raw") and sl_order.get("raw").get("id"))
+                            if sl_order_id:
+                                self.fyers.cancel_order(sl_order_id)
+                        sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, new_sl, tag="NIFTYSLTRAIL")
+                        pos["sl_order"] = sl_resp
+                    except Exception as e:
+                        logger.error(f"Failed to update SL for {symbol}: {e}")
+
+            # --- Target exit logic (existing) ---
+            if ltp >= pos["target"] and not pos.get("exit_initiated"):
+                logger.debug(f"Tick-level target detected for {symbol} ltp={ltp} target={pos['target']}")
+                self._attempt_target_exit(symbol, pos, reason="tick_target")
+        except Exception as e:
+            logger.error(f"on_tick error: {e}")
+
+    # --- trade handler ---
+    def on_trade(self, msg):
+        """
+        Handle trade fills from broker. We expect broker's trade payload to include:
+        - 'trades' (or similar) with side, symbol, orderTag and price / fill price.
+        We'll interpret SL fills (tag=NIFTYSL) and our market exit fills (tags TARGETEXIT/TARGETEXIT_TICK)
+        and compute exact PnL using the trade fill price from the broker.
+        """
+        if not msg.get("trades"):
+            return
+        try:
+            t = msg["trades"]
+            # fields may vary — attempt multiple keys
+            side = t.get("side") or t.get("s")  # -1 sell, 1 buy
+            symbol = t.get("symbol") or t.get("d") or t.get("instrument")
+            tag = t.get("orderTag") or t.get("order_tag") or t.get("orderTagName")
+            fill_price = None
+            # broker payload could include 'price', 'filled_price', 'avg_price', etc.
+            if "price" in t:
+                try:
+                    fill_price = float(t.get("price"))
+                except:
+                    pass
+            if not fill_price and "filled_price" in t:
+                try:
+                    fill_price = float(t.get("filled_price"))
+                except:
+                    pass
+            if not fill_price and "avg_price" in t:
+                try:
+                    fill_price = float(t.get("avg_price"))
+                except:
+                    pass
+            # Some payloads send trades as a list — handle that
+            if isinstance(t, list):
+                # iterate and process each trade item
+                for item in t:
+                    self.on_trade({"trades": item})
+                return
+
+            # Standardize tag for comparisons
+            tag = tag if tag is not None else ""
+
+            logger.info(json.dumps({'event': 'trade_msg', 'symbol': symbol, 'side': side, 'tag': tag, 'fill_price': fill_price, 'raw': t}))
+
+            # SL hit
+            if int(side) == -1 and "NIFTYSL" in tag:
+                pos = self.positions.get(symbol)
+                if pos:
+                    # Use fill_price if available, otherwise use stored SL
+                    exit_price = round_to_tick(fill_price) if fill_price else round_to_tick(pos["sl"])
+                    pnl = (exit_price - pos["entry"]) * self.lot_size
+                    log_trade(symbol, "BUY", pos["entry"], pos["sl"], pos["target"], exit_price, pnl)
+                    logger.info(f"SL HIT {symbol} @ {exit_price} PnL={pnl}")
+                    self.positions[symbol] = None
+                return
+
+            # Our target exit fills (market sell)
+            if int(side) == -1 and ("TARGETEXIT" in tag or "TARGETEXITTICK" in tag):
+                pos = self.positions.get(symbol)
+                if pos:
+                    # Use fill_price if broker provided it; otherwise fall back to target (less ideal)
+                    if fill_price:
+                        exit_price = round_to_tick(fill_price)
+                    else:
+                        exit_price = round_to_tick(pos["target"])
+                    pnl = (exit_price - pos["entry"]) * self.lot_size
+                    log_trade(symbol, "BUY", pos["entry"], pos["sl"], pos["target"], exit_price, pnl)
+                    logger.info(f"TARGET EXIT FILL {symbol} @ {exit_price} PnL={pnl} (tag={tag})")
+                    self.positions[symbol] = None
+                return
+
+            # Handle fills for initial market buy (entry)
+            if int(side) == 1 and ("NIFTYBUYENTRY" in tag):
+                # If trade gives fill price, update stored entry to actual fill
+                pos = self.positions.get(symbol)
+                if pos and fill_price:
+                    old_entry = pos["entry"]
+                    new_entry = round_to_tick(fill_price)
+                    pos["entry"] = new_entry
+                    logger.info(f"Updated entry price for {symbol} from {old_entry} to actual fill {new_entry}")
+                return
+
+        except Exception as e:
+            logger.error(f"on_trade error: {e}")
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    fyers_client = FyersClient(CLIENT_ID, ACCESS_TOKEN, LOT_SIZE)
+    engine = NiftyBuyStrategy(fyers_client, LOT_SIZE)
+
+    # Replace with actual Sensex option symbols as needed
+    option_symbols = get_atm_symbols(fyers_client)
+    #option_symbols = ["BSE:SENSEX2591180700CE", "BSE:SENSEX2591181100PE"]
+
+    engine.prefill_history(option_symbols, days_back=2)
+
+    fyers_client.register_trade_callback(engine.on_trade)
+    # pass the tick callback so we can exit immediately when target touched intra-candle
+    fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
+    fyers_client.start_order_socket()
