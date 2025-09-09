@@ -47,6 +47,49 @@ def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None
             symbol, action, strategy, entry, sl, exit, remarks
         ])
 
+# ---------------- EXPIRY & SYMBOL UTILS ----------------
+def get_next_expiry():
+    """Return expiry date (Thursday) for SENSEX options."""
+    today = datetime.date.today()
+    weekday = today.weekday()  # Monday=0 ... Sunday=6
+
+    if weekday == 3:  # Thursday
+        expiry = today
+    else:
+        days_to_thu = (3 - weekday) % 7
+        expiry = today + datetime.timedelta(days=days_to_thu)
+    return expiry
+
+def format_expiry(expiry_date):
+    """Format expiry date based on month rule (YYMDD if month<10, YYMMDD otherwise)."""
+    yy = expiry_date.strftime("%y")
+    m = expiry_date.month
+    d = expiry_date.day
+    if m < 10:
+        return f"{yy}{m}{d:02d}"   # YYMDD
+    else:
+        return f"{yy}{m:02d}{d:02d}"  # YYMMDD
+
+def get_atm_symbols(fyers_client):
+    """Fetch SENSEX spot, round to ATM strike, and build CE/PE option symbols."""
+    data = {"symbols": "BSE:SENSEX-INDEX"}
+    resp = fyers_client.client.quotes(data)
+    if not resp.get("d"):
+        raise Exception(f"Failed to fetch SENSEX spot: {resp}")
+
+    ltp = float(resp["d"][0]["v"]["lp"])  # last traded price
+    atm_strike = round(ltp / 100) * 100   # nearest 100
+
+    expiry = get_next_expiry()
+    expiry_str = format_expiry(expiry)
+
+    ce_symbol = f"BSE:SENSEX{expiry_str}{atm_strike}CE"
+    pe_symbol = f"BSE:SENSEX{expiry_str}{atm_strike}PE"
+
+    print(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
+    logging.info(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
+    return [ce_symbol, pe_symbol]
+
 def _extract_order_id(resp):
     """Try common places where fyers place_order/cancel may return an id."""
     if not isinstance(resp, dict):
@@ -653,3 +696,4 @@ if __name__ == "__main__":
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
     fyers_client.start_order_socket()
+
