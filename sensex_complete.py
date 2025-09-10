@@ -652,9 +652,10 @@ class StrategyEngine:
                                 logging.info(f"[STRAT4] Pending cleared for {symbol} because ema >= vwma now (ema={ema_curr:.2f}, vwma={vw_curr:.2f})")
                                 self.s4_pending.pop(symbol, None)
                             else:
-                                # check entry candle: red and ema at most 2% lower than vwma
+                                # check entry candle: red and ema at most 2% lower than vwma and atleast 1% lower than vwma
                                 GAP = 0.02
-                                if is_red(c_curr) and (ema_curr <= vw_curr) and (ema_curr >= vw_curr * (1 - GAP)):
+                                GAP_MIN_STRAT_4 = 0.01
+                                if is_red(c_curr) and (ema_curr <= vw_curr) and (ema_curr >= vw_curr * (1 - GAP)) and (ema_curr <= vw_curr * (1 - GAP_MIN_STRAT_4)):
                                     entry = c_curr["close"]
                                     sl = c_curr["high"] + 5
                                     if (sl - entry) > 60:
@@ -772,3 +773,4 @@ if __name__ == "__main__":
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
     fyers_client.start_order_socket()
+
