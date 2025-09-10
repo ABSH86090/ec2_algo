@@ -305,6 +305,9 @@ class StrategyEngine:
         self.sl_count = 0
         self.candles = defaultdict(lambda: deque(maxlen=200))
         self.s3_fired_date = {}  # { symbol: date }
+        # --- STRAT4 state ---
+        # pending map: symbol -> { "first_idx": int (index in candles list), "first_time": datetime }
+        self.s4_pending = {}
 
     def prefill_history(self, symbols, days_back=1):
         """Prefill candles with historical data for warm start."""
@@ -604,6 +607,79 @@ class StrategyEngine:
                 }
                 log_to_journal(symbol, "ENTRY", "strat2", entry=strat2["entry"], sl=strat2["sl"])
 
+        # -------- STRATEGY 4 (NEW) --------
+        # Conditions:
+        # 1) First red candle where ema5 becomes < vwma20 while previous candle's ema5 > vwma20 -> mark pending
+        # 2) Later, when a red candle closes with ema5 <= vwma20 and ema5 >= vwma20 * 0.98 (<=2% lower),
+        #    take entry (limit sell at close) and SL = that red candle high + 5
+        # Clear pending if ema goes back above vwma (condition broken).
+        try:
+            # Only consider if no position exists for symbol and SL quota not exceeded
+            if self.positions.get(symbol) is None:
+                n = len(candles)
+                if n >= 2:
+                    idx_prev = n - 2
+                    idx_curr = n - 1
+                    # compute ema/vwma for prev and curr candle indexes
+                    closes_prefix_prev = closes[:idx_prev+1]
+                    vols_prefix_prev = volumes[:idx_prev+1]
+                    closes_prefix_curr = closes[:idx_curr+1]
+                    vols_prefix_curr = volumes[:idx_curr+1]
+
+                    ema_prev = self.compute_ema(closes_prefix_prev, 5)
+                    vw_prev = self.compute_vwma(closes_prefix_prev, vols_prefix_prev, 20)
+                    ema_curr = self.compute_ema(closes_prefix_curr, 5)
+                    vw_curr = self.compute_vwma(closes_prefix_curr, vols_prefix_curr, 20)
+
+                    c_prev = candles[idx_prev]
+                    c_curr = candles[idx_curr]
+                    is_red = lambda c: c["close"] < c["open"]
+
+                    # If indicator values missing, skip
+                    if None not in (ema_prev, vw_prev, ema_curr, vw_curr):
+                        pending = self.s4_pending.get(symbol)
+
+                        # First condition: previous ema > vwma, current is red and ema < vwma -> set pending
+                        if (ema_prev > vw_prev) and is_red(c_curr) and (ema_curr < vw_curr):
+                            # set pending only if not already pending
+                            if not pending:
+                                self.s4_pending[symbol] = {"first_idx": idx_curr, "first_time": c_curr["time"]}
+                                logging.info(f"[STRAT4] Pending set for {symbol} at idx={idx_curr} time={c_curr['time']} ema_prev={ema_prev:.2f} vw_prev={vw_prev:.2f} ema_curr={ema_curr:.2f} vw_curr={vw_curr:.2f}")
+                        # If pending exists, check for entry candle
+                        elif pending:
+                            # If ema has come back above vwma, clear pending
+                            if ema_curr >= vw_curr:
+                                logging.info(f"[STRAT4] Pending cleared for {symbol} because ema >= vwma now (ema={ema_curr:.2f}, vwma={vw_curr:.2f})")
+                                self.s4_pending.pop(symbol, None)
+                            else:
+                                # check entry candle: red and ema at most 2% lower than vwma
+                                GAP = 0.02
+                                if is_red(c_curr) and (ema_curr <= vw_curr) and (ema_curr >= vw_curr * (1 - GAP)):
+                                    entry = c_curr["close"]
+                                    sl = c_curr["high"] + 5
+                                    if (sl - entry) > 60:
+                                        logging.info(f"[STRAT4] Skipped due to wide SL: {sl-entry:.2f} pts")
+                                        self.s4_pending.pop(symbol, None)
+                                    else:
+                                        # place orders
+                                        raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "STRAT4ENTRY")
+                                        raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "STRAT4SL")
+                                        sl_order_id = _extract_order_id(raw_sl)
+                                        entry_order_id = _extract_order_id(raw_entry)
+                                        self.positions[symbol] = {
+                                            "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                                            "entry_order": {"id": entry_order_id, "resp": raw_entry},
+                                            "strategy": "strat4",
+                                            "entry_price": entry,
+                                            "sl_price": sl
+                                        }
+                                        log_to_journal(symbol, "ENTRY", "strat4", entry=entry, sl=sl)
+                                        logging.info(f"[STRAT4] ENTRY @{entry} SL @{sl} for {symbol}")
+                                        # clear pending on entry
+                                        self.s4_pending.pop(symbol, None)
+        except Exception as e:
+            logging.exception(f"[STRAT4] error processing {symbol}: {e}")
+
         # -------- EXIT conditions (common) --------
         position = self.positions.get(symbol)
         if position and candle["close"] > ema5 and candle["close"] > vwma20 and candle["close"] > candle["open"]:
@@ -696,4 +772,3 @@ if __name__ == "__main__":
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
     fyers_client.start_order_socket()
-
