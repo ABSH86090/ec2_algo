@@ -43,6 +43,12 @@ EXIT_THROTTLE_MS = int(os.getenv("EXIT_THROTTLE_MS", "500"))
 # Logging verbosity can be controlled via env var, e.g., EXIT_LOG_LEVEL=DEBUG
 EXIT_LOG_LEVEL = os.getenv("EXIT_LOG_LEVEL", "INFO").upper()
 
+# Safety buffer for SL placement: leave at least one tick (or a few points) below LTP
+MIN_SL_BUFFER = float(os.getenv("MIN_SL_BUFFER", "0.05"))  # smallest unit (tick)
+
+# small pause after cancel before placing new SL to reduce race (seconds)
+CANCEL_SETTLE_SEC = float(os.getenv("CANCEL_SETTLE_SEC", "0.06"))
+
 # Reset logging handlers
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
@@ -603,6 +609,70 @@ class NiftyBuyStrategy:
         """
         return self.upper_wick_ratio(c) <= max_ratio
 
+    # --- ORDER helpers for robust id extraction and safe SL update ---
+    def _extract_order_id(self, order_resp):
+        """Attempt to extract order id from broker response (which may be dict/string)."""
+        try:
+            if not order_resp:
+                return None
+            if isinstance(order_resp, dict):
+                if order_resp.get("id"):
+                    return str(order_resp.get("id"))
+                if order_resp.get("orders") and isinstance(order_resp["orders"], dict) and order_resp["orders"].get("id"):
+                    return str(order_resp["orders"].get("id"))
+                raw = order_resp.get("raw")
+                if isinstance(raw, dict) and raw.get("id"):
+                    return str(raw.get("id"))
+            if isinstance(order_resp, str):
+                try:
+                    j = json.loads(order_resp)
+                    return j.get("id") or (j.get("raw") and j["raw"].get("id"))
+                except Exception:
+                    return None
+        except Exception:
+            return None
+        return None
+
+    def _safe_cancel_and_place_sl(self, symbol, pos, new_sl, tag="NIFTYSLTRAIL"):
+        """
+        Cancel existing SL order (if any), wait briefly, then place a new SL-M sell with safety checks.
+        Returns the SL-order-response (or None) and the extracted order id.
+        """
+        try:
+            # Extract and cancel existing SL order if possible
+            old_order = pos.get("sl_order")
+            old_order_id = pos.get("sl_order_id") or self._extract_order_id(old_order)
+            if old_order_id:
+                try:
+                    cancel_resp = self.fyers.cancel_order(old_order_id)
+                    logger.debug(f"Cancel response while trailing SL for {symbol}: {cancel_resp}")
+                except Exception as e:
+                    logger.warning(f"Cancel attempt raised while trailing SL for {symbol}: {e}")
+                # short settle to reduce race
+                time.sleep(CANCEL_SETTLE_SEC)
+
+            # Safety clamp: ensure stop price is strictly below current LTP by at least MIN_SL_BUFFER
+            curr_ltp = pos.get("last_ltp") or None
+            if curr_ltp is not None:
+                max_allowed_sl = round_to_tick(curr_ltp - MIN_SL_BUFFER)
+                if new_sl >= max_allowed_sl:
+                    logger.info(f"Trailing SL not safe to place for {symbol}: desired {new_sl} >= max_allowed {max_allowed_sl} (ltp={curr_ltp})")
+                    return None, None
+
+            # Place SL sell (SL-M)
+            sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, new_sl, tag=tag)
+            sl_id = self._extract_order_id(sl_resp)
+            # persist sl_order and id
+            pos["sl_order"] = sl_resp
+            if sl_id:
+                pos["sl_order_id"] = sl_id
+            logger.info(f"Placed trailing SL {new_sl} for {symbol}, sl_id={sl_id}")
+            return sl_resp, sl_id
+        except Exception as e:
+            logger.error(f"_safe_cancel_and_place_sl failed for {symbol}: {e}")
+            return None, None
+
+    # --- main candle handler ---
     def on_candle(self, symbol, candle):
         try:
             self.candles[symbol].append(candle)
@@ -766,15 +836,23 @@ class NiftyBuyStrategy:
                     buy_resp = self.fyers.place_market_buy(symbol, self.lot_size, tag="NIFTYBUYENTRY")
                     sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, sl, tag="NIFTYSL")
 
+                    # Extract SL order id if available
+                    sl_id = self._extract_order_id(sl_resp)
+
                     # Store position; do NOT log exit until trade fills reported by on_trade
                     self.positions[symbol] = {
                         "entry": entry,
                         "sl": sl,
+                        "orig_sl": sl,           # store original SL baseline for trailing computation
+                        "last_trail_step": -1,    # last applied trailing step
                         "target": target,
                         "sl_order": sl_resp,
+                        "sl_order_id": sl_id,
                         "exit_initiated": False,
                         "last_exit_attempt_ms": 0,
-                        "exit_requested_at": None  # timestamp when exit requested
+                        "exit_requested_at": None,
+                        "max_ltp": None,
+                        "last_ltp": None
                     }
                     logger.info(json.dumps({
                         'event': 'entry_assumed',
@@ -869,7 +947,7 @@ class NiftyBuyStrategy:
         except Exception as e:
             logger.error(f"_attempt_target_exit error for {symbol}: {e}")
 
-    # --- tick-level handler for immediate exits ---
+    # --- tick-level handler for immediate exits & robust trailing SL ---
     def on_tick(self, symbol, ltp, ts):
         """
         Called for every incoming tick. We use this to check target-hit intra-candle
@@ -881,28 +959,52 @@ class NiftyBuyStrategy:
             if not pos:
                 return
             entry = pos["entry"]
-            orig_sl = pos["sl"]
+            orig_sl = pos.get("orig_sl", pos.get("sl"))
 
-            # --- NEW: Trailing SL logic ---
-            if ltp > entry:
-                move_up = ltp - entry
-                steps = int(move_up // 10)   # how many 10-pt steps
-                new_sl = round_to_tick(entry - (entry - orig_sl) + steps * 5)
-                if new_sl > pos["sl"]:  # only trail upwards
-                    pos["sl"] = new_sl
-                    logger.info(f"Trailing SL for {symbol}: moved to {new_sl} (ltp={ltp})")
-                    try:
-                        # Cancel old SL order & place new one
-                        sl_order = pos.get("sl_order")
-                        sl_order_id = None
-                        if sl_order and isinstance(sl_order, dict):
-                            sl_order_id = sl_order.get("id") or (sl_order.get("raw") and sl_order.get("raw").get("id"))
-                            if sl_order_id:
-                                self.fyers.cancel_order(sl_order_id)
-                        sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, new_sl, tag="NIFTYSLTRAIL")
-                        pos["sl_order"] = sl_resp
-                    except Exception as e:
-                        logger.error(f"Failed to update SL for {symbol}: {e}")
+            # maintain max LTP seen since entry for trailing decisions
+            if pos.get("max_ltp") is None:
+                pos["max_ltp"] = ltp
+            else:
+                if ltp > pos["max_ltp"]:
+                    pos["max_ltp"] = ltp
+
+            pos["last_ltp"] = ltp  # keep latest seen LTP for safety checks
+
+            # --- Robust trailing SL: use max_ltp and last_trail_step to avoid duplicate moves ---
+            if pos.get("entry") is not None and ltp > pos["entry"]:
+                move_up = pos["max_ltp"] - pos["entry"]
+                trail_step = int(move_up // 10)
+
+                # If we've already applied this step (or it's zero), do nothing
+                if trail_step <= pos.get("last_trail_step", -1):
+                    pass
+                else:
+                    desired_sl = round_to_tick(orig_sl + trail_step * 5)
+
+                    # Safety: ensure desired_sl is strictly below current LTP by buffer
+                    max_allowed_sl = round_to_tick(ltp - MIN_SL_BUFFER)
+                    if desired_sl >= max_allowed_sl:
+                        # desired is too aggressive; clamp to safe value below LTP if that still improves SL
+                        clamped = round_to_tick(max_allowed_sl - TICK_SIZE)
+                        if clamped > pos["sl"] and clamped < ltp:
+                            desired_sl = clamped
+                        else:
+                            logger.debug(f"Trailing SL for {symbol}: desired {desired_sl} unsafe (>= {max_allowed_sl}); skipping.")
+                            desired_sl = None
+
+                    if desired_sl and desired_sl > pos["sl"]:
+                        try:
+                            sl_resp, sl_id = self._safe_cancel_and_place_sl(symbol, pos, desired_sl, tag="NIFTYSLTRAIL")
+                            if sl_resp:
+                                pos["sl"] = desired_sl
+                                if sl_id:
+                                    pos["sl_order_id"] = sl_id
+                                pos["last_trail_step"] = trail_step
+                                logger.info(f"Trailing SL applied for {symbol}: step={trail_step}, sl={desired_sl}, max_ltp={pos['max_ltp']}")
+                            else:
+                                logger.debug(f"No new SL placed for {symbol} (desired_sl={desired_sl})")
+                        except Exception as e:
+                            logger.error(f"Failed to update SL for {symbol}: {e}")
 
             # --- Target exit logic (existing) ---
             if ltp >= pos["target"] and not pos.get("exit_initiated"):
