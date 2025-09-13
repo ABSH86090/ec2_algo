@@ -3,6 +3,7 @@ import logging
 import csv
 import os
 import time
+import uuid
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
@@ -19,13 +20,13 @@ TRADING_START = datetime.time(9, 15)
 TRADING_END = datetime.time(15, 0)
 JOURNAL_FILE = "sensex_trades.csv"
 
-# Ensure journal file exists with headers
+# Ensure journal file exists with headers (added trade_id and pnl)
 if not os.path.exists(JOURNAL_FILE):
     with open(JOURNAL_FILE, mode="w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "timestamp", "symbol", "action", "strategy",
-            "entry_price", "sl_price", "exit_price", "remarks"
+            "timestamp", "trade_id", "symbol", "action", "strategy",
+            "entry_price", "sl_price", "exit_price", "pnl", "remarks"
         ])
 
 # Reset logging handlers
@@ -39,13 +40,127 @@ logging.basicConfig(
 )
 
 # ---------------- Helpers ----------------
-def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None, remarks=""):
-    with open(JOURNAL_FILE, mode="a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            symbol, action, strategy, entry, sl, exit, remarks
-        ])
+def _safe_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+def compute_pnl_for_short(entry_price, exit_price, lot_size):
+    """For short trades: profit per unit = entry - exit. Multiply by lot_size (qty)."""
+    if entry_price is None or exit_price is None:
+        return None
+    try:
+        pnl_points = float(entry_price) - float(exit_price)
+        pnl_value = pnl_points * float(lot_size)
+        return round(pnl_value, 2)
+    except Exception:
+        return None
+
+def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None, remarks="", trade_id=None, lot_size=LOT_SIZE):
+    """
+    If action == 'ENTRY', append a new row and return trade_id.
+    If action in ('EXIT','SL_HIT'), update the matching entry row (by trade_id if provided,
+    otherwise by symbol & empty exit_price) and write exit/pnl/remarks into same row.
+    """
+    # Ensure file exists and header correct (in case script restarted)
+    if not os.path.exists(JOURNAL_FILE):
+        with open(JOURNAL_FILE, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp", "trade_id", "symbol", "action", "strategy",
+                "entry_price", "sl_price", "exit_price", "pnl", "remarks"
+            ])
+
+    if action == "ENTRY":
+        # create trade_id if not provided
+        tid = trade_id or str(uuid.uuid4())
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(JOURNAL_FILE, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp, tid, symbol, action, strategy,
+                entry, sl, "", "", remarks
+            ])
+        return tid
+
+    # For EXIT or SL_HIT, update the existing row
+    # Read all rows
+    updated = False
+    rows = []
+    with open(JOURNAL_FILE, mode="r", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        for r in reader:
+            rows.append(r)
+
+    # Try to find row by trade_id first (most reliable)
+    target_idx = None
+    if trade_id:
+        for idx in range(len(rows)-1, -1, -1):
+            r = rows[idx]
+            if r.get("trade_id") == trade_id:
+                target_idx = idx
+                break
+
+    # If not found by trade_id, fallback: find latest row for same symbol with empty exit_price
+    if target_idx is None:
+        for idx in range(len(rows)-1, -1, -1):
+            r = rows[idx]
+            if r.get("symbol") == symbol and (not r.get("exit_price")):
+                # optionally match strategy/entry if provided
+                if strategy and r.get("strategy") and r.get("strategy") != strategy:
+                    continue
+                if entry is not None and r.get("entry_price"):
+                    try:
+                        if float(r.get("entry_price")) != float(entry):
+                            continue
+                    except Exception:
+                        pass
+                target_idx = idx
+                break
+
+    if target_idx is not None:
+        r = rows[target_idx]
+        # Update fields
+        r["action"] = action  # final action on that row (SL_HIT or EXIT)
+        if exit is not None:
+            r["exit_price"] = str(exit)
+        if sl is not None:
+            r["sl_price"] = str(sl)
+        # compute pnl for short trades
+        entry_val = _safe_float(r.get("entry_price"))
+        exit_val = _safe_float(r.get("exit_price"))
+        pnl = compute_pnl_for_short(entry_val, exit_val, lot_size)
+        r["pnl"] = "" if pnl is None else str(pnl)
+        # Merge remarks, preserving previous remarks
+        prev_remarks = r.get("remarks") or ""
+        combined = (prev_remarks + " | " + remarks).strip(" | ")
+        r["remarks"] = combined
+        rows[target_idx] = r
+        updated = True
+    else:
+        # If no matching entry row, append as fallback (should not usually happen)
+        tid = trade_id or str(uuid.uuid4())
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        pnl = compute_pnl_for_short(entry, exit, lot_size) if entry is not None and exit is not None else ""
+        with open(JOURNAL_FILE, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                timestamp, tid, symbol, action, strategy,
+                entry, sl, exit, pnl, remarks
+            ])
+        return
+
+    # Write back all rows
+    with open(JOURNAL_FILE, mode="w", newline="") as f:
+        if not fieldnames:
+            fieldnames = ["timestamp", "trade_id", "symbol", "action", "strategy",
+                          "entry_price", "sl_price", "exit_price", "pnl", "remarks"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
 
 # ---------------- EXPIRY & SYMBOL UTILS ----------------
 def get_next_expiry():
@@ -135,28 +250,6 @@ def _is_cancel_success(resp):
         if "order cancelled" in msg or "already cancelled" in msg or code == -99:
             return True
     return False
-
-# ---------------- EXPIRY & SYMBOL UTILS ----------------
-def get_next_expiry():
-    """Return expiry date (Thursday) for SENSEX options."""
-    today = datetime.date.today()
-    weekday = today.weekday()  # Monday=0 ... Sunday=6
-    if weekday == 3:  # Thursday
-        expiry = today
-    else:
-        days_to_thu = (3 - weekday) % 7
-        expiry = today + datetime.timedelta(days=days_to_thu)
-    return expiry
-
-def format_expiry(expiry_date):
-    """Format expiry date based on month rule (YYMDD if month<10, YYMMDD otherwise)."""
-    yy = expiry_date.strftime("%y")
-    m = expiry_date.month
-    d = expiry_date.day
-    if m < 10:
-        return f"{yy}{m}{d:02d}"   # YYMDD
-    else:
-        return f"{yy}{m:02d}{d:02d}"  # YYMMDD
 
 # ---------------- FYERS CLIENT ----------------
 class FyersClient:
@@ -301,12 +394,11 @@ class StrategyEngine:
     def __init__(self, fyers_client: FyersClient, lot_size: int = 20):
         self.fyers = fyers_client
         self.lot_size = lot_size
-        self.positions = {}  # { symbol: { strategy, sl_order: {id, resp}, entry_order: {...}, entry_price, sl_price } }
+        # positions: { symbol: { strategy, sl_order: {id, resp}, entry_order: {...}, entry_price, sl_price, trade_id } }
+        self.positions = {}
         self.sl_count = 0
         self.candles = defaultdict(lambda: deque(maxlen=200))
         self.s3_fired_date = {}  # { symbol: date }
-        # --- STRAT4 state ---
-        # pending map: symbol -> { "first_idx": int (index in candles list), "first_time": datetime }
         self.s4_pending = {}
 
     def prefill_history(self, symbols, days_back=1):
@@ -357,10 +449,6 @@ class StrategyEngine:
         return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / denom
 
     def detect_pattern(self, candles):
-        """
-        Strategy 1 pattern (last 6 candles):
-        R, R, G, R, G, R and close[2nd red] < close[1st red]; EMA5 < VWMA20 for each of the 6.
-        """
         n = len(candles)
         if n < 6:
             return False
@@ -557,15 +645,16 @@ class StrategyEngine:
                 raw_sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, s3["sl"], "STRAT3SL")
                 sl_order_id = _extract_order_id(raw_sl_resp)
                 entry_order_id = _extract_order_id(raw_entry_resp)
+                trade_id = log_to_journal(symbol, "ENTRY", "strat3", entry=s3["entry"], sl=s3["sl"], remarks="", trade_id=None, lot_size=self.lot_size)
                 self.positions[symbol] = {
                     "sl_order": {"id": sl_order_id, "resp": raw_sl_resp},
                     "entry_order": {"id": entry_order_id, "resp": raw_entry_resp},
                     "strategy": "strat3",
                     "entry_price": s3["entry"],
-                    "sl_price": s3["sl"]
+                    "sl_price": s3["sl"],
+                    "trade_id": trade_id
                 }
                 self.s3_fired_date[symbol] = s3["date"]
-                log_to_journal(symbol, "ENTRY", "strat3", entry=s3["entry"], sl=s3["sl"])
                 logging.info(f"[STRAT3] ENTRY @{s3['entry']} SL @{s3['sl']} for {symbol}")
 
         # -------- STRATEGY 1 --------
@@ -580,14 +669,16 @@ class StrategyEngine:
                 raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
                 sl_order_id = _extract_order_id(raw_sl)
                 entry_order_id = _extract_order_id(raw_entry)
+                trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="", trade_id=None, lot_size=self.lot_size)
                 self.positions[symbol] = {
                     "sl_order": {"id": sl_order_id, "resp": raw_sl},
                     "entry_order": {"id": entry_order_id, "resp": raw_entry},
                     "strategy": "strat1",
                     "entry_price": entry_price,
-                    "sl_price": sl_price
+                    "sl_price": sl_price,
+                    "trade_id": trade_id
                 }
-                log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price)
+                logging.info(f"[STRAT1] ENTRY @{entry_price} SL @{sl_price} for {symbol}")
 
         # -------- STRATEGY 2 --------
         position = self.positions.get(symbol)
@@ -598,29 +689,24 @@ class StrategyEngine:
                 raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, strat2["sl"], "STRAT2SL")
                 sl_order_id = _extract_order_id(raw_sl)
                 entry_order_id = _extract_order_id(raw_entry)
+                trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=strat2["entry"], sl=strat2["sl"], remarks="", trade_id=None, lot_size=self.lot_size)
                 self.positions[symbol] = {
                     "sl_order": {"id": sl_order_id, "resp": raw_sl},
                     "entry_order": {"id": entry_order_id, "resp": raw_entry},
                     "strategy": "strat2",
                     "entry_price": strat2["entry"],
-                    "sl_price": strat2["sl"]
+                    "sl_price": strat2["sl"],
+                    "trade_id": trade_id
                 }
-                log_to_journal(symbol, "ENTRY", "strat2", entry=strat2["entry"], sl=strat2["sl"])
+                logging.info(f"[STRAT2] ENTRY @{strat2['entry']} SL @{strat2['sl']} for {symbol}")
 
         # -------- STRATEGY 4 (NEW) --------
-        # Conditions:
-        # 1) First red candle where ema5 becomes < vwma20 while previous candle's ema5 > vwma20 -> mark pending
-        # 2) Later, when a red candle closes with ema5 <= vwma20 and ema5 >= vwma20 * 0.98 (<=2% lower),
-        #    take entry (limit sell at close) and SL = that red candle high + 5
-        # Clear pending if ema goes back above vwma (condition broken).
         try:
-            # Only consider if no position exists for symbol and SL quota not exceeded
             if self.positions.get(symbol) is None:
                 n = len(candles)
                 if n >= 2:
                     idx_prev = n - 2
                     idx_curr = n - 1
-                    # compute ema/vwma for prev and curr candle indexes
                     closes_prefix_prev = closes[:idx_prev+1]
                     vols_prefix_prev = volumes[:idx_prev+1]
                     closes_prefix_curr = closes[:idx_curr+1]
@@ -635,24 +721,18 @@ class StrategyEngine:
                     c_curr = candles[idx_curr]
                     is_red = lambda c: c["close"] < c["open"]
 
-                    # If indicator values missing, skip
                     if None not in (ema_prev, vw_prev, ema_curr, vw_curr):
                         pending = self.s4_pending.get(symbol)
 
-                        # First condition: previous ema > vwma, current is red and ema < vwma -> set pending
                         if (ema_prev > vw_prev) and is_red(c_curr) and (ema_curr < vw_curr):
-                            # set pending only if not already pending
                             if not pending:
                                 self.s4_pending[symbol] = {"first_idx": idx_curr, "first_time": c_curr["time"]}
-                                logging.info(f"[STRAT4] Pending set for {symbol} at idx={idx_curr} time={c_curr['time']} ema_prev={ema_prev:.2f} vw_prev={vw_prev:.2f} ema_curr={ema_curr:.2f} vw_curr={vw_curr:.2f}")
-                        # If pending exists, check for entry candle
+                                logging.info(f"[STRAT4] Pending set for {symbol} at idx={idx_curr} time={c_curr['time']}")
                         elif pending:
-                            # If ema has come back above vwma, clear pending
                             if ema_curr >= vw_curr:
                                 logging.info(f"[STRAT4] Pending cleared for {symbol} because ema >= vwma now (ema={ema_curr:.2f}, vwma={vw_curr:.2f})")
                                 self.s4_pending.pop(symbol, None)
                             else:
-                                # check entry candle: red and ema at most 2% lower than vwma and atleast 1% lower than vwma
                                 GAP = 0.02
                                 GAP_MIN_STRAT_4 = 0.01
                                 if is_red(c_curr) and (ema_curr <= vw_curr) and (ema_curr >= vw_curr * (1 - GAP)) and (ema_curr <= vw_curr * (1 - GAP_MIN_STRAT_4)):
@@ -662,21 +742,20 @@ class StrategyEngine:
                                         logging.info(f"[STRAT4] Skipped due to wide SL: {sl-entry:.2f} pts")
                                         self.s4_pending.pop(symbol, None)
                                     else:
-                                        # place orders
                                         raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "STRAT4ENTRY")
                                         raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "STRAT4SL")
                                         sl_order_id = _extract_order_id(raw_sl)
                                         entry_order_id = _extract_order_id(raw_entry)
+                                        trade_id = log_to_journal(symbol, "ENTRY", "strat4", entry=entry, sl=sl, remarks="", trade_id=None, lot_size=self.lot_size)
                                         self.positions[symbol] = {
                                             "sl_order": {"id": sl_order_id, "resp": raw_sl},
                                             "entry_order": {"id": entry_order_id, "resp": raw_entry},
                                             "strategy": "strat4",
                                             "entry_price": entry,
-                                            "sl_price": sl
+                                            "sl_price": sl,
+                                            "trade_id": trade_id
                                         }
-                                        log_to_journal(symbol, "ENTRY", "strat4", entry=entry, sl=sl)
                                         logging.info(f"[STRAT4] ENTRY @{entry} SL @{sl} for {symbol}")
-                                        # clear pending on entry
                                         self.s4_pending.pop(symbol, None)
         except Exception as e:
             logging.exception(f"[STRAT4] error processing {symbol}: {e}")
@@ -699,24 +778,28 @@ class StrategyEngine:
                 self.fyers.place_market_buy(symbol, self.lot_size, "EXITCOND")
                 entry_price = position.get("entry_price")
                 sl_price = position.get("sl_price")
+                trade_id = position.get("trade_id")
+                # Interpret if loss on short -> SL_HIT; else normal EXIT
                 if entry_price is not None and exit_price > entry_price:
-                    # Treat as SL if loss on short
                     self.sl_count += 1
                     log_to_journal(
                         symbol, "SL_HIT", position["strategy"],
                         entry=entry_price, sl=sl_price, exit=exit_price,
-                        remarks=f"Exit after cancel (interpreted success). cancel_resp={cancel_resp}"
+                        remarks=f"Exit after cancel (interpreted success). cancel_resp={cancel_resp}",
+                        trade_id=trade_id,
+                        lot_size=self.lot_size
                     )
                 else:
                     log_to_journal(
                         symbol, "EXIT", position["strategy"],
                         entry=entry_price, sl=sl_price, exit=exit_price,
-                        remarks=f"Exit condition met. cancel_resp={cancel_resp}"
+                        remarks=f"Exit condition met. cancel_resp={cancel_resp}",
+                        trade_id=trade_id,
+                        lot_size=self.lot_size
                     )
                 self.positions[symbol] = None
             else:
                 logging.warning(f"[EXIT SKIPPED] {symbol} - Cancel failed or unknown: {cancel_resp}")
-                # Attempt broker reconcile to see if order was cancelled/executed asynchronously
                 self.reconcile_position(symbol)
 
     def on_trade(self, msg):
@@ -725,13 +808,11 @@ class StrategyEngine:
             trades = msg.get("trades") or msg.get("data") or msg
             if not trades:
                 return
-            # try to extract symbol & side
             symbol = None
             side = None
             if isinstance(trades, dict):
                 symbol = trades.get("symbol") or trades.get("s") or trades.get("sym")
                 side = trades.get("side")
-            # sometimes trades is a list
             if isinstance(trades, list) and len(trades) > 0 and isinstance(trades[0], dict):
                 t0 = trades[0]
                 symbol = symbol or t0.get("symbol")
@@ -743,10 +824,16 @@ class StrategyEngine:
             position = self.positions.get(symbol)
             # SL Buy executed -> side == 1 (buy)
             if position and side == 1:
+                trade_id = position.get("trade_id")
+                entry_price = position.get("entry_price")
+                sl_price = position.get("sl_price")
                 log_to_journal(
                     symbol, "SL_HIT", position["strategy"],
-                    entry=position.get("entry_price"), sl=position.get("sl_price"),
-                    remarks=str(msg)
+                    entry=entry_price, sl=sl_price,
+                    exit=None,  # we may not have exact exit price in msg; if available, include
+                    remarks=str(msg),
+                    trade_id=trade_id,
+                    lot_size=self.lot_size
                 )
                 self.sl_count += 1
                 self.positions[symbol] = None
@@ -773,4 +860,3 @@ if __name__ == "__main__":
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
     fyers_client.start_order_socket()
-
