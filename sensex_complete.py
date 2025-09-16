@@ -400,6 +400,9 @@ class StrategyEngine:
         self.candles = defaultdict(lambda: deque(maxlen=200))
         self.s3_fired_date = {}  # { symbol: date }
         self.s4_pending = {}
+        # NEW for Strategy 1
+        self.s1_marked_low = {}   # { symbol: (date, low_value) }
+        self.s1_fired_date = {}   # { symbol: date }  -> to avoid firing more than once per day
 
     def prefill_history(self, symbols, days_back=1):
         """Prefill candles with historical data for warm start."""
@@ -657,28 +660,56 @@ class StrategyEngine:
                 self.s3_fired_date[symbol] = s3["date"]
                 logging.info(f"[STRAT3] ENTRY @{s3['entry']} SL @{s3['sl']} for {symbol}")
 
-        # -------- STRATEGY 1 --------
+        # -------- STRATEGY 1 (UPDATED) --------
+        # Mark low of the first 3-min candle of the day (9:15). We set per symbol per day.
+        now_date = datetime.date.today()
+        first_mark = self.s1_marked_low.get(symbol)
+        # if not marked for today, check whether this candle is the first session candle
+        if (not first_mark) or (first_mark[0] != now_date):
+            # identify today's candle that is exactly TRADING_START time
+            # candle["time"] is datetime; if it equals TRADING_START, mark it
+            try:
+                c_time = candle["time"].time()
+                if c_time == TRADING_START:
+                    # record low for today
+                    self.s1_marked_low[symbol] = (now_date, candle["low"])
+                    logging.info(f"[STRAT1] Marked first-candle low for {symbol} = {candle['low']}")
+            except Exception as e:
+                logging.exception(f"[STRAT1] error marking first candle low for {symbol}: {e}")
+
+        # Now check breakdown trigger only if we haven't taken STRAT1 today and position is empty
         position = self.positions.get(symbol)
-        if position is None and self.detect_pattern(candles) and ema5 < vwma20:
-            entry_price = candles[-1]["close"]
-            sl_price = candles[-1]["high"] + 2
-            if (sl_price - entry_price) > 60:
-                logging.info(f"[STRAT1] Skipped due to wide SL: {sl_price-entry_price:.2f} pts")
-            else:
-                raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
-                raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
-                sl_order_id = _extract_order_id(raw_sl)
-                entry_order_id = _extract_order_id(raw_entry)
-                trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="", trade_id=None, lot_size=self.lot_size)
-                self.positions[symbol] = {
-                    "sl_order": {"id": sl_order_id, "resp": raw_sl},
-                    "entry_order": {"id": entry_order_id, "resp": raw_entry},
-                    "strategy": "strat1",
-                    "entry_price": entry_price,
-                    "sl_price": sl_price,
-                    "trade_id": trade_id
-                }
-                logging.info(f"[STRAT1] ENTRY @{entry_price} SL @{sl_price} for {symbol}")
+        fired_today = self.s1_fired_date.get(symbol)
+        if position is None and fired_today != now_date:
+            marked = self.s1_marked_low.get(symbol)
+            if marked and marked[0] == now_date:
+                marked_low = marked[1]
+                # breakdown condition: any 3-min candle closes below marked_low AND is red (close < open)
+                is_red = lambda c: c["close"] < c["open"]
+                if candle["close"] < marked_low and is_red(candle):
+                    entry_price = candle["close"]
+                    sl_price = candle["high"] + 10  # SL = high of breakdown candle + 10
+                    if (sl_price - entry_price) > 65:
+                        logging.info(f"[STRAT1] Skipped wide SL: {sl_price-entry_price:.2f} pts for {symbol}")
+                        # mark as fired_today to avoid repeated checks for same day
+                        self.s1_fired_date[symbol] = now_date
+                    else:
+                        # place orders: limit sell entry + stoploss buy
+                        raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
+                        raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
+                        sl_order_id = _extract_order_id(raw_sl)
+                        entry_order_id = _extract_order_id(raw_entry)
+                        trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="breakdown entry", trade_id=None, lot_size=self.lot_size)
+                        self.positions[symbol] = {
+                            "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                            "entry_order": {"id": entry_order_id, "resp": raw_entry},
+                            "strategy": "strat1",
+                            "entry_price": entry_price,
+                            "sl_price": sl_price,
+                            "trade_id": trade_id
+                        }
+                        self.s1_fired_date[symbol] = now_date
+                        logging.info(f"[STRAT1] ENTRY @{entry_price} SL @{sl_price} for {symbol} (marked_low={marked_low})")
 
         # -------- STRATEGY 2 --------
         position = self.positions.get(symbol)
@@ -762,7 +793,8 @@ class StrategyEngine:
 
         # -------- EXIT conditions (common) --------
         position = self.positions.get(symbol)
-        if position and candle["close"] > ema5 and candle["close"] > vwma20 and candle["close"] > candle["open"]:
+        # Exit if we have a position and we see a green candle that closes above VWMA20
+        if position and (candle["close"] > candle["open"]) and (candle["close"] > vwma20):
             sl_order_info = position.get("sl_order") or {}
             sl_order_id = sl_order_info.get("id")
             exit_price = candle["close"]
