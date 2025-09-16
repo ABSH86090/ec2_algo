@@ -402,7 +402,9 @@ class StrategyEngine:
         self.s4_pending = {}
         # NEW for Strategy 1
         self.s1_marked_low = {}   # { symbol: (date, low_value) }
-        self.s1_fired_date = {}   # { symbol: date }  -> to avoid firing more than once per day
+        self.s1_fired_date = {}   # { symbol: date }  -> to avoid firing more than once per day per symbol
+        # GLOBAL flag: ensure Strategy 1 entry happens only once per day across ALL symbols
+        self.s1_global_fired_date = None  # date when S1 was actually taken (global once-per-day)
 
     def prefill_history(self, symbols, days_back=1):
         """Prefill candles with historical data for warm start."""
@@ -660,7 +662,7 @@ class StrategyEngine:
                 self.s3_fired_date[symbol] = s3["date"]
                 logging.info(f"[STRAT3] ENTRY @{s3['entry']} SL @{s3['sl']} for {symbol}")
 
-        # -------- STRATEGY 1 (UPDATED) --------
+        # -------- STRATEGY 1 (UPDATED: per-symbol mark + GLOBAL once-per-day limit) --------
         # Mark low of the first 3-min candle of the day (9:15). We set per symbol per day.
         now_date = datetime.date.today()
         first_mark = self.s1_marked_low.get(symbol)
@@ -677,39 +679,46 @@ class StrategyEngine:
             except Exception as e:
                 logging.exception(f"[STRAT1] error marking first candle low for {symbol}: {e}")
 
-        # Now check breakdown trigger only if we haven't taken STRAT1 today and position is empty
+        # Now check breakdown trigger only if we haven't taken STRAT1 today (global) and position is empty
         position = self.positions.get(symbol)
         fired_today = self.s1_fired_date.get(symbol)
-        if position is None and fired_today != now_date:
-            marked = self.s1_marked_low.get(symbol)
-            if marked and marked[0] == now_date:
-                marked_low = marked[1]
-                # breakdown condition: any 3-min candle closes below marked_low AND is red (close < open)
-                is_red = lambda c: c["close"] < c["open"]
-                if candle["close"] < marked_low and is_red(candle):
-                    entry_price = candle["close"]
-                    sl_price = candle["high"] + 10  # SL = high of breakdown candle + 10
-                    if (sl_price - entry_price) > 65:
-                        logging.info(f"[STRAT1] Skipped wide SL: {sl_price-entry_price:.2f} pts for {symbol}")
-                        # mark as fired_today to avoid repeated checks for same day
-                        self.s1_fired_date[symbol] = now_date
-                    else:
-                        # place orders: limit sell entry + stoploss buy
-                        raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
-                        raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
-                        sl_order_id = _extract_order_id(raw_sl)
-                        entry_order_id = _extract_order_id(raw_entry)
-                        trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="breakdown entry", trade_id=None, lot_size=self.lot_size)
-                        self.positions[symbol] = {
-                            "sl_order": {"id": sl_order_id, "resp": raw_sl},
-                            "entry_order": {"id": entry_order_id, "resp": raw_entry},
-                            "strategy": "strat1",
-                            "entry_price": entry_price,
-                            "sl_price": sl_price,
-                            "trade_id": trade_id
-                        }
-                        self.s1_fired_date[symbol] = now_date
-                        logging.info(f"[STRAT1] ENTRY @{entry_price} SL @{sl_price} for {symbol} (marked_low={marked_low})")
+        # Check global once-per-day flag: if S1 has already been taken today globally, skip
+        if self.s1_global_fired_date == now_date:
+            # global s1 already taken today; skip checking for further entries
+            logging.debug(f"[STRAT1] Global S1 already taken today; skipping checks for {symbol}")
+        else:
+            if position is None and fired_today != now_date:
+                marked = self.s1_marked_low.get(symbol)
+                if marked and marked[0] == now_date:
+                    marked_low = marked[1]
+                    # breakdown condition: any 3-min candle closes below marked_low AND is red (close < open)
+                    is_red = lambda c: c["close"] < c["open"]
+                    if candle["close"] < marked_low and is_red(candle):
+                        entry_price = candle["close"]
+                        sl_price = candle["high"] + 10  # SL = high of breakdown candle + 10
+                        if (sl_price - entry_price) > 65:
+                            logging.info(f"[STRAT1] Skipped wide SL: {sl_price-entry_price:.2f} pts for {symbol}")
+                            # mark per-symbol as checked for today to avoid repeated checks for same symbol
+                            self.s1_fired_date[symbol] = now_date
+                        else:
+                            # place orders: limit sell entry + stoploss buy
+                            raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
+                            raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
+                            sl_order_id = _extract_order_id(raw_sl)
+                            entry_order_id = _extract_order_id(raw_entry)
+                            trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="breakdown entry", trade_id=None, lot_size=self.lot_size)
+                            self.positions[symbol] = {
+                                "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                                "entry_order": {"id": entry_order_id, "resp": raw_entry},
+                                "strategy": "strat1",
+                                "entry_price": entry_price,
+                                "sl_price": sl_price,
+                                "trade_id": trade_id
+                            }
+                            # mark both per-symbol and GLOBAL that S1 has been taken today
+                            self.s1_fired_date[symbol] = now_date
+                            self.s1_global_fired_date = now_date
+                            logging.info(f"[STRAT1] ENTRY @{entry_price} SL @{sl_price} for {symbol} (marked_low={marked_low})")
 
         # -------- STRATEGY 2 --------
         position = self.positions.get(symbol)
