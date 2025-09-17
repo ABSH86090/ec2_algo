@@ -8,6 +8,7 @@ Changes:
  - hedge_qty stored in position
  - improved on_trade_update lookup for hedge fills
  - SL stop price rounded to exchange tick (round up/ceil) before placing SL order
+ - ONE-TIME trailing SL: when price moves 1:1 in our favor, SL moves to entry+2 (rounded to nearest tick 0.05). Happens only once.
 """
 
 import os
@@ -157,6 +158,14 @@ def compute_vwma(closes, volumes, period):
     return num / den
 
 # ---------------- FYERS CLIENT WRAPPER ----------------
+try:
+    from fyers_apiv3 import fyersModel
+    from fyers_apiv3.FyersWebsocket import order_ws, data_ws
+except Exception:
+    fyersModel = None
+    order_ws = None
+    data_ws = None
+
 class FyersClient:
     """
     Minimal wrapper around fyersModel + sockets to provide:
@@ -748,12 +757,23 @@ class NiftySTRAT15Engine:
         logging.info(f"[{STRATEGY_NAME}] Placing SL buy for {symbol} qty={self.lot_size} at {sl_adj}")
         sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, float(sl_adj), sl_tag)
 
+        # compute initial SL width and store sl_moved flag so we only trail once
+        try:
+            initial_sl_width = float(Decimal(str(sl_price)) - Decimal(str(entry_price)))
+        except Exception:
+            try:
+                initial_sl_width = float(sl_price) - float(entry_price)
+            except Exception:
+                initial_sl_width = None
+
         position = {
             "symbol": symbol,
             "strategy": STRATEGY_NAME,
             "entry_price": entry_price,
             "sl_price": float(sl_price),        # original computed SL (float)
             "sl_price_adj": float(sl_adj),     # adjusted SL actually sent (float)
+            "initial_sl_width": initial_sl_width,  # NEW: used to detect 1:1 move
+            "sl_moved": False,                 # NEW: one-time trail flag
             "sl_order_resp": sl_resp,
             "entry_order_resp": sell_resp,
             "hedge_symbol": hedge_symbol,
@@ -783,6 +803,65 @@ class NiftySTRAT15Engine:
         ema5 = compute_ema(closes, 5)
         vwma20 = compute_vwma(closes, volumes, 20)
         is_green = candle["close"] > candle["open"]
+
+        # --------- ONE-TIME TRAIL SL: move SL to entry+2 (rounded to nearest TICK_SIZE) when price moves 1:1 ----------
+        # This triggers only once per position. We use candle['low'] to detect intrabar touches.
+        if pos and not pos.get("sl_moved", False):
+            try:
+                entry = float(pos.get("entry_price"))
+                sl_original = float(pos.get("sl_price")) if pos.get("sl_price") is not None else None
+                initial_width = pos.get("initial_sl_width")
+                if initial_width is None:
+                    if sl_original is not None:
+                        initial_width = sl_original - entry
+                    else:
+                        initial_width = None
+
+                if initial_width is not None:
+                    # target when price has moved in our favour 1:1 (short => price down by initial_width)
+                    target_price = entry - float(initial_width)
+                    # if the candle touched or went below the target (intrabar low), move SL to entry+2 (only once)
+                    if candle.get("low") is not None and candle["low"] <= target_price:
+                        desired_raw = entry + 2.0
+                        # nearest tick rounding (method="nearest")
+                        new_sl_decimal = round_to_tick(Decimal(str(desired_raw)), tick=TICK_SIZE, method="nearest")
+                        new_sl = float(new_sl_decimal)
+
+                        # decide whether to move (only if tighter than current adjusted SL to avoid widening)
+                        current_sl_for_orders = float(pos.get("sl_price_adj", pos.get("sl_price", new_sl)))
+                        if new_sl < current_sl_for_orders:
+                            logging.info(f"[{STRATEGY_NAME}] Trailing SL: price touched target ({target_price}). Moving SL {symbol} -> {new_sl}")
+                            # cancel existing SL order if we have an id
+                            sl_order = pos.get("sl_order_resp", {})
+                            sl_order_id = None
+                            if isinstance(sl_order, dict):
+                                sl_order_id = sl_order.get("id") or sl_order.get("orderId")
+                            if sl_order_id:
+                                try:
+                                    cancel_resp = self.fyers.cancel_order(sl_order_id)
+                                    logging.info(f"[{STRATEGY_NAME}] Cancel old SL response: {cancel_resp}")
+                                except Exception:
+                                    logging.exception("[ENGINE] cancel_order failed while trailing SL")
+
+                            # place new SL buy at entry+2 rounded to nearest tick
+                            try:
+                                sl_trail_tag = sanitize_tag(f"{STRATEGY_NAME}_SL_TRAIL")
+                                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, float(new_sl_decimal), tag=sl_trail_tag)
+                                # update position record
+                                pos["sl_price_adj"] = float(new_sl_decimal)
+                                pos["sl_order_resp"] = sl_resp
+                                pos["sl_moved"] = True
+                                log_to_journal(symbol, "SL_TRAILED", STRATEGY_NAME, entry=entry, sl=float(new_sl_decimal), remarks=f"SL trailed to entry+2 (nearest tick) after price hit {target_price}. old_sl_adj={current_sl_for_orders}")
+                                logging.info(f"[{STRATEGY_NAME}] SL_TRAILED for {symbol}: new_sl={new_sl_decimal} resp={sl_resp}")
+                            except Exception:
+                                logging.exception("[ENGINE] Failed to place trailed SL")
+                        else:
+                            # new_sl not tighter than current; still mark sl_moved True to avoid repeated attempts
+                            pos["sl_moved"] = True
+                            logging.info(f"[{STRATEGY_NAME}] Computed trailed SL {new_sl} not tighter than current {current_sl_for_orders}; no change but marking sl_moved=True")
+            except Exception:
+                logging.exception("[ENGINE] Error in one-time SL trail check")
+        # --------------------------------------------------------------------------------------------
 
         # Exit condition: green candle closes above EMA5 and VWMA20
         if pos and ema5 is not None and vwma20 is not None and is_green and candle["close"] > ema5 and candle["close"] > vwma20:
