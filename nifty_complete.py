@@ -223,16 +223,33 @@ class FyersClient:
             logging.exception("[BROKER] place_limit_sell failed")
             return {"s": "error", "msg": str(e)}
 
-    def place_stoploss_buy(self, symbol: str, qty: int, stop_price: float, tag: str = ""):
+    def place_stoploss_buy(self, symbol: str, qty: int, stop_price: float, tag: str = "", limit_price: float = None):
+        """
+        Place a trigger order (stop). For options SL-M may be blocked; use SL-L by passing limit_price.
+        If limit_price is None, we set limit_price = stop_price (or stop_price + tick) to force SL-L.
+        """
         tag = sanitize_tag(tag)
-        logging.info(f"[BROKER] Place SL BUY {symbol} qty={qty} stop_price={stop_price} tag={tag}")
+        logging.info(f"[BROKER] Place SL BUY {symbol} qty={qty} stop_price={stop_price} limit_price={limit_price} tag={tag}")
         if not self.client:
             return {"s": "mock", "msg": "sl_buy_mock", "id": f"mock-sl-{datetime.datetime.now().timestamp()}"}
         try:
+            # If caller didn't provide a limit, set it to the stop_price (or add a tick buffer)
+            if limit_price is None:
+                # ensure limit >= trigger for a BUY trigger (exchange rule)
+                limit_price = float(Decimal(str(stop_price)) + TICK_SIZE)
+
             data = {
-                "symbol": symbol, "qty": qty, "type": 3, "side": 1,
-                "productType": "INTRADAY", "limitPrice": 0, "stopPrice": stop_price,
-                "validity": "DAY", "disclosedQty": 0, "offlineOrder": False, "orderTag": tag
+                "symbol": symbol,
+                "qty": qty,
+                "type": 3,         # trigger order
+                "side": 1,         # buy
+                "productType": "INTRADAY",
+                "limitPrice": float(limit_price),  # non-zero => SL-L (Trigger-Limit)
+                "stopPrice": float(stop_price),
+                "validity": "DAY",
+                "disclosedQty": 0,
+                "offlineOrder": False,
+                "orderTag": tag
             }
             return self._log_order_resp("SL Buy", self.client.place_order(data))
         except Exception as e:
@@ -755,7 +772,10 @@ class NiftySTRAT15Engine:
             logging.exception(f"[{STRATEGY_NAME}] SL tick-rounding failed for {sl_price}, using original")
 
         logging.info(f"[{STRATEGY_NAME}] Placing SL buy for {symbol} qty={self.lot_size} at {sl_adj}")
-        sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, float(sl_adj), sl_tag)
+        # Use SL-L by providing a limit slightly worse/safer than trigger to satisfy "limit >= trigger" (BUY)
+        limit_for_sl = float(Decimal(str(sl_adj)) + TICK_SIZE)
+        sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, float(sl_adj), sl_tag, limit_price=limit_for_sl)
+
 
         # compute initial SL width and store sl_moved flag so we only trail once
         try:
@@ -846,7 +866,9 @@ class NiftySTRAT15Engine:
                             # place new SL buy at entry+2 rounded to nearest tick
                             try:
                                 sl_trail_tag = sanitize_tag(f"{STRATEGY_NAME}_SL_TRAIL")
-                                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, float(new_sl_decimal), tag=sl_trail_tag)
+                                limit_for_trail_sl = float(Decimal(str(new_sl_decimal)) + TICK_SIZE)
+                                sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, float(new_sl_decimal), tag=sl_trail_tag, limit_price=limit_for_trail_sl)
+
                                 # update position record
                                 pos["sl_price_adj"] = float(new_sl_decimal)
                                 pos["sl_order_resp"] = sl_resp
