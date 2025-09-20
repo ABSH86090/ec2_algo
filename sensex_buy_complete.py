@@ -86,6 +86,15 @@ def log_trade(symbol, side, entry, sl, target, exit_price, pnl, file="trades.csv
             symbol, side, entry, sl, target, exit_price, pnl
         ])
 # ---------------- EXPIRY & SYMBOL UTILS ----------------
+def is_last_thursday(date_obj: datetime.date) -> bool:
+    """Return True if date_obj is the last Thursday of its month."""
+    # Thursday weekday() == 3
+    if date_obj.weekday() != 3:
+        return False
+    # Add 7 days; if month changes, current date is last Thursday
+    next_week = date_obj + datetime.timedelta(days=7)
+    return next_week.month != date_obj.month
+
 def get_next_expiry():
     """Return expiry date (Thursday) for SENSEX options."""
     today = datetime.date.today()
@@ -98,9 +107,17 @@ def get_next_expiry():
         expiry = today + datetime.timedelta(days=days_to_thu)
     return expiry
 
-def format_expiry(expiry_date):
-    """Format expiry date based on month rule (YYMDD if month<10, YYMMDD otherwise)."""
-    yy = expiry_date.strftime("%y")
+def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
+    """
+    Return expiry token used inside option symbols:
+    - If expiry is last Thursday of month -> 'YYMMM' (e.g. '25SEP')
+    - Else -> numeric scheme close to your old logic (YYMDD or YYMMDD).
+    """
+    yy = expiry_date.strftime("%y")  # e.g. '25'
+    if is_last_thursday(expiry_date):
+        mon = expiry_date.strftime("%b").upper()  # 'SEP'
+        return f"{yy}{mon}"
+    # fallback to previous numeric behavior for non-last-thursday expiries
     m = expiry_date.month
     d = expiry_date.day
     if m < 10:
@@ -119,7 +136,7 @@ def get_atm_symbols(fyers_client):
     atm_strike = round(ltp / 100) * 100   # nearest 100
 
     expiry = get_next_expiry()
-    expiry_str = format_expiry(expiry)
+    expiry_str = format_expiry_for_symbol(expiry)
     ce_strike = atm_strike - 200
     pe_strike = atm_strike + 200
     ce_symbol = f"BSE:SENSEX{expiry_str}{ce_strike}CE"
@@ -1114,3 +1131,4 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
+
