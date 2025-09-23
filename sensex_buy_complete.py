@@ -790,6 +790,9 @@ class NiftyBuyStrategy:
             # If any green candle closes above EMA5 and VWMA20 after W (no pullback wait), enter immediately.
             # Keep other filters: trigger patterns, wick, ADX.
             if self.is_green(candle) and candle["close"] > ema5 and candle["close"] > vwma20:
+                # --- CHANGED: require ema5 > vwma20 at breakout candle ---
+                ema_over_vwma_now = (ema5 > vwma20)
+
                 # trigger patterns (same as before)
                 prev = candles[idx-1] if idx-1 >= 0 else None
                 is_trigger_pattern = self.is_strong_green_close_near_high(candle, pct=0.01)
@@ -804,7 +807,8 @@ class NiftyBuyStrategy:
                 adx_ok = (adx is not None and adx >= ADX_MIN)
                 wick_ok = self.has_short_upper_wick(candle, max_ratio=0.5)
 
-                if is_trigger_pattern and adx_ok and wick_ok:
+                # require ema_over_vwma_now in addition to other checks
+                if is_trigger_pattern and adx_ok and wick_ok and ema_over_vwma_now:
                     # ENTRY: at close of this green candle
                     entry = round_to_tick(candle["close"])
 
@@ -861,6 +865,7 @@ class NiftyBuyStrategy:
                         'target': target_price,
                         'multiplier': mult,
                         'ADX': _safe(adx),
+                        'ema_over_vwma_now': ema_over_vwma_now,
                         'buy_resp': str(buy_resp),
                         'sl_resp': str(sl_resp)
                     }))
@@ -878,6 +883,8 @@ class NiftyBuyStrategy:
                         reasons.append(f'adx_too_low(adx={_safe(adx)})')
                     if not wick_ok:
                         reasons.append(f'upper_wick_too_long(ratio={_safe(self.upper_wick_ratio(candle))})')
+                    if not ema_over_vwma_now:
+                        reasons.append('ema_not_above_vwma')
 
                     logger.debug(json.dumps({
                         'event': 'immediate_candidate_rejected',
