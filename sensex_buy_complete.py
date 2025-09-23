@@ -28,10 +28,9 @@ MIN_BARS_BETWEEN_LOWS = 5
 EMA_PERIOD = 5
 VWMA_PERIOD = 20
 
-# Trigger conditions
+# Trigger conditions (kept for reference but NOT used in immediate-entry now)
 EMA_OVER_VWMA_MIN_GAP = 0.02  # 2% relative gap at trigger candle
 EMA_OVER_VWMA_MAX_GAP = 0.06  # 6% maximum allowed relative gap at trigger candle
-MAX_RISK_POINTS = 60          # skip if entry - SL > 60
 
 # ADX filter
 ADX_PERIOD = 14
@@ -392,10 +391,9 @@ class NiftyBuyStrategy:
         self.lot_size = lot_size
         self.candles = defaultdict(lambda: deque(maxlen=400))
         self.positions = {}       # Active positions per symbol
+        # simplified state: track detected w_span and last_trade_idx
         self.state = defaultdict(lambda: {
             "w_span": None,
-            "post_breakout": False,
-            "pullback_count": 0,
             "last_trade_idx": -1
         })
 
@@ -749,8 +747,6 @@ class NiftyBuyStrategy:
                 'VWMA20': _safe(vwma20),
                 'ADX': _safe(adx),
                 'w_span': st.get('w_span'),
-                'post_breakout': st.get('post_breakout'),
-                'pullback_count': st.get('pullback_count'),
                 'in_position': bool(pos)
             }))
 
@@ -766,8 +762,7 @@ class NiftyBuyStrategy:
             if w_span:
                 if st["w_span"] != w_span:
                     st["w_span"] = w_span
-                    st["post_breakout"] = False
-                    st["pullback_count"] = 0
+                    st["last_trade_idx"] = -1
                     # log the detected W
                     i1, i2 = w_span
                     logger.info(json.dumps({
@@ -791,24 +786,11 @@ class NiftyBuyStrategy:
             if idx <= low2_idx:
                 return  # still within the W
 
-            if not st["post_breakout"]:
-                if self.is_green(candle) and candle["close"] > ema5 and candle["close"] > vwma20:
-                    st["post_breakout"] = True
-                    st["pullback_count"] = 0
-                    logger.info(f"Post-breakout set for {symbol} at idx={idx}")
-                return
-
-            if st["post_breakout"] and st["pullback_count"] == 0:
-                if self.is_red(candle):
-                    st["pullback_count"] = 1
-                    logger.debug(f"Pullback started for {symbol} (count=1)")
-                return
-            elif st["post_breakout"] and st["pullback_count"] >= 1:
-                if self.is_red(candle):
-                    st["pullback_count"] += 1
-                    logger.debug(f"Pullback incremented for {symbol} (count={st['pullback_count']})")
-                    return
-
+            # --- NEW: immediate-entry after W ---
+            # If any green candle closes above EMA5 and VWMA20 after W (no pullback wait), enter immediately.
+            # Keep other filters: trigger patterns, wick, ADX.
+            if self.is_green(candle) and candle["close"] > ema5 and candle["close"] > vwma20:
+                # trigger patterns (same as before)
                 prev = candles[idx-1] if idx-1 >= 0 else None
                 is_trigger_pattern = self.is_strong_green_close_near_high(candle, pct=0.01)
                 if prev:
@@ -818,51 +800,49 @@ class NiftyBuyStrategy:
                         or self.is_bullish_engulfing(prev, candle)
                     )
 
-                # Compute relative gap between EMA5 and VWMA20
-                rel_gap = None
-                if vwma20 and vwma20 != 0:
-                    rel_gap = (ema5 - vwma20) / vwma20
-
-                # FINAL ENTRY CHECK booleans
-                green_ok = self.is_green(candle)
-                close_above_ema_vwma = (candle['close'] > ema5 and candle['close'] > vwma20)
-                gap_ok = (rel_gap is not None and rel_gap >= EMA_OVER_VWMA_MIN_GAP and rel_gap <= EMA_OVER_VWMA_MAX_GAP)
+                # ADX and wick checks
                 adx_ok = (adx is not None and adx >= ADX_MIN)
-                trigger_ok = is_trigger_pattern
                 wick_ok = self.has_short_upper_wick(candle, max_ratio=0.5)
 
-                if (green_ok and close_above_ema_vwma and gap_ok and adx_ok and trigger_ok and wick_ok):
-
+                if is_trigger_pattern and adx_ok and wick_ok:
+                    # ENTRY: at close of this green candle
                     entry = round_to_tick(candle["close"])
-                    sl = round_to_tick(candle["low"] - 5.0)  # low - 5 per spec
-                    risk = entry - sl
-                    if risk <= 0:
-                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'non_positive_risk', 'entry': entry, 'sl': sl}))
-                        st["post_breakout"] = False
-                        st["pullback_count"] = 0
+
+                    # SL = lowest point of the W pattern minus 5 points (keeps SL below pattern low)
+                    w_lows = [candles[i]["low"] for i in range(low1_idx, low2_idx+1)]
+                    if not w_lows:
+                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'w_lows_missing'}))
+                        st["w_span"] = None
                         return
-                    if risk > MAX_RISK_POINTS:
-                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'risk_too_large', 'risk': risk, 'max_allowed': MAX_RISK_POINTS}))
-                        st["post_breakout"] = False
-                        st["pullback_count"] = 0
+                    min_w_low = min(w_lows)
+                    sl_price = round_to_tick(min_w_low - 5.0)   # NOTE: using minus 5 to place SL below the W low
+                    risk_points = entry - sl_price
+
+                    if risk_points <= 0:
+                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'non_positive_risk', 'entry': entry, 'sl': sl_price}))
+                        st["w_span"] = None
                         return
 
-                    target = round_to_tick(entry + 2.0 * risk)
+                    # target multiplier as per your rule
+                    if risk_points < 100:
+                        mult = 1.5
+                    else:
+                        mult = 1.0
+                    target_price = round_to_tick(entry + mult * risk_points)
 
                     # Place market buy then SL-M
                     buy_resp = self.fyers.place_market_buy(symbol, self.lot_size, tag="NIFTYBUYENTRY")
-                    sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, sl, tag="NIFTYSL")
+                    sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, sl_price, tag="NIFTYSL")
 
-                    # Extract SL order id if available
                     sl_id = self._extract_order_id(sl_resp)
 
-                    # Store position; do NOT log exit until trade fills reported by on_trade
+                    # store position
                     self.positions[symbol] = {
                         "entry": entry,
-                        "sl": sl,
-                        "orig_sl": sl,           # store original SL baseline for trailing computation
-                        "last_trail_step": -1,    # last applied trailing step
-                        "target": target,
+                        "sl": sl_price,
+                        "orig_sl": sl_price,
+                        "last_trail_step": -1,
+                        "target": target_price,
                         "sl_order": sl_resp,
                         "sl_order_id": sl_id,
                         "exit_initiated": False,
@@ -871,54 +851,48 @@ class NiftyBuyStrategy:
                         "max_ltp": None,
                         "last_ltp": None
                     }
+
                     logger.info(json.dumps({
-                        'event': 'entry_assumed',
+                        'event': 'entry_assumed_immediate',
                         'symbol': symbol,
                         'entry': entry,
-                        'sl': sl,
-                        'target': target,
-                        'rel_gap': rel_gap,
+                        'sl': sl_price,
+                        'risk_points': risk_points,
+                        'target': target_price,
+                        'multiplier': mult,
                         'ADX': _safe(adx),
                         'buy_resp': str(buy_resp),
                         'sl_resp': str(sl_resp)
                     }))
 
-                    # Reset sequence so we don't double-trigger
-                    st["post_breakout"] = False
-                    st["pullback_count"] = 0
+                    # reset W so we don't re-enter immediately on subsequent candles (will re-detect later)
+                    st["w_span"] = None
                     st["last_trade_idx"] = idx
+                    return
                 else:
-                    # Build reasons list for easier tuning
+                    # reasons logging for tuning (no EMA/VWMA gap check here)
                     reasons = []
-                    if not green_ok:
-                        reasons.append('not_green')
-                    if not close_above_ema_vwma:
-                        reasons.append('close_below_ema_or_vwma')
-                    if not gap_ok:
-                        if rel_gap is None:
-                            reasons.append('gap_na')
-                        else:
-                            reasons.append(f'gap_out_of_range(rel_gap={rel_gap:.4f})')
+                    if not is_trigger_pattern:
+                        reasons.append('no_trigger_pattern')
                     if not adx_ok:
                         reasons.append(f'adx_too_low(adx={_safe(adx)})')
-                    if not trigger_ok:
-                        reasons.append('no_trigger_pattern')
                     if not wick_ok:
                         reasons.append(f'upper_wick_too_long(ratio={_safe(self.upper_wick_ratio(candle))})')
 
                     logger.debug(json.dumps({
-                        'event': 'candidate_rejected',
+                        'event': 'immediate_candidate_rejected',
                         'symbol': symbol,
                         'idx': idx,
                         'reasons': reasons,
                         'EMA5': _safe(ema5),
                         'VWMA20': _safe(vwma20),
-                        'ADX': _safe(adx),
-                        'rel_gap': _safe(rel_gap)
+                        'ADX': _safe(adx)
                     }))
-                    # reset the sequence to avoid repeated noisy candidates
-                    st["post_breakout"] = False
-                    st["pullback_count"] = 0
+
+                    # reset W so we can detect a fresh W later (optional)
+                    st["w_span"] = None
+                    return
+
         except Exception as e:
             logger.error(f"on_candle unexpected error for {symbol}: {e}")
 
@@ -1131,4 +1105,3 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
-
