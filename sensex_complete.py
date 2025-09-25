@@ -229,10 +229,15 @@ def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
     # fallback to previous numeric behavior for non-monthly expiries
     m = expiry_date.month
     d = expiry_date.day
-    if m < 10:
-        return f"{yy}{m}{d:02d}"   # YYMDD
+    if m == 10:
+        m_token = "O"
+    elif m == 11:
+        m_token = "N"
+    elif m == 12:
+        m_token = "D"
     else:
-        return f"{yy}{m:02d}{d:02d}"  # YYMMDD
+        m_token = f"{m:02d}"
+    return f"{yy}{m_token}{d:02d}"
 
 def get_atm_symbols(fyers_client):
     """Fetch SENSEX spot, round to ATM strike, and build CE/PE option symbols."""
@@ -950,4 +955,5 @@ if __name__ == "__main__":
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
     fyers_client.start_order_socket()
+
 
