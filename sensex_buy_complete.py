@@ -85,6 +85,12 @@ def log_trade(symbol, side, entry, sl, target, exit_price, pnl, file="trades.csv
             symbol, side, entry, sl, target, exit_price, pnl
         ])
 # ---------------- EXPIRY & SYMBOL UTILS ----------------
+
+SPECIAL_MARKET_HOLIDAYS = {
+    datetime.date(2025, 10, 2),
+    datetime.date(2025, 12, 25),
+}
+
 def is_last_thursday(date_obj: datetime.date) -> bool:
     """Return True if date_obj is the last Thursday of its month."""
     # Thursday weekday() == 3
@@ -95,28 +101,55 @@ def is_last_thursday(date_obj: datetime.date) -> bool:
     return next_week.month != date_obj.month
 
 def get_next_expiry():
-    """Return expiry date (Thursday) for SENSEX options."""
+    """Return expiry date for SENSEX options.
+    By default expiry is the next Thursday. If that Thursday is a special market holiday
+    (e.g., exchange moved expiry to Wednesday), return the previous day (Wednesday).
+    """
     today = datetime.date.today()
     weekday = today.weekday()  # Monday=0 ... Sunday=6
 
     if weekday == 3:  # Thursday
-        expiry = today
+        candidate_thu = today
     else:
         days_to_thu = (3 - weekday) % 7
-        expiry = today + datetime.timedelta(days=days_to_thu)
+        candidate_thu = today + datetime.timedelta(days=days_to_thu)
+
+    # If the exchange is closed on the Thursday (special holiday), expiry moves to Wednesday
+    if candidate_thu in SPECIAL_MARKET_HOLIDAYS:
+        expiry = candidate_thu - datetime.timedelta(days=1)  # Wednesday
+    else:
+        expiry = candidate_thu
     return expiry
+
 
 def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
     """
     Return expiry token used inside option symbols:
-    - If expiry is last Thursday of month -> 'YYMMM' (e.g. '25SEP')
-    - Else -> numeric scheme close to your old logic (YYMDD or YYMMDD).
+    - If expiry is (or should be treated as) the 'monthly' expiry -> 'YYMON' (e.g. '25SEP')
+      We consider it monthly if:
+        * expiry is the last Thursday of month (normal case), OR
+        * expiry is a Wednesday which was moved from the last-Thursday because Thursday was holiday
+          (i.e., expiry.weekday()==2 and expiry+1 is last Thursday)
+    - Else -> numeric scheme similar to old logic (YYMDD or YYMMDD).
     """
     yy = expiry_date.strftime("%y")  # e.g. '25'
-    if is_last_thursday(expiry_date):
-        mon = expiry_date.strftime("%b").upper()  # 'SEP'
+
+    # If expiry is Wednesday but the next day (Thursday) is the month's last Thursday,
+    # treat it as the monthly expiry token (this handles Thurs->Wed holiday moves).
+    treat_as_monthly = False
+    if expiry_date.weekday() == 3 and is_last_thursday(expiry_date):
+        treat_as_monthly = True
+    elif expiry_date.weekday() == 2:  # Wednesday
+        thursday = expiry_date + datetime.timedelta(days=1)
+        if is_last_thursday(thursday):
+            treat_as_monthly = True
+
+    if treat_as_monthly:
+        mon = (expiry_date + datetime.timedelta(days=(3 - expiry_date.weekday())))\
+                .strftime("%b").upper() if expiry_date.weekday() != 3 else expiry_date.strftime("%b").upper()
         return f"{yy}{mon}"
-    # fallback to previous numeric behavior for non-last-thursday expiries
+
+    # fallback to previous numeric behavior for non-monthly expiries
     m = expiry_date.month
     d = expiry_date.day
     if m < 10:
