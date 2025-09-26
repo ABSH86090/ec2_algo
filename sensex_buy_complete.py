@@ -66,12 +66,16 @@ def round_to_tick(price, tick_size=TICK_SIZE):
     """Round a price to the nearest tick size (default = 0.05)."""
     return round(round(price / tick_size) * tick_size, 2)
 
-
 def _safe(v, fmt="{:.2f}"):
     try:
         return fmt.format(v)
     except Exception:
         return "None"
+
+def session_start_dt():
+    """Return today's session start datetime (today @ TRADING_START)."""
+    today = datetime.date.today()
+    return datetime.datetime.combine(today, TRADING_START)
 
 # ---------------- JOURNAL LOGGING ----------------
 def log_trade(symbol, side, entry, sl, target, exit_price, pnl, file="trades.csv"):
@@ -604,24 +608,51 @@ class NiftyBuyStrategy:
                 return False
         return True
 
-    def find_recent_w(self, candles, ema5_arr, vwma_arr):
+    def find_recent_w(self, candles, ema5_arr, vwma_arr, start_dt=None):
+        """
+        Find a W only within today's session window (>= start_dt).
+        Keeps original conditions: both lows inside session and EMA5 < VWMA20 between i1..i2.
+        """
         n = len(candles)
         if n < (2*PIVOT_K + 1) + MIN_BARS_BETWEEN_LOWS:
             return None
 
+        # limit to current session
+        if start_dt is None:
+            start_dt = session_start_dt()
+
+        # find first index within today's session
+        start_idx = None
+        for i, c in enumerate(candles):
+            if c["time"] >= start_dt:
+                start_idx = i
+                break
+        if start_idx is None:
+            return None  # no candles yet in session
+
         lows = [c["low"] for c in candles]
-        for i2 in range(n-1-PIVOT_K, 2*PIVOT_K, -1):
+
+        # Ensure scanning never goes before start_idx
+        i2_min_bound = max(2*PIVOT_K, start_idx + PIVOT_K)
+        for i2 in range(n - 1 - PIVOT_K, i2_min_bound - 1, -1):
             if not self.is_pivot_low(lows, i2, PIVOT_K):
                 continue
+
             jmax = i2 - MIN_BARS_BETWEEN_LOWS
-            for i1 in range(jmax, 2*PIVOT_K-1, -1):
+            i1_min_bound = max(2*PIVOT_K - 1, start_idx + PIVOT_K - 1)
+            for i1 in range(jmax, i1_min_bound - 1, -1):
                 if not self.is_pivot_low(lows, i1, PIVOT_K):
                     continue
+                # second low should not be lower than first low (double-bottom style)
                 if lows[i2] + 1e-9 < lows[i1]:
                     continue
+
+                # between i1..i2, EMA5 < VWMA20 and all indices within session
                 ok = True
-                for k in range(i1, i2+1):
-                    if ema5_arr[k] is None or vwma_arr[k] is None or not (ema5_arr[k] < vwma_arr[k]):
+                for k in range(i1, i2 + 1):
+                    if (k < start_idx or
+                        ema5_arr[k] is None or vwma_arr[k] is None or
+                        not (ema5_arr[k] < vwma_arr[k])):
                         ok = False
                         break
                 if ok:
@@ -672,7 +703,7 @@ class NiftyBuyStrategy:
                 if order_resp.get("id"):
                     return str(order_resp.get("id"))
                 if order_resp.get("orders") and isinstance(order_resp["orders"], dict) and order_resp["orders"].get("id"):
-                    return str(order_resp["orders"].get("id"))
+                    return str(order_resp["orders"]["id"])
                 raw = order_resp.get("raw")
                 if isinstance(raw, dict) and raw.get("id"):
                     return str(raw.get("id"))
@@ -752,7 +783,7 @@ class NiftyBuyStrategy:
                     'close': _safe(self.candles[s][-1]['close']),
                     'EMA5': _safe(self.ema_series([c['close'] for c in self.candles[s]], EMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
                     'VWMA20': _safe(self.vwma_series([c['close'] for c in self.candles[s]], [c['volume'] for c in self.candles[s]], VWMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
-                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s]], ADX_PERIOD)[-1]) if len(self.candles[s])>0 else None
+                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s']], ADX_PERIOD)[-1]) if len(self.candles[s])>0 else None
                 } for s in list(self.candles.keys())}
                 logger.info(f"Indicators snapshot at {candle['time']}: {json.dumps(snapshot)}")
             except Exception as e:
@@ -796,7 +827,8 @@ class NiftyBuyStrategy:
                 return  # don't seek new entries while in position
 
             # 2) Not in a position: build W context and hunt setup
-            w_span = self.find_recent_w(candles, ema5_arr, vwma20_arr)
+            # Pass today's session start so W is restricted to today only
+            w_span = self.find_recent_w(candles, ema5_arr, vwma20_arr, start_dt=session_start_dt())
             if w_span:
                 if st["w_span"] != w_span:
                     st["w_span"] = w_span
@@ -824,14 +856,12 @@ class NiftyBuyStrategy:
             if idx <= low2_idx:
                 return  # still within the W
 
-            # --- NEW: immediate-entry after W ---
-            # If any green candle closes above EMA5 and VWMA20 after W (no pullback wait), enter immediately.
-            # Keep other filters: trigger patterns, wick, ADX.
+            # --- ORIGINAL breakout entry logic retained ---
             if self.is_green(candle) and candle["close"] > ema5 and candle["close"] > vwma20:
-                # --- CHANGED: require ema5 > vwma20 at breakout candle ---
+                # require ema5 > vwma20 at breakout candle
                 ema_over_vwma_now = (ema5 > vwma20)
 
-                # trigger patterns (same as before)
+                # trigger patterns
                 prev = candles[idx-1] if idx-1 >= 0 else None
                 is_trigger_pattern = self.is_strong_green_close_near_high(candle, pct=0.01)
                 if prev:
@@ -845,19 +875,18 @@ class NiftyBuyStrategy:
                 adx_ok = (adx is not None and adx >= ADX_MIN)
                 wick_ok = self.has_short_upper_wick(candle, max_ratio=0.5)
 
-                # require ema_over_vwma_now in addition to other checks
                 if is_trigger_pattern and adx_ok and wick_ok and ema_over_vwma_now:
                     # ENTRY: at close of this green candle
                     entry = round_to_tick(candle["close"])
 
-                    # SL = lowest point of the W pattern minus 5 points (keeps SL below pattern low)
+                    # SL = lowest point of the W pattern minus 5 points
                     w_lows = [candles[i]["low"] for i in range(low1_idx, low2_idx+1)]
                     if not w_lows:
                         logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'w_lows_missing'}))
                         st["w_span"] = None
                         return
                     min_w_low = min(w_lows)
-                    sl_price = round_to_tick(min_w_low - 5.0)   # NOTE: using minus 5 to place SL below the W low
+                    sl_price = round_to_tick(min_w_low - 5.0)
                     risk_points = entry - sl_price
 
                     if risk_points <= 0:
@@ -866,10 +895,7 @@ class NiftyBuyStrategy:
                         return
 
                     # target multiplier as per your rule
-                    if risk_points < 100:
-                        mult = 1.5
-                    else:
-                        mult = 1.0
+                    mult = 1.5 if risk_points < 100 else 1.0
                     target_price = round_to_tick(entry + mult * risk_points)
 
                     # Place market buy then SL-M
@@ -913,7 +939,7 @@ class NiftyBuyStrategy:
                     st["last_trade_idx"] = idx
                     return
                 else:
-                    # reasons logging for tuning (no EMA/VWMA gap check here)
+                    # reasons logging
                     reasons = []
                     if not is_trigger_pattern:
                         reasons.append('no_trigger_pattern')
@@ -1150,4 +1176,3 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
-
