@@ -511,9 +511,18 @@ class StrategyEngine:
         return True
 
     def detect_new_short_strategy(self, candles, ema5, vwma20):
-        GAP_GREEN2 = 0.01  # 1% gap for 2nd green candle
-        GAP_RED = 0.02     # 2% gap for red candle
-
+        """
+        Strategy 2 (S2): Two greens then a red with EMA/VWMA conditions (bearish bias)
+        Implemented per spec:
+          - Pattern: c1 green, c2 green, c3 red
+          - Bearish bias required on c1 and c3: EMA5 < VWMA20
+          - Keep: VWMA(c2) > VWMA(c3)
+          - Change: c3.high ≥ EMA5 (on c3)
+          - Keep: c3.close < EMA5 and c3.close < VWMA20
+          - Entry = c3.close
+          - SL    = c3.high + 5
+          - If SL-width rule fails -> skip
+        """
         if len(candles) < 3:
             return None
         if ema5 is None or vwma20 is None:
@@ -523,12 +532,15 @@ class StrategyEngine:
         is_green = lambda c: c["close"] > c["open"]
         is_red   = lambda c: c["close"] < c["open"]
 
+        # Pattern: two greens then a red
         if not (is_green(c1) and is_green(c2) and is_red(c3)):
-            logging.info(f"[STRAT2] blocked: pattern mismatch -> c1({c1['open']},{c1['close']}), c2({c2['open']},{c2['close']}), c3({c3['open']},{c3['close']})")
+            logging.info(f"[STRAT2] blocked: pattern mismatch -> "
+                         f"c1({c1['open']},{c1['close']}), c2({c2['open']},{c2['close']}), c3({c3['open']},{c3['close']})")
             return None
 
-        closes = [c["close"] for c in candles]
-        vols   = [c.get("volume", 0) for c in candles]
+        # Compute bar-wise EMA5 and VWMA20 up to each candle
+        closes = [x["close"] for x in candles]
+        vols   = [x.get("volume", 0) for x in candles]
 
         idx1, idx2, idx3 = len(closes) - 3, len(closes) - 2, len(closes) - 1
 
@@ -539,40 +551,45 @@ class StrategyEngine:
         ema_c3 = self.compute_ema(closes[:idx3+1], 5)
         vw_c3  = self.compute_vwma(closes[:idx3+1], vols[:idx3+1], 20)
 
-        logging.info(f"[STRAT2] c1: ema={ema_c1}, vwma={vw_c1}; c2: ema={ema_c2}, vwma={vw_c2}; c3: ema={ema_c3}, vwma={vw_c3}")
+        logging.info(f"[STRAT2] c1: ema={ema_c1}, vwma={vw_c1}; "
+                     f"c2: ema={ema_c2}, vwma={vw_c2}; "
+                     f"c3: ema={ema_c3}, vwma={vw_c3}")
 
         if None in (ema_c1, vw_c1, ema_c2, vw_c2, ema_c3, vw_c3):
             logging.info("[STRAT2] blocked: missing indicator values")
             return None
 
+        # Bearish bias on c1 and c3
         if not (ema_c1 < vw_c1):
-            logging.info(f"[STRAT2] blocked: c1 ema>=vwma (ema={ema_c1}, vwma={vw_c1})")
+            logging.info(f"[STRAT2] blocked: bearish bias failed on c1 (ema={ema_c1}, vwma={vw_c1})")
+            return None
+        if not (ema_c3 < vw_c3):
+            logging.info(f"[STRAT2] blocked: bearish bias failed on c3 (ema={ema_c3}, vwma={vw_c3})")
             return None
 
-        if not (vw_c2 >= ema_c2 * (1 + GAP_GREEN2)):
-            logging.info(f"[STRAT2] blocked: c2 gap failed (ema={ema_c2}, vwma={vw_c2})")
-            return None
-
+        # Keep: VWMA(c2) > VWMA(c3)
         if not (vw_c2 > vw_c3):
             logging.info(f"[STRAT2] blocked: vwma(c2)={vw_c2} <= vwma(c3)={vw_c3}")
             return None
 
-        if not (vw_c3 >= ema_c3 * (1 + GAP_RED)):
-            logging.info(f"[STRAT2] blocked: red candle gap failed (ema={ema_c3}, vwma={vw_c3})")
+        # Change: c3.high ≥ EMA5 (at c3)
+        if not (c3["high"] >= ema_c3):
+            logging.info(f"[STRAT2] blocked: c3.high {c3['high']} < ema5(c3) {ema_c3}")
             return None
 
-        if not (c3["high"] >= vwma20):
-            logging.info(f"[STRAT2] blocked: c3.high {c3['high']} < vwma20 {vwma20}")
-            return None
-        if not (c3["close"] < ema5 and c3["close"] < vwma20):
-            logging.info(f"[STRAT2] blocked: c3.close {c3['close']} not below ema5 {ema5}, vwma20 {vwma20}")
+        # Keep: c3.close below both EMA5 & VWMA20 (at c3)
+        if not (c3["close"] < ema_c3 and c3["close"] < vw_c3):
+            logging.info(f"[STRAT2] blocked: c3.close {c3['close']} not below ema5 {ema_c3} and vwma20 {vw_c3}")
             return None
 
+        # Entry & SL
         entry = c3["close"]
         sl    = c3["high"] + 5
 
+        # If SL-width rule fails -> skip
         if not self._sl_within_pct_range(entry, sl, c3):
-            logging.info(f"[STRAT2] Skipped: SL width {sl-entry:.2f} exceeds {int(MAX_SL_PCT_OF_RANGE*100)}% of range {(c3['high']-c3['low']):.2f}")
+            logging.info(f"[STRAT2] Skipped: SL width {sl-entry:.2f} exceeds "
+                         f"{int(MAX_SL_PCT_OF_RANGE*100)}% of range {(c3['high']-c3['low']):.2f}")
             return None
 
         logging.info(f"[STRAT2] Triggered: entry={entry}, sl={sl}")
@@ -678,7 +695,7 @@ class StrategyEngine:
                 raw_sl_resp = self.fyers.place_stoploss_buy(symbol, self.lot_size, s3["sl"], "STRAT3SL")
                 sl_order_id = _extract_order_id(raw_sl_resp)
                 entry_order_id = _extract_order_id(raw_entry_resp)
-                trade_id = log_to_journal(symbol, "ENTRY", "strat3", entry=s3["entry"], sl=s3["sl"], remarks="", trade_id=None, lot_size=self.lot_size)
+                trade_id = log_to_journal(symbol, "ENTRY", "strat3", entry=s3["entry"], sl=s3["sl"], remarks="", lot_size=self.lot_size)
                 self.positions[symbol] = {
                     "sl_order": {"id": sl_order_id, "resp": raw_sl_resp},
                     "entry_order": {"id": entry_order_id, "resp": raw_entry_resp},
@@ -724,7 +741,7 @@ class StrategyEngine:
                             raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl_price, "STRAT1SL")
                             sl_order_id = _extract_order_id(raw_sl)
                             entry_order_id = _extract_order_id(raw_entry)
-                            trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="breakdown entry", trade_id=None, lot_size=self.lot_size)
+                            trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry_price, sl=sl_price, remarks="breakdown entry", lot_size=self.lot_size)
                             self.positions[symbol] = {
                                 "sl_order": {"id": sl_order_id, "resp": raw_sl},
                                 "entry_order": {"id": entry_order_id, "resp": raw_entry},
@@ -746,7 +763,7 @@ class StrategyEngine:
                 raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, strat2["sl"], "STRAT2SL")
                 sl_order_id = _extract_order_id(raw_sl)
                 entry_order_id = _extract_order_id(raw_entry)
-                trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=strat2["entry"], sl=strat2["sl"], remarks="", trade_id=None, lot_size=self.lot_size)
+                trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=strat2["entry"], sl=strat2["sl"], remarks="", lot_size=self.lot_size)
                 self.positions[symbol] = {
                     "sl_order": {"id": sl_order_id, "resp": raw_sl},
                     "entry_order": {"id": entry_order_id, "resp": raw_entry},
@@ -803,7 +820,7 @@ class StrategyEngine:
                                         raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "STRAT4SL")
                                         sl_order_id = _extract_order_id(raw_sl)
                                         entry_order_id = _extract_order_id(raw_entry)
-                                        trade_id = log_to_journal(symbol, "ENTRY", "strat4", entry=entry, sl=sl, remarks="", trade_id=None, lot_size=self.lot_size)
+                                        trade_id = log_to_journal(symbol, "ENTRY", "strat4", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
                                         self.positions[symbol] = {
                                             "sl_order": {"id": sl_order_id, "resp": raw_sl},
                                             "entry_order": {"id": entry_order_id, "resp": raw_entry},
@@ -841,16 +858,16 @@ class StrategyEngine:
                         symbol, "SL_HIT", position["strategy"],
                         entry=entry_price, sl=sl_price, exit=exit_price,
                         remarks=f"Exit after cancel (interpreted success). cancel_resp={cancel_resp}",
-                        trade_id=trade_id,
-                        lot_size=self.lot_size
+                        lot_size=self.lot_size,
+                        trade_id=trade_id
                     )
                 else:
                     log_to_journal(
                         symbol, "EXIT", position["strategy"],
                         entry=entry_price, sl=sl_price, exit=exit_price,
                         remarks=f"Exit condition met. cancel_resp={cancel_resp}",
-                        trade_id=trade_id,
-                        lot_size=self.lot_size
+                        lot_size=self.lot_size,
+                        trade_id=trade_id
                     )
                 self.positions[symbol] = None
             else:
@@ -885,8 +902,8 @@ class StrategyEngine:
                     entry=entry_price, sl=sl_price,
                     exit=None,
                     remarks=str(msg),
-                    trade_id=trade_id,
-                    lot_size=self.lot_size
+                    lot_size=self.lot_size,
+                    trade_id=trade_id
                 )
                 self.sl_count += 1
                 self.positions[symbol] = None
