@@ -48,6 +48,9 @@ MIN_SL_BUFFER = float(os.getenv("MIN_SL_BUFFER", "0.05"))  # smallest unit (tick
 # small pause after cancel before placing new SL to reduce race (seconds)
 CANCEL_SETTLE_SEC = float(os.getenv("CANCEL_SETTLE_SEC", "0.06"))
 
+# PATCH: risk cap for SL distance (points)
+MAX_SL_POINTS = float(os.getenv("MAX_SL_POINTS", "60.0"))
+
 # Reset logging handlers
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
@@ -783,7 +786,8 @@ class NiftyBuyStrategy:
                     'close': _safe(self.candles[s][-1]['close']),
                     'EMA5': _safe(self.ema_series([c['close'] for c in self.candles[s]], EMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
                     'VWMA20': _safe(self.vwma_series([c['close'] for c in self.candles[s]], [c['volume'] for c in self.candles[s]], VWMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
-                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s']], ADX_PERIOD)[-1]) if len(self.candles[s])>0 else None
+                    # PATCH: fixed stray quote bug in original snapshot line below
+                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s]], ADX_PERIOD)[-1]) if len(self.candles[s])>0 else None
                 } for s in list(self.candles.keys())}
                 logger.info(f"Indicators snapshot at {candle['time']}: {json.dumps(snapshot)}")
             except Exception as e:
@@ -879,24 +883,24 @@ class NiftyBuyStrategy:
                     # ENTRY: at close of this green candle
                     entry = round_to_tick(candle["close"])
 
-                    # SL = lowest point of the W pattern minus 5 points
-                    w_lows = [candles[i]["low"] for i in range(low1_idx, low2_idx+1)]
-                    if not w_lows:
-                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'w_lows_missing'}))
-                        st["w_span"] = None
-                        return
-                    min_w_low = min(w_lows)
-                    sl_price = round_to_tick(min_w_low - 5.0)
-                    risk_points = entry - sl_price
+                    # PATCH: SL = breakout candle's low - 5 points
+                    sl_price = round_to_tick(candle["low"] - 5.0)
+                    risk_points = round(entry - sl_price, 2)
 
+                    # Guardrails
                     if risk_points <= 0:
                         logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'non_positive_risk', 'entry': entry, 'sl': sl_price}))
                         st["w_span"] = None
                         return
 
-                    # target multiplier as per your rule
-                    mult = 1.5 if risk_points < 100 else 1.0
-                    target_price = round_to_tick(entry + mult * risk_points)
+                    # PATCH: enforce maximum SL distance
+                    if risk_points > MAX_SL_POINTS:
+                        logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'risk_exceeds_max', 'risk_points': risk_points, 'max_allowed': MAX_SL_POINTS}))
+                        st["w_span"] = None
+                        return
+
+                    # PATCH: target = 2 * SL distance
+                    target_price = round_to_tick(entry + 2.0 * risk_points)
 
                     # Place market buy then SL-M
                     buy_resp = self.fyers.place_market_buy(symbol, self.lot_size, tag="NIFTYBUYENTRY")
@@ -927,7 +931,7 @@ class NiftyBuyStrategy:
                         'sl': sl_price,
                         'risk_points': risk_points,
                         'target': target_price,
-                        'multiplier': mult,
+                        'multiplier': 2.0,  # PATCH: always 2R
                         'ADX': _safe(adx),
                         'ema_over_vwma_now': ema_over_vwma_now,
                         'buy_resp': str(buy_resp),
