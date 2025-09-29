@@ -4,6 +4,7 @@ import csv
 import os
 import time
 import uuid
+import sys  # >>> PATCH: needed for console StreamHandler
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
@@ -34,15 +35,22 @@ if not os.path.exists(JOURNAL_FILE):
             "entry_price", "sl_price", "exit_price", "pnl", "remarks"
         ])
 
-# Reset logging handlers
+# ---------------- LOGGING (patched to file + console) ----------------
+# >>> PATCH: Reset handlers and configure both file and console logging
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
 logging.basicConfig(
-    filename="strategy.log",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("strategy.log"),   # file logs
+        logging.StreamHandler(sys.stdout)      # console logs
+    ],
+    force=True  # override any earlier logging config from libraries
 )
+
+logging.info("[BOOT] Logger initialized. Logs -> console + strategy.log")
 
 # ---------------- Helpers ----------------
 def _safe_float(v):
@@ -359,7 +367,10 @@ class FyersClient:
                     return
                 symbol = tick["symbol"]
                 ltp = float(tick["ltp"])
-                ts = int(tick["last_traded_time"])
+                # >>> PATCH: normalize timestamp ms->s if needed
+                ts = int(tick.get("last_traded_time") or tick.get("tt") or tick.get("timestamp"))
+                if ts > 10_000_000_000:  # heuristic: milliseconds
+                    ts //= 1000
                 cum_vol = int(tick.get("vol_traded_today", 0))
             except Exception as e:
                 logging.error(f"Bad tick format: {tick}, {e}")
@@ -371,8 +382,13 @@ class FyersClient:
 
             c = candle_buffers[symbol]
             if c is None or c["time"] != candle_open_time:
+                # CLOSE previous candle and send it out
                 if c is not None:
+                    # >>> PATCH: explicit bar-close log
+                    logging.info(f"[BAR CLOSE] {symbol} {c['time']} "
+                                 f"O={c['open']} H={c['high']} L={c['low']} C={c['close']} V={c['volume']}")
                     on_candle_callback(symbol, c)
+                # start new candle
                 candle_buffers[symbol] = {
                     "time": candle_open_time,
                     "open": ltp,
@@ -448,7 +464,7 @@ class StrategyEngine:
                             "close": c[4],
                             "volume": c[5],
                         }
-                            # keep only within market hours
+                        # keep only within market hours
                         if TRADING_START <= candle["time"].time() <= TRADING_END:
                             self.candles[symbol].append(candle)
                 logging.info(f"Fetched history for {symbol}")
@@ -912,6 +928,7 @@ class StrategyEngine:
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
+    logging.info("[BOOT] Starting main…")
     fyers_client = FyersClient(CLIENT_ID, ACCESS_TOKEN, LOT_SIZE)
     engine = StrategyEngine(fyers_client, LOT_SIZE)
 
