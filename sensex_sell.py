@@ -4,7 +4,7 @@ import csv
 import os
 import time
 import uuid
-import sys  # >>> PATCH: needed for console StreamHandler
+import sys  # console StreamHandler
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
@@ -22,9 +22,11 @@ TRADING_END = datetime.time(15, 0)
 JOURNAL_FILE = "sensex_trades.csv"
 
 # Candle settings
-CANDLE_MINUTES = 15           # <-- switched from 3 to 15
-HISTORY_RESOLUTION = "15"     # <-- switched from "3" to "15"
-MAX_SL_PCT_OF_RANGE = 0.30    # <-- SL must be <= 30% of (high - low)
+CANDLE_MINUTES = 15
+HISTORY_RESOLUTION = "15"
+
+# === NEW: Absolute max SL in points ===
+MAX_SL_POINTS = 100  # If computed SL width > 100, skip the trade
 
 # Ensure journal file exists with headers (added trade_id and pnl)
 if not os.path.exists(JOURNAL_FILE):
@@ -35,8 +37,7 @@ if not os.path.exists(JOURNAL_FILE):
             "entry_price", "sl_price", "exit_price", "pnl", "remarks"
         ])
 
-# ---------------- LOGGING (patched to file + console) ----------------
-# >>> PATCH: Reset handlers and configure both file and console logging
+# ---------------- LOGGING (file + console) ----------------
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
@@ -47,12 +48,13 @@ logging.basicConfig(
         logging.FileHandler("strategy.log"),   # file logs
         logging.StreamHandler(sys.stdout)      # console logs
     ],
-    force=True  # override any earlier logging config from libraries
+    force=True
 )
 
 logging.info("[BOOT] Logger initialized. Logs -> console + strategy.log")
 
 # ---------------- Helpers ----------------
+
 def _safe_float(v):
     try:
         return float(v)
@@ -73,10 +75,8 @@ def compute_pnl_for_short(entry_price, exit_price, lot_size):
 def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None, remarks="", trade_id=None, lot_size=LOT_SIZE):
     """
     If action == 'ENTRY', append a new row and return trade_id.
-    If action in ('EXIT','SL_HIT'), update the matching entry row (by trade_id if provided,
-    otherwise by symbol & empty exit_price) and write exit/pnl/remarks into same row.
+    If action in ('EXIT','SL_HIT'), update the matching entry row and write exit/pnl/remarks.
     """
-    # Ensure file exists and header correct (in case script restarted)
     if not os.path.exists(JOURNAL_FILE):
         with open(JOURNAL_FILE, mode="w", newline="") as f:
             writer = csv.writer(f)
@@ -96,7 +96,6 @@ def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None
             ])
         return tid
 
-    # For EXIT or SL_HIT, update the existing row
     updated = False
     rows = []
     with open(JOURNAL_FILE, mode="r", newline="") as f:
@@ -238,6 +237,7 @@ def get_atm_symbols(fyers_client):
     logging.info(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
     return [ce_symbol, pe_symbol]
 
+
 def _extract_order_id(resp):
     if not isinstance(resp, dict):
         return None
@@ -262,6 +262,7 @@ def _extract_order_id(resp):
         except Exception:
             pass
     return None
+
 
 def _is_cancel_success(resp):
     if not resp:
@@ -367,9 +368,8 @@ class FyersClient:
                     return
                 symbol = tick["symbol"]
                 ltp = float(tick["ltp"])
-                # >>> PATCH: normalize timestamp ms->s if needed
                 ts = int(tick.get("last_traded_time") or tick.get("tt") or tick.get("timestamp"))
-                if ts > 10_000_000_000:  # heuristic: milliseconds
+                if ts > 10_000_000_000:
                     ts //= 1000
                 cum_vol = int(tick.get("vol_traded_today", 0))
             except Exception as e:
@@ -384,9 +384,7 @@ class FyersClient:
             if c is None or c["time"] != candle_open_time:
                 # CLOSE previous candle and send it out
                 if c is not None:
-                    # >>> PATCH: explicit bar-close log
-                    logging.info(f"[BAR CLOSE] {symbol} {c['time']} "
-                                 f"O={c['open']} H={c['high']} L={c['low']} C={c['close']} V={c['volume']}")
+                    logging.info(f"[BAR CLOSE] {symbol} {c['time']} O={c['open']} H={c['high']} L={c['low']} C={c['close']} V={c['volume']}")
                     on_candle_callback(symbol, c)
                 # start new candle
                 candle_buffers[symbol] = {
@@ -437,7 +435,6 @@ class StrategyEngine:
         self.s1_global_fired_date = None
 
     def prefill_history(self, symbols, days_back=1):
-        """Prefill candles with historical data for warm start."""
         for symbol in symbols:
             try:
                 to_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -445,7 +442,7 @@ class StrategyEngine:
 
                 params = {
                     "symbol": symbol,
-                    "resolution": HISTORY_RESOLUTION,  # "15"
+                    "resolution": HISTORY_RESOLUTION,
                     "date_format": "1",
                     "range_from": from_date,
                     "range_to": to_date,
@@ -464,7 +461,6 @@ class StrategyEngine:
                             "close": c[4],
                             "volume": c[5],
                         }
-                        # keep only within market hours
                         if TRADING_START <= candle["time"].time() <= TRADING_END:
                             self.candles[symbol].append(candle)
                 logging.info(f"Fetched history for {symbol}")
@@ -485,14 +481,11 @@ class StrategyEngine:
             return None
         return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / denom
 
-    def _sl_within_pct_range(self, entry_price, sl_price, candle):
-        """Return True if (sl - entry) <= MAX_SL_PCT_OF_RANGE * (high - low) for the same candle."""
+    # === NEW: absolute SL width check ===
+    def _sl_within_max_points(self, entry_price, sl_price):
         try:
             width = float(sl_price) - float(entry_price)
-            rng = float(candle["high"]) - float(candle["low"])
-            if rng <= 0:
-                return False
-            return width <= MAX_SL_PCT_OF_RANGE * rng
+            return width <= MAX_SL_POINTS
         except Exception:
             return False
 
@@ -529,15 +522,9 @@ class StrategyEngine:
     def detect_new_short_strategy(self, candles, ema5, vwma20):
         """
         Strategy 2 (S2): Two greens then a red with EMA/VWMA conditions (bearish bias)
-        Implemented per spec:
-          - Pattern: c1 green, c2 green, c3 red
-          - Bearish bias required on c1 and c3: EMA5 < VWMA20
-          - Keep: VWMA(c2) > VWMA(c3)
-          - Change: c3.high ≥ EMA5 (on c3)
-          - Keep: c3.close < EMA5 and c3.close < VWMA20
-          - Entry = c3.close
-          - SL    = c3.high + 5
-          - If SL-width rule fails -> skip
+        Changes:
+          - Remove % range SL filter; use absolute max SL of 100 points
+          - If (SL - Entry) > 100 -> skip
         """
         if len(candles) < 3:
             return None
@@ -548,13 +535,11 @@ class StrategyEngine:
         is_green = lambda c: c["close"] > c["open"]
         is_red   = lambda c: c["close"] < c["open"]
 
-        # Pattern: two greens then a red
         if not (is_green(c1) and is_green(c2) and is_red(c3)):
             logging.info(f"[STRAT2] blocked: pattern mismatch -> "
                          f"c1({c1['open']},{c1['close']}), c2({c2['open']},{c2['close']}), c3({c3['open']},{c3['close']})")
             return None
 
-        # Compute bar-wise EMA5 and VWMA20 up to each candle
         closes = [x["close"] for x in candles]
         vols   = [x.get("volume", 0) for x in candles]
 
@@ -575,7 +560,6 @@ class StrategyEngine:
             logging.info("[STRAT2] blocked: missing indicator values")
             return None
 
-        # Bearish bias on c1 and c3
         if not (ema_c1 < vw_c1):
             logging.info(f"[STRAT2] blocked: bearish bias failed on c1 (ema={ema_c1}, vwma={vw_c1})")
             return None
@@ -583,29 +567,24 @@ class StrategyEngine:
             logging.info(f"[STRAT2] blocked: bearish bias failed on c3 (ema={ema_c3}, vwma={vw_c3})")
             return None
 
-        # Keep: VWMA(c2) > VWMA(c3)
         if not (vw_c2 > vw_c3):
             logging.info(f"[STRAT2] blocked: vwma(c2)={vw_c2} <= vwma(c3)={vw_c3}")
             return None
 
-        # Change: c3.high ≥ EMA5 (at c3)
         if not (c3["high"] >= ema_c3):
             logging.info(f"[STRAT2] blocked: c3.high {c3['high']} < ema5(c3) {ema_c3}")
             return None
 
-        # Keep: c3.close below both EMA5 & VWMA20 (at c3)
         if not (c3["close"] < ema_c3 and c3["close"] < vw_c3):
             logging.info(f"[STRAT2] blocked: c3.close {c3['close']} not below ema5 {ema_c3} and vwma20 {vw_c3}")
             return None
 
-        # Entry & SL
         entry = c3["close"]
         sl    = c3["high"] + 5
 
-        # If SL-width rule fails -> skip
-        if not self._sl_within_pct_range(entry, sl, c3):
-            logging.info(f"[STRAT2] Skipped: SL width {sl-entry:.2f} exceeds "
-                         f"{int(MAX_SL_PCT_OF_RANGE*100)}% of range {(c3['high']-c3['low']):.2f}")
+        # NEW: absolute SL cap
+        if not self._sl_within_max_points(entry, sl):
+            logging.info(f"[STRAT2] Skipped: SL width {sl-entry:.2f} > {MAX_SL_POINTS} points")
             return None
 
         logging.info(f"[STRAT2] Triggered: entry={entry}, sl={sl}")
@@ -616,7 +595,6 @@ class StrategyEngine:
         if self.s3_fired_date.get(symbol) == today:
             return None
 
-        # For 15-min bars, first two bars should be 09:15 and 09:30
         todays = [c for c in candles if c["time"].date() == today and c["time"].time() >= TRADING_START]
         if len(todays) < 2:
             return None
@@ -657,14 +635,13 @@ class StrategyEngine:
         entry = c2["low"]
         sl    = c2["high"] + 5
 
-        if not self._sl_within_pct_range(entry, sl, c2):
-            logging.info(f"[STRAT3] Skipped: SL width {sl-entry:.2f} exceeds {int(MAX_SL_PCT_OF_RANGE*100)}% of range {(c2['high']-c2['low']):.2f}")
+        if not self._sl_within_max_points(entry, sl):
+            logging.info(f"[STRAT3] Skipped: SL width {sl-entry:.2f} > {MAX_SL_POINTS} points")
             return None
 
         return {"entry": entry, "sl": sl, "date": today}
 
     def reconcile_position(self, symbol):
-        """Check broker positions to ensure internal state is correct."""
         try:
             resp = self.fyers.client.positions()
             if resp.get("s") == "ok":
@@ -690,9 +667,9 @@ class StrategyEngine:
         if ema5 is None or vwma20 is None:
             return
 
+        # === Enhanced candle-close log with EMA/VWMA ===
         logging.info(
-            f"[Candle] {symbol} {candle['time']} EMA5={ema5:.2f}, "
-            f"VWMA20={vwma20:.2f}, Close={candle['close']}"
+            f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} V={candle['volume']} | EMA5={ema5:.2f} VWMA20={vwma20:.2f}"
         )
 
         now = datetime.datetime.now().time()
@@ -729,7 +706,7 @@ class StrategyEngine:
         if (not first_mark) or (first_mark[0] != now_date):
             try:
                 c_time = candle["time"].time()
-                if c_time == TRADING_START:  # 09:15 15-min opening candle
+                if c_time == TRADING_START:
                     self.s1_marked_low[symbol] = (now_date, candle["low"])
                     logging.info(f"[STRAT1] Marked first-candle low for {symbol} = {candle['low']}")
             except Exception as e:
@@ -747,10 +724,10 @@ class StrategyEngine:
                     is_red = lambda c: c["close"] < c["open"]
                     if candle["close"] < marked_low and is_red(candle):
                         entry_price = candle["close"]
-                        sl_price = candle["high"] + 5  # small pad
+                        sl_price = candle["high"] + 5
 
-                        if not self._sl_within_pct_range(entry_price, sl_price, candle):
-                            logging.info(f"[STRAT1] Skipped: SL width {sl_price-entry_price:.2f} exceeds {int(MAX_SL_PCT_OF_RANGE*100)}% of range {(candle['high']-candle['low']):.2f} for {symbol}")
+                        if not self._sl_within_max_points(entry_price, sl_price):
+                            logging.info(f"[STRAT1] Skipped: SL width {sl_price-entry_price:.2f} > {MAX_SL_POINTS} points for {symbol}")
                             self.s1_fired_date[symbol] = now_date
                         else:
                             raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry_price, "STRAT1ENTRY")
@@ -828,8 +805,8 @@ class StrategyEngine:
                                 if is_red(c_curr) and (ema_curr <= vw_curr) and (ema_curr >= vw_curr * (1 - GAP)) and (ema_curr <= vw_curr * (1 - GAP_MIN_STRAT_4)):
                                     entry = c_curr["close"]
                                     sl = c_curr["high"] + 5
-                                    if not self._sl_within_pct_range(entry, sl, c_curr):
-                                        logging.info(f"[STRAT4] Skipped: SL width {sl-entry:.2f} exceeds {int(MAX_SL_PCT_OF_RANGE*100)}% of range {(c_curr['high']-c_curr['low']):.2f}")
+                                    if not self._sl_within_max_points(entry, sl):
+                                        logging.info(f"[STRAT4] Skipped: SL width {sl-entry:.2f} > {MAX_SL_POINTS} points")
                                         self.s4_pending.pop(symbol, None)
                                     else:
                                         raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "STRAT4ENTRY")
@@ -932,7 +909,7 @@ if __name__ == "__main__":
     fyers_client = FyersClient(CLIENT_ID, ACCESS_TOKEN, LOT_SIZE)
     engine = StrategyEngine(fyers_client, LOT_SIZE)
 
-    # Wait until 9:15 AM (light sleep to avoid busy-loop)
+    # Wait until 9:15 AM
     while datetime.datetime.now().time() < TRADING_START:
         time.sleep(1)
 
