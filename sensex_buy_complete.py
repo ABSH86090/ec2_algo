@@ -789,7 +789,7 @@ class NiftyBuyStrategy:
                     'EMA5': _safe(self.ema_series([c['close'] for c in self.candles[s]], EMA_PERIOD)[-1]) if len(self.candles[s]) > 0 else None,
                     'VWMA20': _safe(self.vwma_series([c['close'] for c in self.candles[s]], [c['volume'] for c in self.candles[s]], VWMA_PERIOD)[-1]) if len(self.candles[s]) > 0 else None,
                     # PATCH: fixed stray quote bug in original snapshot line below
-                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s']], ADX_PERIOD)[-1]) if len(self.candles[s]) > 0 else None
+                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s]], ADX_PERIOD)[-1]) if len(self.candles[s]) > 0 else None
                 } for s in list(self.candles.keys())}
                 logger.info(f"Indicators snapshot at {candle['time']}: {json.dumps(snapshot)}")
             except Exception as e:
@@ -1194,3 +1194,4 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
+
