@@ -19,7 +19,7 @@ ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 LOT_SIZE = int(os.getenv("LOT_SIZE", "20"))  # tweak via env or edit constant
 TICK_SIZE = 0.05  # NSE options tick size
 
-TRADING_START = datetime.time(9, 15)
+TRADING_START = datetime.time(9,15)
 TRADING_END = datetime.time(15, 0)
 
 # --- W-pattern config ---
@@ -86,12 +86,11 @@ def log_trade(symbol, side, entry, sl, target, exit_price, pnl, file="trades.csv
     with open(file, "a", newline="") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["date", "symbol", "side", "entry", "sl", "target", "exit", "pnl"])
+            writer.writerow(["date","symbol","side","entry","sl","target","exit","pnl"])
         writer.writerow([
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             symbol, side, entry, sl, target, exit_price, pnl
         ])
-
 # ---------------- EXPIRY & SYMBOL UTILS ----------------
 
 SPECIAL_MARKET_HOLIDAYS = {
@@ -129,6 +128,7 @@ def get_next_expiry():
         expiry = candidate_thu
     return expiry
 
+
 def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
     """
     Return expiry token used inside option symbols:
@@ -152,8 +152,8 @@ def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
             treat_as_monthly = True
 
     if treat_as_monthly:
-        mon = (expiry_date + datetime.timedelta(days=(3 - expiry_date.weekday()))) \
-            .strftime("%b").upper() if expiry_date.weekday() != 3 else expiry_date.strftime("%b").upper()
+        mon = (expiry_date + datetime.timedelta(days=(3 - expiry_date.weekday())))\
+                .strftime("%b").upper() if expiry_date.weekday() != 3 else expiry_date.strftime("%b").upper()
         return f"{yy}{mon}"
 
     # fallback to previous numeric behavior for non-monthly expiries
@@ -189,6 +189,7 @@ def get_atm_symbols(fyers_client):
     print(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
     logging.info(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
     return [ce_symbol, pe_symbol]
+
 
 # ---------------- FYERS CLIENT ----------------
 class FyersClient:
@@ -435,11 +436,10 @@ class NiftyBuyStrategy:
         self.lot_size = lot_size
         self.candles = defaultdict(lambda: deque(maxlen=400))
         self.positions = {}       # Active positions per symbol
-        # simplified state: track detected w_span, last_trade_idx, and consumed W (for one trade per W)
+        # simplified state: track detected w_span and last_trade_idx
         self.state = defaultdict(lambda: {
             "w_span": None,
-            "last_trade_idx": -1,
-            "consumed_w": None,   # <-- NEW: remember the W for which we already took a trade
+            "last_trade_idx": -1
         })
 
     # --- history prefill ---
@@ -485,29 +485,29 @@ class NiftyBuyStrategy:
 
     # --- indicator series ---
     def ema_series(self, prices, period):
-        out = [None] * len(prices)
+        out = [None]*len(prices)
         if len(prices) < 1:
             return out
-        k = 2 / (period + 1)
+        k = 2/(period+1)
         ema = prices[0]
-        for i, p in enumerate(prices):
+        for i,p in enumerate(prices):
             if i == 0:
                 ema = p
             else:
-                ema = p * k + ema * (1 - k)
+                ema = p*k + ema*(1-k)
             out[i] = ema
         return out
 
     def vwma_series(self, closes, volumes, period):
-        out = [None] * len(closes)
+        out = [None]*len(closes)
         if len(closes) < period:
             return out
         for i in range(len(closes)):
-            if i + 1 >= period:
-                c = closes[i - period + 1:i + 1]
-                v = volumes[i - period + 1:i + 1]
+            if i+1 >= period:
+                c = closes[i-period+1:i+1]
+                v = volumes[i-period+1:i+1]
                 denom = sum(v)
-                out[i] = (sum([ci * vi for ci, vi in zip(c, v)]) / denom) if denom > 0 else None
+                out[i] = (sum([ci*vi for ci,vi in zip(c,v)]) / denom) if denom > 0 else None
         return out
 
     def adx_series(self, highs, lows, closes, period=14):
@@ -526,9 +526,9 @@ class NiftyBuyStrategy:
         for i in range(1, n):
             high = highs[i]
             low = lows[i]
-            prev_high = highs[i - 1]
-            prev_low = lows[i - 1]
-            prev_close = closes[i - 1]
+            prev_high = highs[i-1]
+            prev_low = lows[i-1]
+            prev_close = closes[i-1]
 
             tr_val = max(high - low, abs(high - prev_close), abs(low - prev_close))
             tr[i] = tr_val
@@ -549,18 +549,18 @@ class NiftyBuyStrategy:
         plus_smooth = [None] * n
         minus_smooth = [None] * n
 
-        tr_sum = sum([tr[i] for i in range(1, period + 1) if tr[i] is not None])
-        plus_sum = sum([plus_dm[i] for i in range(1, period + 1)])
-        minus_sum = sum([minus_dm[i] for i in range(1, period + 1)])
+        tr_sum = sum([tr[i] for i in range(1, period+1) if tr[i] is not None])
+        plus_sum = sum([plus_dm[i] for i in range(1, period+1)])
+        minus_sum = sum([minus_dm[i] for i in range(1, period+1)])
 
         tr_smooth[period] = tr_sum
         plus_smooth[period] = plus_sum
         minus_smooth[period] = minus_sum
 
-        for i in range(period + 1, n):
-            tr_smooth[i] = tr_smooth[i - 1] - (tr_smooth[i - 1] / period) + tr[i]
-            plus_smooth[i] = plus_smooth[i - 1] - (plus_smooth[i - 1] / period) + plus_dm[i]
-            minus_smooth[i] = minus_smooth[i - 1] - (minus_smooth[i - 1] / period) + minus_dm[i]
+        for i in range(period+1, n):
+            tr_smooth[i] = tr_smooth[i-1] - (tr_smooth[i-1] / period) + tr[i]
+            plus_smooth[i] = plus_smooth[i-1] - (plus_smooth[i-1] / period) + plus_dm[i]
+            minus_smooth[i] = minus_smooth[i-1] - (minus_smooth[i-1] / period) + minus_dm[i]
 
         # Calculate +DI, -DI, DX, then ADX (smoothed DX)
         plus_di = [None] * n
@@ -589,16 +589,15 @@ class NiftyBuyStrategy:
                 # Wilder smoothing for subsequent ADX values
                 for i in range(first_adx_index + 1, n):
                     if dx[i] is None:
-                        adx[i] = adx[i - 1]
+                        adx[i] = adx[i-1]
                     else:
-                        adx[i] = ((adx[i - 1] * (period - 1)) + dx[i]) / period
+                        adx[i] = ((adx[i-1] * (period - 1)) + dx[i]) / period
 
         return adx
 
     # --- helpers ---
     @staticmethod
     def is_green(c): return c["close"] > c["open"]
-
     @staticmethod
     def is_red(c): return c["close"] < c["open"]
 
@@ -606,9 +605,8 @@ class NiftyBuyStrategy:
         if idx - k < 0 or idx + k >= len(lows):
             return False
         center = lows[idx]
-        for i in range(idx - k, idx + k + 1):
-            if i == idx:
-                continue
+        for i in range(idx-k, idx+k+1):
+            if i == idx: continue
             if center > lows[i]:
                 return False
         return True
@@ -619,7 +617,7 @@ class NiftyBuyStrategy:
         Keeps original conditions: both lows inside session and EMA5 < VWMA20 between i1..i2.
         """
         n = len(candles)
-        if n < (2 * PIVOT_K + 1) + MIN_BARS_BETWEEN_LOWS:
+        if n < (2*PIVOT_K + 1) + MIN_BARS_BETWEEN_LOWS:
             return None
 
         # limit to current session
@@ -638,13 +636,13 @@ class NiftyBuyStrategy:
         lows = [c["low"] for c in candles]
 
         # Ensure scanning never goes before start_idx
-        i2_min_bound = max(2 * PIVOT_K, start_idx + PIVOT_K)
+        i2_min_bound = max(2*PIVOT_K, start_idx + PIVOT_K)
         for i2 in range(n - 1 - PIVOT_K, i2_min_bound - 1, -1):
             if not self.is_pivot_low(lows, i2, PIVOT_K):
                 continue
 
             jmax = i2 - MIN_BARS_BETWEEN_LOWS
-            i1_min_bound = max(2 * PIVOT_K - 1, start_idx + PIVOT_K - 1)
+            i1_min_bound = max(2*PIVOT_K - 1, start_idx + PIVOT_K - 1)
             for i1 in range(jmax, i1_min_bound - 1, -1):
                 if not self.is_pivot_low(lows, i1, PIVOT_K):
                     continue
@@ -668,7 +666,7 @@ class NiftyBuyStrategy:
         body = abs(c["close"] - c["open"])
         upper = c["high"] - max(c["close"], c["open"])
         lower = min(c["close"], c["open"]) - c["low"]
-        return (c["close"] > c["open"]) and (lower >= 2 * body) and (upper <= body)
+        return (c["close"] > c["open"]) and (lower >= 2*body) and (upper <= body)
 
     def is_bullish_engulfing(self, prev, curr):
         return (prev["close"] < prev["open"] and
@@ -784,12 +782,12 @@ class NiftyBuyStrategy:
             # --- SNAPSHOT: log indicators for all tracked symbols at this 3-min close ---
             try:
                 snapshot = {s: {
-                    'time': str(self.candles[s][-1]['time']) if len(self.candles[s]) > 0 else None,
+                    'time': str(self.candles[s][-1]['time']) if len(self.candles[s])>0 else None,
                     'close': _safe(self.candles[s][-1]['close']),
-                    'EMA5': _safe(self.ema_series([c['close'] for c in self.candles[s]], EMA_PERIOD)[-1]) if len(self.candles[s]) > 0 else None,
-                    'VWMA20': _safe(self.vwma_series([c['close'] for c in self.candles[s]], [c['volume'] for c in self.candles[s]], VWMA_PERIOD)[-1]) if len(self.candles[s]) > 0 else None,
+                    'EMA5': _safe(self.ema_series([c['close'] for c in self.candles[s]], EMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
+                    'VWMA20': _safe(self.vwma_series([c['close'] for c in self.candles[s]], [c['volume'] for c in self.candles[s]], VWMA_PERIOD)[-1]) if len(self.candles[s])>0 else None,
                     # PATCH: fixed stray quote bug in original snapshot line below
-                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s]], ADX_PERIOD)[-1]) if len(self.candles[s]) > 0 else None
+                    'ADX': _safe(self.adx_series([c['high'] for c in self.candles[s]], [c['low'] for c in self.candles[s]], [c['close'] for c in self.candles[s]], ADX_PERIOD)[-1]) if len(self.candles[s])>0 else None
                 } for s in list(self.candles.keys())}
                 logger.info(f"Indicators snapshot at {candle['time']}: {json.dumps(snapshot)}")
             except Exception as e:
@@ -836,16 +834,6 @@ class NiftyBuyStrategy:
             # Pass today's session start so W is restricted to today only
             w_span = self.find_recent_w(candles, ema5_arr, vwma20_arr, start_dt=session_start_dt())
             if w_span:
-                # NEW: If we've already traded this exact W, ignore and wait for a new W
-                if st.get("consumed_w") == w_span:
-                    logger.debug(json.dumps({
-                        'event': 'w_already_consumed',
-                        'symbol': symbol,
-                        'w_span': w_span
-                    }))
-                    st["w_span"] = None
-                    return
-
                 if st["w_span"] != w_span:
                     st["w_span"] = w_span
                     st["last_trade_idx"] = -1
@@ -878,7 +866,7 @@ class NiftyBuyStrategy:
                 ema_over_vwma_now = (ema5 > vwma20)
 
                 # trigger patterns
-                prev = candles[idx - 1] if idx - 1 >= 0 else None
+                prev = candles[idx-1] if idx-1 >= 0 else None
                 is_trigger_pattern = self.is_strong_green_close_near_high(candle, pct=0.01)
                 if prev:
                     is_trigger_pattern = (
@@ -950,9 +938,7 @@ class NiftyBuyStrategy:
                         'sl_resp': str(sl_resp)
                     }))
 
-                    # Mark this W as consumed so we won't trade it again
-                    st["consumed_w"] = st.get("w_span")
-                    # reset current W tracking; a NEW W must form for the next trade
+                    # reset W so we don't re-enter immediately on subsequent candles (will re-detect later)
                     st["w_span"] = None
                     st["last_trade_idx"] = idx
                     return
@@ -997,7 +983,7 @@ class NiftyBuyStrategy:
             logger.debug(f"Exit already initiated for {symbol}; skipping duplicate attempt.")
             return
         if (now_ms - last_ms) < EXIT_THROTTLE_MS:
-            logger.debug(f"Throttle active for {symbol} exit attempts (wait {(EXIT_THROTTLE_MS - (now_ms - last_ms))} ms).")
+            logger.debug(f"Throttle active for {symbol} exit attempts (wait {(EXIT_THROTTLE_MS - (now_ms-last_ms))} ms).")
             return
 
         pos["last_exit_attempt_ms"] = now_ms
@@ -1186,7 +1172,7 @@ if __name__ == "__main__":
 
     # Replace with actual Sensex option symbols as needed
     option_symbols = get_atm_symbols(fyers_client)
-    # option_symbols = ["BSE:SENSEX2591180700CE", "BSE:SENSEX2591181100PE"]
+    #option_symbols = ["BSE:SENSEX2591180700CE", "BSE:SENSEX2591181100PE"]
 
     engine.prefill_history(option_symbols, days_back=2)
 
@@ -1194,4 +1180,3 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
-
