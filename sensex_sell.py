@@ -25,7 +25,11 @@ JOURNAL_FILE = "sensex_trades.csv"
 CANDLE_MINUTES = 15
 HISTORY_RESOLUTION = "15"
 
-# === NEW: Absolute max SL in points ===
+# === NEW/UPDATED: warmup requirements ===
+MIN_BARS_FOR_VWMA = 20          # need at least 20 bars for VWMA(20)
+MAX_HISTORY_LOOKBACK_DAYS = 7   # try up to N days back to fetch enough bars
+
+# === Absolute max SL in points ===
 MAX_SL_POINTS = 100  # If computed SL width > 100, skip the trade
 
 # Ensure journal file exists with headers (added trade_id and pnl)
@@ -429,43 +433,63 @@ class StrategyEngine:
         self.candles = defaultdict(lambda: deque(maxlen=200))
         self.s3_fired_date = {}
         self.s4_pending = {}
-        # NEW for Strategy 1
+        # Strategy 1 state
         self.s1_marked_low = {}
         self.s1_fired_date = {}
         self.s1_global_fired_date = None
 
     def prefill_history(self, symbols, days_back=1):
+        """
+        UPDATED: keep going farther back day-by-day until we collect at least MIN_BARS_FOR_VWMA candles
+        (during trading hours), or hit MAX_HISTORY_LOOKBACK_DAYS. Log exactly how many per symbol.
+        """
         for symbol in symbols:
-            try:
-                to_date = datetime.datetime.now().strftime("%Y-%m-%d")
-                from_date = (datetime.datetime.now() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+            total_added = 0
+            used_days = 0
+            # Try from 'days_back' up to 'MAX_HISTORY_LOOKBACK_DAYS'
+            while total_added < MIN_BARS_FOR_VWMA and used_days < MAX_HISTORY_LOOKBACK_DAYS:
+                try:
+                    to_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                    from_dt = datetime.datetime.now() - datetime.timedelta(days=days_back + used_days)
+                    from_date = from_dt.strftime("%Y-%m-%d")
 
-                params = {
-                    "symbol": symbol,
-                    "resolution": HISTORY_RESOLUTION,
-                    "date_format": "1",
-                    "range_from": from_date,
-                    "range_to": to_date,
-                    "cont_flag": "1"
-                }
-                hist = self.fyers.client.history(params)
+                    params = {
+                        "symbol": symbol,
+                        "resolution": HISTORY_RESOLUTION,
+                        "date_format": "1",
+                        "range_from": from_date,
+                        "range_to": to_date,
+                        "cont_flag": "1"
+                    }
+                    hist = self.fyers.client.history(params)
 
-                if hist.get("candles"):
-                    for c in hist["candles"]:
-                        ts = datetime.datetime.fromtimestamp(c[0])
-                        candle = {
-                            "time": ts,
-                            "open": c[1],
-                            "high": c[2],
-                            "low": c[3],
-                            "close": c[4],
-                            "volume": c[5],
-                        }
-                        if TRADING_START <= candle["time"].time() <= TRADING_END:
-                            self.candles[symbol].append(candle)
-                logging.info(f"Fetched history for {symbol}")
-            except Exception as e:
-                logging.error(f"Failed to fetch history for {symbol}: {e}")
+                    added_this_round = 0
+                    if hist.get("candles"):
+                        for c in hist["candles"]:
+                            ts = datetime.datetime.fromtimestamp(c[0])
+                            candle = {
+                                "time": ts,
+                                "open": c[1],
+                                "high": c[2],
+                                "low": c[3],
+                                "close": c[4],
+                                "volume": c[5],
+                            }
+                            if TRADING_START <= candle["time"].time() <= TRADING_END:
+                                self.candles[symbol].append(candle)
+                                total_added += 1
+                                added_this_round += 1
+
+                    logging.info(f"[PREFILL] {symbol}: +{added_this_round} bars (round {used_days+1}), total={total_added}")
+                except Exception as e:
+                    logging.error(f"[PREFILL] Failed to fetch history for {symbol}: {e}")
+                finally:
+                    used_days += 1
+
+            if total_added == 0:
+                logging.info(f"[PREFILL] {symbol}: no historical bars appended (total=0)")
+            else:
+                logging.info(f"[PREFILL DONE] {symbol}: total prefilled bars={total_added} (min needed={MIN_BARS_FOR_VWMA})")
 
     def compute_ema(self, prices, period):
         if len(prices) < period: return None
@@ -481,7 +505,7 @@ class StrategyEngine:
             return None
         return sum([c*v for c, v in zip(closes[-period:], volumes[-period:])]) / denom
 
-    # === NEW: absolute SL width check ===
+    # === absolute SL width check ===
     def _sl_within_max_points(self, entry_price, sl_price):
         try:
             width = float(sl_price) - float(entry_price)
@@ -522,13 +546,13 @@ class StrategyEngine:
     def detect_new_short_strategy(self, candles, ema5, vwma20):
         """
         Strategy 2 (S2): Two greens then a red with EMA/VWMA conditions (bearish bias)
-        Changes:
-          - Remove % range SL filter; use absolute max SL of 100 points
-          - If (SL - Entry) > 100 -> skip
+        Changes already logged in caller.
         """
         if len(candles) < 3:
+            logging.info("[STRAT2] blocked: need at least 3 candles")
             return None
         if ema5 is None or vwma20 is None:
+            logging.info("[STRAT2] blocked: missing indicator values")
             return None
 
         c1, c2, c3 = candles[-3], candles[-2], candles[-1]
@@ -557,7 +581,7 @@ class StrategyEngine:
                      f"c3: ema={ema_c3}, vwma={vw_c3}")
 
         if None in (ema_c1, vw_c1, ema_c2, vw_c2, ema_c3, vw_c3):
-            logging.info("[STRAT2] blocked: missing indicator values")
+            logging.info("[STRAT2] blocked: missing indicator values (per-index)")
             return None
 
         if not (ema_c1 < vw_c1):
@@ -582,7 +606,7 @@ class StrategyEngine:
         entry = c3["close"]
         sl    = c3["high"] + 5
 
-        # NEW: absolute SL cap
+        # absolute SL cap
         if not self._sl_within_max_points(entry, sl):
             logging.info(f"[STRAT2] Skipped: SL width {sl-entry:.2f} > {MAX_SL_POINTS} points")
             return None
@@ -660,22 +684,32 @@ class StrategyEngine:
     def on_candle(self, symbol, candle):
         self.candles[symbol].append(candle)
         candles = list(self.candles[symbol])
+
+        # --- NEW: explicit warmup/skip logs before indicator calc
+        if len(candles) < MIN_BARS_FOR_VWMA:
+            logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; need {MIN_BARS_FOR_VWMA} for VWMA20")
+            return
+
         closes = [c["close"] for c in candles]
         volumes = [c["volume"] for c in candles]
         ema5 = self.compute_ema(closes, 5)
         vwma20 = self.compute_vwma(closes, volumes, 20)
+
         if ema5 is None or vwma20 is None:
+            logging.info(f"[SKIP] {symbol} {candle['time']}: indicators unavailable (EMA5={ema5}, VWMA20={vwma20})")
             return
 
-        # === Enhanced candle-close log with EMA/VWMA ===
+        # Enhanced candle-close log with EMA/VWMA
         logging.info(
             f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} V={candle['volume']} | EMA5={ema5:.2f} VWMA20={vwma20:.2f}"
         )
 
         now = datetime.datetime.now().time()
         if not (TRADING_START <= now <= TRADING_END):
+            logging.info(f"[SKIP] {symbol} outside trading window")
             return
         if self.sl_count >= MAX_SLS_PER_DAY:
+            logging.info(f"[SKIP] {symbol} daily SL limit reached ({self.sl_count}/{MAX_SLS_PER_DAY})")
             return
 
         position = self.positions.get(symbol)
@@ -750,6 +784,7 @@ class StrategyEngine:
         # -------- STRATEGY 2 --------
         position = self.positions.get(symbol)
         if position is None:
+            logging.info(f"[DEBUG] Checking STRAT2 for {symbol} at {candle['time']}")
             strat2 = self.detect_new_short_strategy(candles, ema5, vwma20)
             if strat2:
                 raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, strat2["entry"], "STRAT2ENTRY")
@@ -766,6 +801,8 @@ class StrategyEngine:
                     "trade_id": trade_id
                 }
                 logging.info(f"[STRAT2] ENTRY @{strat2['entry']} SL @{strat2['sl']} for {symbol}")
+        else:
+            logging.info(f"[SKIP] {symbol} STRAT2 not evaluated: position already open")
 
         # -------- STRATEGY 4 --------
         try:
@@ -920,7 +957,9 @@ if __name__ == "__main__":
         logging.exception(f"Failed to build ATM symbols: {e}")
         raise
 
+    # UPDATED: dynamic prefill to ensure ≥ MIN_BARS_FOR_VWMA bars if possible
     engine.prefill_history(option_symbols, days_back=1)
+
     fyers_client.register_trade_callback(engine.on_trade)
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle)
     fyers_client.start_order_socket()
