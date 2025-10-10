@@ -16,7 +16,7 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
-LOT_SIZE = int(os.getenv("LOT_SIZE", "20"))  # tweak via env or edit constant
+LOT_SIZE = int(os.getenv("LOT_SIZE", "40"))  # tweak via env or edit constant
 TICK_SIZE = 0.05  # NSE options tick size
 
 TRADING_START = datetime.time(9,15)
@@ -1180,3 +1180,4 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
+
