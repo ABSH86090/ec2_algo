@@ -759,6 +759,39 @@ class NiftyBuyStrategy:
             logger.error(f"_safe_cancel_and_place_sl failed for {symbol}: {e}")
             return None, None
 
+    # --- New helper: choose strike 200 pts from ATM if premium > threshold ---
+    def _select_strike_200_from_atm(self, symbol):
+        """
+        Given an option symbol like 'BSE:SENSEX25OCT80300CE', return a new symbol
+        using ATM +/- 200 (CE -> ATM-200 ; PE -> ATM+200) keeping the same expiry token.
+        Raises Exception on parse/fetch failure.
+        """
+        try:
+            # symbol pattern: BSE:SENSEX<EXPIRY><STRIKE><CE|PE>
+            m = re.match(r'^(BSE:SENSEX)([A-Z0-9]+?)(\d+)(CE|PE)$', symbol)
+            if not m:
+                raise Exception(f"Unrecognized symbol format: {symbol}")
+            prefix, expiry_token, old_strike, opt_type = m.groups()
+
+            # fetch underlying spot (SENSEX)
+            resp = self.fyers.client.quotes({"symbols": "BSE:SENSEX-INDEX"})
+            if not resp.get("d"):
+                raise Exception(f"Failed to fetch SENSEX spot: {resp}")
+            ltp = float(resp["d"][0]["v"]["lp"])  # last traded price of index
+            atm = int(round(ltp / 100.0) * 100)
+
+            if opt_type == "CE":
+                new_strike = int(atm - 200)
+            else:  # "PE"
+                new_strike = int(atm + 200)
+
+            new_symbol = f"{prefix}{expiry_token}{new_strike}{opt_type}"
+            logger.info(f"Adjusted symbol from {symbol} -> {new_symbol} (atm={atm})")
+            return new_symbol
+        except Exception as e:
+            logger.error(f"_select_strike_200_from_atm failed for {symbol}: {e}")
+            raise
+
     # --- main candle handler ---
     def on_candle(self, symbol, candle):
         try:
@@ -903,13 +936,33 @@ class NiftyBuyStrategy:
                     target_price = round_to_tick(entry + 2.0 * risk_points)
 
                     # Place market buy then SL-M
-                    buy_resp = self.fyers.place_market_buy(symbol, self.lot_size, tag="NIFTYBUYENTRY")
-                    sl_resp = self.fyers.place_stoploss_sell(symbol, self.lot_size, sl_price, tag="NIFTYSL")
+                    selected_symbol = symbol
+                    # If premium on candle close crosses 700 -> select new strike 200 pts away from ATM
+                    try:
+                        if candle["close"] > 700:
+                            try:
+                                selected_symbol = self._select_strike_200_from_atm(symbol)
+                                logger.info(json.dumps({
+                                    'event': 'strike_adjusted_due_to_high_premium',
+                                    'orig_symbol': symbol,
+                                    'selected_symbol': selected_symbol,
+                                    'premium': candle["close"]
+                                }))
+                            except Exception as e:
+                                logger.warning(f"Failed to adjust strike for {symbol}: {e}. Proceeding with original symbol.")
+
+                    except Exception:
+                        # defensive: if candle has no 'close' or weird type, continue with original symbol
+                        pass
+
+                    # Place market buy on selected symbol and place SL on same symbol
+                    buy_resp = self.fyers.place_market_buy(selected_symbol, self.lot_size, tag="NIFTYBUYENTRY")
+                    sl_resp = self.fyers.place_stoploss_sell(selected_symbol, self.lot_size, sl_price, tag="NIFTYSL")
 
                     sl_id = self._extract_order_id(sl_resp)
 
-                    # store position
-                    self.positions[symbol] = {
+                    # store position under the selected instrument symbol
+                    self.positions[selected_symbol] = {
                         "entry": entry,
                         "sl": sl_price,
                         "orig_sl": sl_price,
@@ -926,7 +979,8 @@ class NiftyBuyStrategy:
 
                     logger.info(json.dumps({
                         'event': 'entry_assumed_immediate',
-                        'symbol': symbol,
+                        'orig_symbol': symbol,
+                        'selected_symbol': selected_symbol,
                         'entry': entry,
                         'sl': sl_price,
                         'risk_points': risk_points,
@@ -938,7 +992,7 @@ class NiftyBuyStrategy:
                         'sl_resp': str(sl_resp)
                     }))
 
-                    # reset W so we don't re-enter immediately on subsequent candles (will re-detect later)
+                    # reset W so we don't re-enter immediately on subsequent candles
                     st["w_span"] = None
                     st["last_trade_idx"] = idx
                     return
@@ -1180,4 +1234,3 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
-
