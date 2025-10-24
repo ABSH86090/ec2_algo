@@ -34,7 +34,7 @@ EMA_OVER_VWMA_MAX_GAP = 0.06  # 6% maximum allowed relative gap at trigger candl
 
 # ADX filter
 ADX_PERIOD = 14
-ADX_MIN = 20  # only take trade if ADX >= 20
+ADX_MIN = 15  # only take trade if ADX > 15  (patched per request)
 
 # Exit throttle (milliseconds) to avoid spamming cancel/market orders on rapid ticks
 EXIT_THROTTLE_MS = int(os.getenv("EXIT_THROTTLE_MS", "500"))
@@ -436,10 +436,11 @@ class NiftyBuyStrategy:
         self.lot_size = lot_size
         self.candles = defaultdict(lambda: deque(maxlen=400))
         self.positions = {}       # Active positions per symbol
-        # simplified state: track detected w_span and last_trade_idx
+        # simplified state: track detected w_span, last_trade_idx, and breakout_time
         self.state = defaultdict(lambda: {
             "w_span": None,
-            "last_trade_idx": -1
+            "last_trade_idx": -1,
+            "breakout_time": None  # patched: record first breakout candle datetime
         })
 
     # --- history prefill ---
@@ -870,6 +871,7 @@ class NiftyBuyStrategy:
                 if st["w_span"] != w_span:
                     st["w_span"] = w_span
                     st["last_trade_idx"] = -1
+                    st["breakout_time"] = None  # reset breakout_time when new W detected
                     # log the detected W
                     i1, i2 = w_span
                     logger.info(json.dumps({
@@ -895,6 +897,21 @@ class NiftyBuyStrategy:
 
             # --- ORIGINAL breakout entry logic retained ---
             if self.is_green(candle) and candle["close"] > ema5 and candle["close"] > vwma20:
+                # We treat the first candle that is green and closes above EMA5 & VWMA20 as the "breakout candle".
+                # Record breakout_time on the first such candle for the W; used to enforce the 25-minute cutoff.
+                try:
+                    if st.get("breakout_time") is None:
+                        # store breakout_time as datetime
+                        st["breakout_time"] = candle["time"]
+                        logger.info(json.dumps({
+                            'event': 'breakout_time_recorded',
+                            'symbol': symbol,
+                            'breakout_time': str(st["breakout_time"])
+                        }))
+                except Exception:
+                    # defensive: continue even if time storing fails
+                    st["breakout_time"] = None
+
                 # require ema5 > vwma20 at breakout candle
                 ema_over_vwma_now = (ema5 > vwma20)
 
@@ -909,10 +926,35 @@ class NiftyBuyStrategy:
                     )
 
                 # ADX and wick checks
-                adx_ok = (adx is not None and adx >= ADX_MIN)
+                # patched: ADX check is strict greater than ADX_MIN (ADX_MIN set to 15 above)
+                adx_ok = (adx is not None and adx > ADX_MIN)
                 wick_ok = self.has_short_upper_wick(candle, max_ratio=0.5)
 
-                if is_trigger_pattern and adx_ok and wick_ok and ema_over_vwma_now:
+                # patched: enforce 25-minute cutoff from breakout candle
+                breakout_allowed = True
+                try:
+                    bt = st.get("breakout_time")
+                    if bt is not None:
+                        # compute minutes diff between current candle time and breakout_time
+                        diff_min = (candle["time"] - bt).total_seconds() / 60.0
+                        if diff_min > 25.0:
+                            breakout_allowed = False
+                            logger.info(json.dumps({
+                                'event': 'late_candidate_skipped',
+                                'symbol': symbol,
+                                'breakout_time': str(bt),
+                                'candidate_time': str(candle['time']),
+                                'minutes_since_breakout': diff_min,
+                                'reason': 'exceeds_25_min_cutoff'
+                            }))
+                            # clear the W so we don't repeatedly attempt late entries
+                            st["w_span"] = None
+                            st["breakout_time"] = None
+                except Exception as e:
+                    logger.debug(f"breakout cutoff check failed: {e}")
+                    breakout_allowed = True  # fail-safe: if we can't compute, allow
+
+                if is_trigger_pattern and adx_ok and wick_ok and ema_over_vwma_now and breakout_allowed:
                     # ENTRY: at close of this green candle
                     entry = round_to_tick(candle["close"])
 
@@ -924,12 +966,14 @@ class NiftyBuyStrategy:
                     if risk_points <= 0:
                         logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'non_positive_risk', 'entry': entry, 'sl': sl_price}))
                         st["w_span"] = None
+                        st["breakout_time"] = None
                         return
 
                     # PATCH: enforce maximum SL distance
                     if risk_points > MAX_SL_POINTS:
                         logger.info(json.dumps({'event': 'skip', 'symbol': symbol, 'reason': 'risk_exceeds_max', 'risk_points': risk_points, 'max_allowed': MAX_SL_POINTS}))
                         st["w_span"] = None
+                        st["breakout_time"] = None
                         return
 
                     # PATCH: target = 2 * SL distance
@@ -995,6 +1039,7 @@ class NiftyBuyStrategy:
                     # reset W so we don't re-enter immediately on subsequent candles
                     st["w_span"] = None
                     st["last_trade_idx"] = idx
+                    st["breakout_time"] = None
                     return
                 else:
                     # reasons logging
@@ -1007,6 +1052,8 @@ class NiftyBuyStrategy:
                         reasons.append(f'upper_wick_too_long(ratio={_safe(self.upper_wick_ratio(candle))})')
                     if not ema_over_vwma_now:
                         reasons.append('ema_not_above_vwma')
+                    if not breakout_allowed:
+                        reasons.append('breakout_too_old')
 
                     logger.debug(json.dumps({
                         'event': 'immediate_candidate_rejected',
@@ -1020,6 +1067,7 @@ class NiftyBuyStrategy:
 
                     # reset W so we can detect a fresh W later (optional)
                     st["w_span"] = None
+                    st["breakout_time"] = None
                     return
 
         except Exception as e:
@@ -1226,7 +1274,7 @@ if __name__ == "__main__":
 
     # Replace with actual Sensex option symbols as needed
     option_symbols = get_atm_symbols(fyers_client)
-    #option_symbols = ["BSE:SENSEX2591180700CE", "BSE:SENSEX2591181100PE"]
+    #option_symbols = ["BSE:SENSEEX2591180700CE", "BSE:SENSEX2591181100PE"]
 
     engine.prefill_history(option_symbols, days_back=2)
 
