@@ -647,13 +647,19 @@ class StrategyEngine:
         vw1  = self.compute_vwma(closes[:idx1+1], volumes[:idx1+1], 20)
         if ema1 is None or vw1 is None or not (ema1 < vw1):
             return None
+        # ---------- NEW CHECK 1 ----------
+        # Require the first (9:15) green candle to CLOSE BELOW both EMA5 and VWMA20
+        if not (c1["close"] < ema1 and c1["close"] < vw1):
+            logging.info(f"[STRAT3] blocked: c1.close {c1['close']} not below EMA5={ema1:.2f} and VWMA20={vw1:.2f}")
+            return None
+        # ---------------------------------
 
         ema2 = self.compute_ema(closes[:idx2+1], 5)
         vw2  = self.compute_vwma(closes[:idx2+1], volumes[:idx2+1], 20)
         if ema2 is None or vw2 is None:
             return None
 
-        if not (c2["close"] < ema2 and c2["close"] < vw2):
+        if not (c2["close"] < ema2 - 2 and c2["close"] < vw2):
             return None
 
         entry = c2["low"]
