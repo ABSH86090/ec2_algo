@@ -26,7 +26,7 @@ CANDLE_MINUTES = 15
 HISTORY_RESOLUTION = "15"
 
 # === NEW/UPDATED: warmup requirements ===
-MIN_BARS_FOR_VWMA = 20          # need at least 20 bars for VWMA(20)
+MIN_BARS_FOR_EMA = 20          # need at least 20 bars for EMA(20)
 MAX_HISTORY_LOOKBACK_DAYS = 7   # try up to N days back to fetch enough bars
 
 # === Absolute max SL in points ===
@@ -440,14 +440,14 @@ class StrategyEngine:
 
     def prefill_history(self, symbols, days_back=1):
         """
-        UPDATED: keep going farther back day-by-day until we collect at least MIN_BARS_FOR_VWMA candles
+        UPDATED: keep going farther back day-by-day until we collect at least MIN_BARS_FOR_EMA candles
         (during trading hours), or hit MAX_HISTORY_LOOKBACK_DAYS. Log exactly how many per symbol.
         """
         for symbol in symbols:
             total_added = 0
             used_days = 0
             # Try from 'days_back' up to 'MAX_HISTORY_LOOKBACK_DAYS'
-            while total_added < MIN_BARS_FOR_VWMA and used_days < MAX_HISTORY_LOOKBACK_DAYS:
+            while total_added < MIN_BARS_FOR_EMA and used_days < MAX_HISTORY_LOOKBACK_DAYS:
                 try:
                     to_date = datetime.datetime.now().strftime("%Y-%m-%d")
                     from_dt = datetime.datetime.now() - datetime.timedelta(days=days_back + used_days)
@@ -489,7 +489,7 @@ class StrategyEngine:
             if total_added == 0:
                 logging.info(f"[PREFILL] {symbol}: no historical bars appended (total=0)")
             else:
-                logging.info(f"[PREFILL DONE] {symbol}: total prefilled bars={total_added} (min needed={MIN_BARS_FOR_VWMA})")
+                logging.info(f"[PREFILL DONE] {symbol}: total prefilled bars={total_added} (min needed={MIN_BARS_FOR_EMA})")
 
     def compute_ema(self, prices, period):
         if len(prices) < period: return None
@@ -499,6 +499,7 @@ class StrategyEngine:
         return ema
 
     def compute_vwma(self, closes, volumes, period):
+        # kept for backward compatibility if needed later; not used for EMA20 mode
         if len(closes) < period: return None
         denom = sum(volumes[-period:])
         if denom == 0:
@@ -535,23 +536,23 @@ class StrategyEngine:
         start_idx = n - 6
         for i in range(start_idx, n):
             ema5  = self.compute_ema(closes[:i+1], 5)
-            vwma20 = self.compute_vwma(closes[:i+1], volumes[:i+1], 20)
-            if ema5 is None or vwma20 is None:
+            ema20 = self.compute_ema(closes[:i+1], 20)
+            if ema5 is None or ema20 is None:
                 return False
-            if not (ema5 < vwma20):
+            if not (ema5 < ema20):
                 return False
 
         return True
 
-    def detect_new_short_strategy(self, candles, ema5, vwma20):
+    def detect_new_short_strategy(self, candles, ema5, ema20):
         """
-        Strategy 2 (S2): Two greens then a red with EMA/VWMA conditions (bearish bias)
+        Strategy 2 (S2): Two greens then a red with EMA conditions (bearish bias)
         Changes already logged in caller.
         """
         if len(candles) < 3:
             logging.info("[STRAT2] blocked: need at least 3 candles")
             return None
-        if ema5 is None or vwma20 is None:
+        if ema5 is None or ema20 is None:
             logging.info("[STRAT2] blocked: missing indicator values")
             return None
 
@@ -570,37 +571,38 @@ class StrategyEngine:
         idx1, idx2, idx3 = len(closes) - 3, len(closes) - 2, len(closes) - 1
 
         ema_c1 = self.compute_ema(closes[:idx1+1], 5)
-        vw_c1  = self.compute_vwma(closes[:idx1+1], vols[:idx1+1], 20)
+        ema20_c1  = self.compute_ema(closes[:idx1+1], 20)
         ema_c2 = self.compute_ema(closes[:idx2+1], 5)
-        vw_c2  = self.compute_vwma(closes[:idx2+1], vols[:idx2+1], 20)
+        ema20_c2  = self.compute_ema(closes[:idx2+1], 20)
         ema_c3 = self.compute_ema(closes[:idx3+1], 5)
-        vw_c3  = self.compute_vwma(closes[:idx3+1], vols[:idx3+1], 20)
+        ema20_c3  = self.compute_ema(closes[:idx3+1], 20)
 
-        logging.info(f"[STRAT2] c1: ema={ema_c1}, vwma={vw_c1}; "
-                     f"c2: ema={ema_c2}, vwma={vw_c2}; "
-                     f"c3: ema={ema_c3}, vwma={vw_c3}")
+        logging.info(f"[STRAT2] c1: ema5={ema_c1}, ema20={ema20_c1}; "
+                     f"c2: ema5={ema_c2}, ema20={ema20_c2}; "
+                     f"c3: ema5={ema_c3}, ema20={ema20_c3}")
 
-        if None in (ema_c1, vw_c1, ema_c2, vw_c2, ema_c3, vw_c3):
+        if None in (ema_c1, ema20_c1, ema_c2, ema20_c2, ema_c3, ema20_c3):
             logging.info("[STRAT2] blocked: missing indicator values (per-index)")
             return None
 
-        if not (ema_c1 < vw_c1):
-            logging.info(f"[STRAT2] blocked: bearish bias failed on c1 (ema={ema_c1}, vwma={vw_c1})")
+        if not (ema_c1 < ema20_c1):
+            logging.info(f"[STRAT2] blocked: bearish bias failed on c1 (ema5={ema_c1}, ema20={ema20_c1})")
             return None
-        if not (ema_c3 < vw_c3):
-            logging.info(f"[STRAT2] blocked: bearish bias failed on c3 (ema={ema_c3}, vwma={vw_c3})")
+        if not (ema_c3 < ema20_c3):
+            logging.info(f"[STRAT2] blocked: bearish bias failed on c3 (ema5={ema_c3}, ema20={ema20_c3})")
             return None
 
-        if not (vw_c2 > vw_c3):
-            logging.info(f"[STRAT2] blocked: vwma(c2)={vw_c2} <= vwma(c3)={vw_c3}")
+        # formerly compared vw_c2 > vw_c3; replicate similar logic with ema20:
+        if not (ema20_c2 > ema20_c3):
+            logging.info(f"[STRAT2] blocked: ema20(c2)={ema20_c2} <= ema20(c3)={ema20_c3}")
             return None
 
         if not (c3["high"] >= ema_c3):
             logging.info(f"[STRAT2] blocked: c3.high {c3['high']} < ema5(c3) {ema_c3}")
             return None
 
-        if not (c3["close"] < ema_c3 and c3["close"] < vw_c3):
-            logging.info(f"[STRAT2] blocked: c3.close {c3['close']} not below ema5 {ema_c3} and vwma20 {vw_c3}")
+        if not (c3["close"] < ema_c3 and c3["close"] < ema20_c3):
+            logging.info(f"[STRAT2] blocked: c3.close {c3['close']} not below ema5 {ema_c3} and ema20 {ema20_c3}")
             return None
 
         entry = c3["close"]
@@ -644,22 +646,22 @@ class StrategyEngine:
             return None
 
         ema1 = self.compute_ema(closes[:idx1+1], 5)
-        vw1  = self.compute_vwma(closes[:idx1+1], volumes[:idx1+1], 20)
-        if ema1 is None or vw1 is None or not (ema1 < vw1):
+        ema20_1  = self.compute_ema(closes[:idx1+1], 20)
+        if ema1 is None or ema20_1 is None or not (ema1 < ema20_1):
             return None
         # ---------- NEW CHECK 1 ----------
-        # Require the first (9:15) green candle to CLOSE BELOW both EMA5 and VWMA20
-        if not (c1["close"] < ema1 and c1["close"] < vw1):
-            logging.info(f"[STRAT3] blocked: c1.close {c1['close']} not below EMA5={ema1:.2f} and VWMA20={vw1:.2f}")
+        # Require the first (9:15) green candle to CLOSE BELOW both EMA5 and EMA20
+        if not (c1["close"] < ema1 and c1["close"] < ema20_1):
+            logging.info(f"[STRAT3] blocked: c1.close {c1['close']} not below EMA5={ema1:.2f} and EMA20={ema20_1:.2f}")
             return None
         # ---------------------------------
 
         ema2 = self.compute_ema(closes[:idx2+1], 5)
-        vw2  = self.compute_vwma(closes[:idx2+1], volumes[:idx2+1], 20)
-        if ema2 is None or vw2 is None:
+        ema20_2  = self.compute_ema(closes[:idx2+1], 20)
+        if ema2 is None or ema20_2 is None:
             return None
 
-        if not (c2["close"] < ema2 - 2 and c2["close"] < vw2):
+        if not (c2["close"] < ema2 - 2 and c2["close"] < ema20_2):
             return None
 
         entry = c2["low"]
@@ -692,22 +694,22 @@ class StrategyEngine:
         candles = list(self.candles[symbol])
 
         # --- NEW: explicit warmup/skip logs before indicator calc
-        if len(candles) < MIN_BARS_FOR_VWMA:
-            logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; need {MIN_BARS_FOR_VWMA} for VWMA20")
+        if len(candles) < MIN_BARS_FOR_EMA:
+            logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; need {MIN_BARS_FOR_EMA} for EMA20")
             return
 
         closes = [c["close"] for c in candles]
         volumes = [c["volume"] for c in candles]
         ema5 = self.compute_ema(closes, 5)
-        vwma20 = self.compute_vwma(closes, volumes, 20)
+        ema20 = self.compute_ema(closes, 20)
 
-        if ema5 is None or vwma20 is None:
-            logging.info(f"[SKIP] {symbol} {candle['time']}: indicators unavailable (EMA5={ema5}, VWMA20={vwma20})")
+        if ema5 is None or ema20 is None:
+            logging.info(f"[SKIP] {symbol} {candle['time']}: indicators unavailable (EMA5={ema5}, EMA20={ema20})")
             return
 
-        # Enhanced candle-close log with EMA/VWMA
+        # Enhanced candle-close log with EMA20
         logging.info(
-            f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} V={candle['volume']} | EMA5={ema5:.2f} VWMA20={vwma20:.2f}"
+            f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} V={candle['volume']} | EMA5={ema5:.2f} EMA20={ema20:.2f}"
         )
 
         now = datetime.datetime.now().time()
@@ -791,7 +793,7 @@ class StrategyEngine:
         position = self.positions.get(symbol)
         if position is None:
             logging.info(f"[DEBUG] Checking STRAT2 for {symbol} at {candle['time']}")
-            strat2 = self.detect_new_short_strategy(candles, ema5, vwma20)
+            strat2 = self.detect_new_short_strategy(candles, ema5, ema20)
             if strat2:
                 raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, strat2["entry"], "STRAT2ENTRY")
                 raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, strat2["sl"], "STRAT2SL")
@@ -823,29 +825,29 @@ class StrategyEngine:
                     vols_prefix_curr = volumes[:idx_curr+1]
 
                     ema_prev = self.compute_ema(closes_prefix_prev, 5)
-                    vw_prev = self.compute_vwma(closes_prefix_prev, vols_prefix_prev, 20)
+                    ema20_prev = self.compute_ema(closes_prefix_prev, 20)
                     ema_curr = self.compute_ema(closes_prefix_curr, 5)
-                    vw_curr = self.compute_vwma(closes_prefix_curr, vols_prefix_curr, 20)
+                    ema20_curr = self.compute_ema(closes_prefix_curr, 20)
 
                     c_prev = candles[idx_prev]
                     c_curr = candles[idx_curr]
                     is_red = lambda c: c["close"] < c["open"]
 
-                    if None not in (ema_prev, vw_prev, ema_curr, vw_curr):
+                    if None not in (ema_prev, ema20_prev, ema_curr, ema20_curr):
                         pending = self.s4_pending.get(symbol)
 
-                        if (ema_prev > vw_prev) and is_red(c_curr) and (ema_curr < vw_curr):
+                        if (ema_prev > ema20_prev) and is_red(c_curr) and (ema_curr < ema20_curr):
                             if not pending:
                                 self.s4_pending[symbol] = {"first_idx": idx_curr, "first_time": c_curr["time"]}
                                 logging.info(f"[STRAT4] Pending set for {symbol} at idx={idx_curr} time={c_curr['time']}")
                         elif pending:
-                            if ema_curr >= vw_curr:
-                                logging.info(f"[STRAT4] Pending cleared for {symbol} because ema >= vwma now (ema={ema_curr:.2f}, vwma={vw_curr:.2f})")
+                            if ema_curr >= ema20_curr:
+                                logging.info(f"[STRAT4] Pending cleared for {symbol} because ema >= ema20 now (ema={ema_curr:.2f}, ema20={ema20_curr:.2f})")
                                 self.s4_pending.pop(symbol, None)
                             else:
                                 GAP = 0.02
                                 GAP_MIN_STRAT_4 = 0.01
-                                if is_red(c_curr) and (ema_curr <= vw_curr) and (ema_curr >= vw_curr * (1 - GAP)) and (ema_curr <= vw_curr * (1 - GAP_MIN_STRAT_4)):
+                                if is_red(c_curr) and (ema_curr <= ema20_curr) and (ema_curr >= ema20_curr * (1 - GAP)) and (ema_curr <= ema20_curr * (1 - GAP_MIN_STRAT_4)):
                                     entry = c_curr["close"]
                                     sl = c_curr["high"] + 5
                                     if not self._sl_within_max_points(entry, sl):
@@ -872,7 +874,7 @@ class StrategyEngine:
 
         # -------- EXIT conditions (common) --------
         position = self.positions.get(symbol)
-        if position and (candle["close"] > candle["open"]) and (candle["close"] > vwma20):
+        if position and (candle["close"] > candle["open"]) and (candle["close"] > ema20):
             sl_order_info = position.get("sl_order") or {}
             sl_order_id = sl_order_info.get("id")
             exit_price = candle["close"]
@@ -963,7 +965,7 @@ if __name__ == "__main__":
         logging.exception(f"Failed to build ATM symbols: {e}")
         raise
 
-    # UPDATED: dynamic prefill to ensure ≥ MIN_BARS_FOR_VWMA bars if possible
+    # UPDATED: dynamic prefill to ensure ≥ MIN_BARS_FOR_EMA bars if possible
     engine.prefill_history(option_symbols, days_back=1)
 
     fyers_client.register_trade_callback(engine.on_trade)
