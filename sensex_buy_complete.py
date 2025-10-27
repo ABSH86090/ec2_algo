@@ -977,7 +977,7 @@ class NiftyBuyStrategy:
                         return
 
                     # PATCH: target = 2 * SL distance
-                    target_price = round_to_tick(entry + 2.0 * risk_points)
+                    target_price = round_to_tick(entry + 1.0 * risk_points)
 
                     # Place market buy then SL-M
                     selected_symbol = symbol
@@ -1282,3 +1282,4 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
+
