@@ -15,7 +15,7 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")  # Format: APPID-XXXXX:token
-LOT_SIZE = 40
+LOT_SIZE = 20
 MAX_SLS_PER_DAY = 3
 TRADING_START = datetime.time(9, 15)
 TRADING_END = datetime.time(15, 0)
