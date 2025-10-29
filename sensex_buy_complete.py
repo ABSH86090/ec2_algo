@@ -16,7 +16,7 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
-LOT_SIZE = int(os.getenv("LOT_SIZE", "40"))  # tweak via env or edit constant
+LOT_SIZE = int(os.getenv("LOT_SIZE", "20"))  # tweak via env or edit constant
 TICK_SIZE = 0.05  # NSE options tick size
 
 TRADING_START = datetime.time(9,15)
@@ -50,6 +50,9 @@ CANCEL_SETTLE_SEC = float(os.getenv("CANCEL_SETTLE_SEC", "0.06"))
 
 # PATCH: risk cap for SL distance (points)
 MAX_SL_POINTS = float(os.getenv("MAX_SL_POINTS", "60.0"))
+
+# minimum minutes between two consecutive trades (global cooldown)
+TRADE_MIN_GAP_MIN = float(os.getenv("TRADE_MIN_GAP_MIN", "15.0"))
 
 # Reset logging handlers
 for handler in logging.root.handlers[:]:
@@ -442,6 +445,8 @@ class NiftyBuyStrategy:
             "last_trade_idx": -1,
             "breakout_time": None  # patched: record first breakout candle datetime
         })
+        # global last trade time (datetime) to enforce cooldown between trades
+        self.last_trade_time = None
 
     # --- history prefill ---
     def prefill_history(self, symbols, days_back=1):
@@ -958,6 +963,29 @@ class NiftyBuyStrategy:
                     # ENTRY: at close of this green candle
                     entry = round_to_tick(candle["close"])
 
+                    # Enforce global cooldown between trades
+                    try:
+                        if self.last_trade_time is not None:
+                            minutes_since_last = (candle["time"] - self.last_trade_time).total_seconds() / 60.0
+                        else:
+                            minutes_since_last = float("inf")
+
+                        if minutes_since_last < TRADE_MIN_GAP_MIN:
+                            logger.info(json.dumps({
+                                'event': 'entry_skipped_due_to_trade_cooldown',
+                                'symbol': symbol,
+                                'candidate_time': str(candle['time']),
+                                'minutes_since_last_trade': minutes_since_last,
+                                'required_gap_min': TRADE_MIN_GAP_MIN
+                            }))
+                            # Optionally clear W so you don't immediately re-attempt same W on next candle:
+                            st["w_span"] = None
+                            st["breakout_time"] = None
+                            return
+                    except Exception as e:
+                        logger.debug(f"trade cooldown check failed: {e}")
+                        # fail-safe: if we cannot compute cooldown, allow entry
+
                     # PATCH: SL = breakout candle's low - 5 points
                     sl_price = round_to_tick(candle["low"] - 5.0)
                     risk_points = round(entry - sl_price, 2)
@@ -1020,6 +1048,13 @@ class NiftyBuyStrategy:
                         "max_ltp": None,
                         "last_ltp": None
                     }
+
+                    # set last_trade_time only after we have placed the buy (start cooldown)
+                    try:
+                        self.last_trade_time = candle["time"]
+                    except Exception:
+                        # defensive: if time setting fails, ignore
+                        pass
 
                     logger.info(json.dumps({
                         'event': 'entry_assumed_immediate',
@@ -1282,4 +1317,3 @@ if __name__ == "__main__":
     # pass the tick callback so we can exit immediately when target touched intra-candle
     fyers_client.subscribe_market_data(option_symbols, engine.on_candle, on_tick_callback=engine.on_tick)
     fyers_client.start_order_socket()
-
