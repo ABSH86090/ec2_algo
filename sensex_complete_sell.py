@@ -34,7 +34,7 @@ EMA_OVER_EMA20_MAX_GAP = 0.06
 
 # ADX filter
 ADX_PERIOD = 14
-ADX_MIN = 15  # only take trade if ADX > 15
+ADX_MIN = 10  # only take trade if ADX > 10
 
 # Exit throttle (milliseconds) to avoid spamming cancel/market orders on rapid ticks
 EXIT_THROTTLE_MS = int(os.getenv("EXIT_THROTTLE_MS", "500"))
