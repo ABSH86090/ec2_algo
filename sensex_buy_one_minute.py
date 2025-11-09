@@ -152,8 +152,8 @@ def get_atm_symbols(fyers_client):
 
     expiry = get_next_expiry()
     expiry_str = format_expiry_for_symbol(expiry)
-    ce_strike = atm_strike - 200
-    pe_strike = atm_strike + 200
+    ce_strike = atm_strike
+    pe_strike = atm_strike
     ce_symbol = f"BSE:SENSEX{expiry_str}{ce_strike}CE"
     pe_symbol = f"BSE:SENSEX{expiry_str}{pe_strike}PE"
 
