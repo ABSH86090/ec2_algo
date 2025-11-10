@@ -638,12 +638,14 @@ class NiftyBuyStrategy:
             cond_gap_5 = (vwma20 <= 0.95 * ema5)  # Scenario 1 gap: VWMA20 <= EMA5 * 0.95
             cond_gap_1 = (vwma20 <= 0.99 * ema5)  # Scenario 2 gap: VWMA20 <= EMA5 * 0.99
 
+            trend_ok = (ema5 > vwma20)
+
             # Scenario 2 (priority): green & strong, low <= VWMA, close > VWMA, and EMA5 > VWMA at close
-            scenario2 = (cond_gap_1 and is_green and is_strong and
+            scenario2 = (trend_ok and cond_gap_1 and is_green and is_strong and
                          (candle["low"] <= vwma20) and (candle["close"] > vwma20) and (ema5 > vwma20))
 
             # Scenario 1 (fallback): green & strong, low < EMA5 but closes above EMA5
-            scenario1 = (cond_gap_5 and is_green and is_strong and
+            scenario1 = (trend_ok and cond_gap_5 and is_green and is_strong and
                          (candle["low"] < ema5) and (candle["close"] > ema5))
 
             should_enter = False
