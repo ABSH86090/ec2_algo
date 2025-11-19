@@ -817,7 +817,7 @@ class NiftyBuyStrategy:
             logger.error(f"_select_strike_200_from_atm failed for {symbol}: {e}")
             raise
 
-    # --- main candle handler (UPDATED LOGIC) ---
+    # --- main candle handler (UPDATED LOGIC with VWMA<=3% below EMA check) ---
     def on_candle(self, symbol, candle):
         try:
             self.candles[symbol].append(candle)
@@ -981,16 +981,19 @@ class NiftyBuyStrategy:
                 return
 
             # --- Step C: after base + red, wait for entry green candle with low <= VWMA20 ---
+            # Additional VWMA vs EMA constraint: VWMA must be within 3% below EMA5 (i.e., vwma20 >= ema5 * 0.97)
             # Conditions:
             #  - green candle
             #  - close > EMA5 and > VWMA20
             #  - EMA5 > VWMA20
             #  - low <= VWMA20
+            #  - vwma20 >= ema5 * 0.97  (NEW)
             if (self.is_green(candle) and
                     candle["close"] > ema5 and
                     candle["close"] > vwma20 and
                     ema5 > vwma20 and
-                    candle["low"] <= vwma20):
+                    candle["low"] <= vwma20 and
+                    (vwma20 >= (ema5 * 0.97))):
 
                 # Enforce global cooldown between trades
                 try:
@@ -1125,6 +1128,34 @@ class NiftyBuyStrategy:
                 st["breakout_time"] = None
                 st["trigger_base_idx"] = None
                 st["seen_red_after_trigger"] = False
+                return
+            else:
+                # If we reached here, we may have failed the new VWMA-vs-EMA check (or other conditions).
+                # Log the reason for auditability.
+                reasons = []
+                if not self.is_green(candle):
+                    reasons.append("not_green")
+                if not (candle["close"] > ema5):
+                    reasons.append("close_not_above_ema")
+                if not (candle["close"] > vwma20):
+                    reasons.append("close_not_above_vwma")
+                if not (ema5 > vwma20):
+                    reasons.append("ema_not_above_vwma")
+                if not (candle["low"] <= vwma20):
+                    reasons.append("low_above_vwma")
+                if not (vwma20 >= (ema5 * 0.97)):
+                    reasons.append("vwma_more_than_3pct_below_ema")
+
+                logger.debug(json.dumps({
+                    'event': 'entry_candidate_rejected_new_check',
+                    'symbol': symbol,
+                    'idx': idx,
+                    'reasons': reasons,
+                    'EMA5': _safe(ema5),
+                    'VWMA20': _safe(vwma20)
+                }))
+
+                # keep the W+trigger state intact so a later candle can still qualify
                 return
 
         except Exception as e:
