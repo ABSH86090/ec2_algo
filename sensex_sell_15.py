@@ -29,7 +29,7 @@ MIN_BARS_FOR_EMA = 20
 MAX_HISTORY_LOOKBACK_DAYS = 7
 
 # ------------- NEW: max SL points -------------
-MAX_SL_POINTS = 75
+MAX_SL_POINTS = 150
 # ----------------------------------------------
 
 # Ensure journal file exists with headers
@@ -603,7 +603,7 @@ class StrategyEngine:
 
             # Move SL to entry after 70%/80% of target achieved depending on strategy
             # For shorts, favorable move = price lowered by fraction of target_points
-            fraction = 0.7 if position.get("strategy") == "strat1" else 0.8
+            fraction = 0.7 if position.get("strategy") == "strat1" else 0.7
             trigger_price = entry - tp_pts * fraction
             # if low of the candle <= trigger_price then move SL to entry
             if candle["low"] <= trigger_price and position.get("sl_price") != entry:
