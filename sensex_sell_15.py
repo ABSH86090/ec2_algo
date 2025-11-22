@@ -16,7 +16,7 @@ load_dotenv()
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")  # Format: APPID-XXXXX:token
 LOT_SIZE = 20
-TRADING_START = datetime.time(9, 15)
+TRADING_START = datetime.time(9, 25)
 TRADING_END = datetime.time(14, 59)  # 3:00 PM
 JOURNAL_FILE = "sensex_trades.csv"
 
