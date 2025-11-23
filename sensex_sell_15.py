@@ -505,8 +505,8 @@ class StrategyEngine:
                     sl = candle["high"]  # SL exactly at high of the red candle (user requirement)
                     target_points = abs(sl - entry)
                     
-                    # ------------- NEW: skip if SL too large -------------
-                    if target_points > MAX_SL_POINTS:
+                    # ------------- NEW: skip if SL too large or too small -------------
+                    if target_points > MAX_SL_POINTS or target_points < 30:
                         logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat1: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
                         # Log skip to journal for traceability
                         log_to_journal(symbol, "SKIP", "strat1", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
@@ -551,8 +551,8 @@ class StrategyEngine:
                     sl = candle["high"] + 5  # user requirement
                     target_points = abs(sl - entry)
 
-                    # ------------- NEW: skip if SL too large -------------
-                    if target_points > MAX_SL_POINTS:
+                    # ------------- NEW: skip if SL too large or too small -------------
+                    if target_points > MAX_SL_POINTS or target_points < 30:
                         logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
                         log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
                         # do not place orders or set position
