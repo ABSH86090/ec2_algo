@@ -76,6 +76,30 @@ def compute_pnl_for_short(entry_price, exit_price, lot_size):
     except Exception:
         return None
 
+
+# Helper to extract order id from various fyers responses (robust)
+def _extract_order_id(resp):
+    try:
+        if not resp:
+            return None
+        # common shapes: {'id': '...'}, {'data': {'id': '...'}}, {'order_id': '...'}, or nested
+        if isinstance(resp, dict):
+            # direct keys
+            for key in ("id", "order_id", "orderId", "orderID", "data"):
+                if key in resp and resp[key]:
+                    val = resp[key]
+                    if isinstance(val, dict):
+                        # try a few common nested keys
+                        for subk in ("id", "order_id", "orderId"):
+                            if subk in val and val[subk]:
+                                return str(val[subk])
+                    else:
+                        return str(val)
+            # sometimes response contains a 'message' with id — ignore
+        return None
+    except Exception:
+        return None
+
 # journaling (unchanged)
 def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None, remarks="", trade_id=None, lot_size=LOT_SIZE):
     if not os.path.exists(JOURNAL_FILE):
@@ -609,7 +633,7 @@ class StrategyEngine:
                     log_to_journal(symbol, "EXIT", position["strategy"], entry=entry, sl=sl, exit=exit_price, remarks=f"Green candle close above EMA -> exit; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
                     if pnl and pnl > 0:
                         self.profitable_today[symbol] = True
-                    self.positions[symbol] = None
+                    self.positions.pop(symbol, None)
                     logging.info(f"[STRAT1-GREEN-EXIT] {symbol} exited at {exit_price} pnl={pnl} cancel_resp={cancel_resp}")
                 except Exception as e:
                     logging.exception(f"Failed to execute strat1 green-exit for {symbol}: {e}")
@@ -625,7 +649,7 @@ class StrategyEngine:
                 # mark profitable if pnl>0
                 if pnl and pnl > 0:
                     self.profitable_today[symbol] = True
-                self.positions[symbol] = None
+                self.positions.pop(symbol, None)
                 logging.info(f"[EXIT-TARGET] {symbol} exited at {exit_price} pnl={pnl}")
                 return
 
@@ -658,7 +682,7 @@ class StrategyEngine:
                 log_to_journal(symbol, "EXIT", position["strategy"], entry=entry, sl=sl, exit=exit_price, remarks=f"EOD exit; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
                 if pnl and pnl > 0:
                     self.profitable_today[symbol] = True
-                self.positions[symbol] = None
+                self.positions.pop(symbol, None)
                 logging.info(f"[EXIT-EOD] {symbol} exited at {exit_price} pnl={pnl} cancel_resp={cancel_resp}")
 
     def on_trade(self, msg):
@@ -699,7 +723,7 @@ class StrategyEngine:
                 pnl = compute_pnl_for_short(entry_price, exit_price, self.lot_size) if exit_price is not None else None
                 if pnl and pnl > 0:
                     self.profitable_today[symbol] = True
-                self.positions[symbol] = None
+                self.positions.pop(symbol, None)
         except Exception as e:
             logging.exception(f"Error in on_trade processing: {e}")
 
