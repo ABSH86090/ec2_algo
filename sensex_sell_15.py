@@ -17,7 +17,7 @@ CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")  # Format: APPID-XXXXX:token
 LOT_SIZE = 20
 TRADING_START = datetime.time(9, 25)
-TRADING_END = datetime.time(14, 59)  # 3:00 PM
+TRADING_END = datetime.time(14, 45)  # 3:00 PM
 JOURNAL_FILE = "sensex_trades.csv"
 
 # Candle settings
@@ -29,7 +29,7 @@ MIN_BARS_FOR_EMA = 20
 MAX_HISTORY_LOOKBACK_DAYS = 7
 
 # ------------- NEW: max SL points -------------
-MAX_SL_POINTS = 150
+MAX_SL_POINTS = 100
 # ----------------------------------------------
 
 # Ensure journal file exists with headers
@@ -526,9 +526,9 @@ class StrategyEngine:
             mark_date, _ = self.s1_marked_green[symbol]
             if mark_date == candle["time"].date():
                 if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
-                                        entry = candle["close"]
+                    entry = candle["close"]
                     sl = candle["high"]  # SL exactly at high of the red candle (user requirement)
-                                        target_points = abs(sl - entry)
+                    target_points = abs(sl - entry)
                     
                     # ------------- NEW: skip if SL too large or too small -------------
                     if target_points > 125 or target_points < 30:
@@ -574,13 +574,13 @@ class StrategyEngine:
             mark_date, _ = self.s1_marked_green[key]
             if mark_date == candle["time"].date():
                 # Entry requires: red candle close below both EMA5 & EMA20, EMA5 < EMA20, AND the red candle's HIGH must be > EMA5
-                    if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["high"] > ema5:
-                    entry = candle["close"]
-                                        sl = candle["high"] + 5  # user requirement
-                    target_points = abs(sl - entry)
+                    if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["open"] > ema5:
+                        entry = candle["close"]
+                        sl = candle["high"] + 5  # user requirement
+                        target_points = abs(sl - entry)
 
                     # ------------- NEW: skip if SL too large or too small -------------
-                    if target_points > 50 or target_points < 30:
+                    if target_points > 50 or target_points < 20:
                         logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
                         log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
                         # do not place orders or set position
