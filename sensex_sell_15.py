@@ -574,37 +574,37 @@ class StrategyEngine:
             mark_date, _ = self.s1_marked_green[key]
             if mark_date == candle["time"].date():
                 # Entry requires: red candle close below both EMA5 & EMA20, EMA5 < EMA20, AND the red candle's HIGH must be > EMA5
-                    if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["open"] > ema5:
-                        entry = candle["close"]
-                        sl = candle["high"] + 5  # user requirement
-                        target_points = abs(sl - entry)
-                        # ------------- NEW: skip if SL too large or too small -------------
-                        if target_points > 50 or target_points < 20:
-                            logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
-                            log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
-                            # do not place orders or set position
-                        else:
-                            target_price = entry - target_points
-    
-                            raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "S2ENTRY")
-                            raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "S2SL")
-                            sl_order_id = _extract_order_id(raw_sl)
-                            entry_order_id = _extract_order_id(raw_entry)
-                            trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
-                            self.positions[symbol] = {
-                                "symbol": symbol,
-                                "strategy": "strat2",
-                                "entry_price": entry,
-                                "sl_price": sl,
-                                "target_price": target_price,
-                                "target_points": target_points,
-                                "sl_order": {"id": sl_order_id, "resp": raw_sl},
-                                "entry_order": {"id": entry_order_id, "resp": raw_entry},
-                                "trade_id": trade_id
-                            }
-                            logging.info(f"[STRAT2] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
-                            # mark that we've taken the one allowed trade for this strike today
-                            self.taken_today[symbol] = True
+                if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["open"] > ema5:
+                    entry = candle["close"]
+                    sl = candle["high"] + 5  # user requirement
+                    target_points = abs(sl - entry)
+                    # ------------- NEW: skip if SL too large or too small -------------
+                    if target_points > 50 or target_points < 20:
+                        logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
+                        log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
+                        # do not place orders or set position
+                    else:
+                        target_price = entry - target_points
+
+                        raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "S2ENTRY")
+                        raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "S2SL")
+                        sl_order_id = _extract_order_id(raw_sl)
+                        entry_order_id = _extract_order_id(raw_entry)
+                        trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
+                        self.positions[symbol] = {
+                            "symbol": symbol,
+                            "strategy": "strat2",
+                            "entry_price": entry,
+                            "sl_price": sl,
+                            "target_price": target_price,
+                            "target_points": target_points,
+                            "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                            "entry_order": {"id": entry_order_id, "resp": raw_entry},
+                            "trade_id": trade_id
+                        }
+                        logging.info(f"[STRAT2] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
+                        # mark that we've taken the one allowed trade for this strike today
+                        self.taken_today[symbol] = True
 
         # ------------------ Manage open position: target, move SL, green-exit (new), and time-based exit ------------------
         position = self.positions.get(symbol)
