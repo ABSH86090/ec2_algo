@@ -502,9 +502,9 @@ class StrategyEngine:
             mark_date, _ = self.s1_marked_green[symbol]
             if mark_date == candle["time"].date():
                 if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
-                    entry = candle["close"]
+                                        entry = candle["close"]
                     sl = candle["high"]  # SL exactly at high of the red candle (user requirement)
-                    target_points = abs(sl - entry)
+                                        target_points = abs(sl - entry)
                     
                     # ------------- NEW: skip if SL too large or too small -------------
                     if target_points > 125 or target_points < 30:
@@ -549,9 +549,10 @@ class StrategyEngine:
         if position is None and key in self.s1_marked_green and not self.taken_today.get(symbol):
             mark_date, _ = self.s1_marked_green[key]
             if mark_date == candle["time"].date():
-                if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20:
+                # Entry requires: red candle close below both EMA5 & EMA20, EMA5 < EMA20, AND the red candle's HIGH must be > EMA5
+                    if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["high"] > ema5:
                     entry = candle["close"]
-                    sl = candle["high"] + 5  # user requirement
+                                        sl = candle["high"] + 5  # user requirement
                     target_points = abs(sl - entry)
 
                     # ------------- NEW: skip if SL too large or too small -------------
