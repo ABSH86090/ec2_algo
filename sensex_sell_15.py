@@ -386,6 +386,7 @@ class StrategyEngine:
         self.positions = {}  # symbol -> position dict
         self.candles = defaultdict(lambda: deque(maxlen=500))
         self.profitable_today = {}  # symbol -> bool (True if any trade produced profit for that symbol today)
+        self.taken_today = {}  # symbol -> bool (True if any trade was taken for that strike today; enforces 1 trade per strike)
         self.s1_marked_green = {}  # symbol -> (date, price) for first green closure above EMAs (or last such green)
 
     def prefill_history(self, symbols, days_back=1):
@@ -497,7 +498,7 @@ class StrategyEngine:
             logging.info(f"[S1 MARK] {symbol} marked green close above EMAs at {candle['close']} on {candle['time'].date()}")
 
         # Strategy 1 entry: wait for red candle which closes below both EMA5 and EMA20
-        if position is None and symbol in self.s1_marked_green:
+        if position is None and symbol in self.s1_marked_green and not self.taken_today.get(symbol):
             mark_date, _ = self.s1_marked_green[symbol]
             if mark_date == candle["time"].date():
                 if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
@@ -506,7 +507,7 @@ class StrategyEngine:
                     target_points = abs(sl - entry)
                     
                     # ------------- NEW: skip if SL too large or too small -------------
-                    if target_points > MAX_SL_POINTS or target_points < 30:
+                    if target_points > 125 or target_points < 30:
                         logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat1: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
                         # Log skip to journal for traceability
                         log_to_journal(symbol, "SKIP", "strat1", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
@@ -532,6 +533,8 @@ class StrategyEngine:
                             "trade_id": trade_id
                         }
                         logging.info(f"[STRAT1] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
+                        # mark that we've taken the one allowed trade for this strike today
+                        self.taken_today[symbol] = True
 
         # ------------------ Strategy 2 ------------------
         # Updated: require ema5 < ema20 when the green candle is formed AND when the red (entry) candle forms.
@@ -543,7 +546,7 @@ class StrategyEngine:
 
         # Strategy 2 entry: wait for red candle which closes below both ema5 and ema20 AND ema5 < ema20 on the entry candle
         key = (symbol, "s2")
-        if position is None and key in self.s1_marked_green:
+        if position is None and key in self.s1_marked_green and not self.taken_today.get(symbol):
             mark_date, _ = self.s1_marked_green[key]
             if mark_date == candle["time"].date():
                 if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20:
@@ -552,7 +555,7 @@ class StrategyEngine:
                     target_points = abs(sl - entry)
 
                     # ------------- NEW: skip if SL too large or too small -------------
-                    if target_points > MAX_SL_POINTS or target_points < 30:
+                    if target_points > 50 or target_points < 30:
                         logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
                         log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
                         # do not place orders or set position
@@ -576,6 +579,8 @@ class StrategyEngine:
                             "trade_id": trade_id
                         }
                         logging.info(f"[STRAT2] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
+                        # mark that we've taken the one allowed trade for this strike today
+                        self.taken_today[symbol] = True
 
         # ------------------ Manage open position: target, move SL, green-exit (new), and time-based exit ------------------
         position = self.positions.get(symbol)
