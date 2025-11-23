@@ -378,7 +378,7 @@ class FyersClient:
     def register_order_callback(self, cb): self.order_callbacks.append(cb)
     def register_trade_callback(self, cb): self.trade_callbacks.append(cb)
 
-# ---------------- STRATEGY ENGINE (updated: only Strategy 1 & 2 implemented) ----------------
+# ---------------- STRATEGY ENGINE (updated: strat2 EMA condition + strat1 green-exit) ----------------
 class StrategyEngine:
     def __init__(self, fyers_client: FyersClient, lot_size: int = 20):
         self.fyers = fyers_client
@@ -534,21 +534,19 @@ class StrategyEngine:
                         logging.info(f"[STRAT1] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
 
         # ------------------ Strategy 2 ------------------
-        # If a green candle formed that closes below EMA20 -> mark for strat2
-        # (User: "If a green candle is formed such that it closes below ema20, then wait for a red candle which closes below both ema5 and ema20")
-        # We'll reuse s1_marked_green structure but tag differently
-        if is_green(candle) and candle["close"] < ema20:
-            # mark for strat2
+        # Updated: require ema5 < ema20 when the green candle is formed AND when the red (entry) candle forms.
+        if is_green(candle) and candle["close"] < ema20 and ema5 < ema20:
+            # mark for strat2 only if EMA5 < EMA20 at time of the green candle
             key = (symbol, "s2")
             self.s1_marked_green[key] = (candle["time"].date(), candle["close"])  # reusing store; different key
-            logging.info(f"[S2 MARK] {symbol} marked green-close-below-EMA20 at {candle['close']} on {candle['time'].date()}")
+            logging.info(f"[S2 MARK] {symbol} marked green-close-below-EMA20 with EMA5<EMA20 at {candle['close']} on {candle['time'].date()}")
 
-        # Strategy 2 entry: wait for red candle which closes below both ema5 and ema20
+        # Strategy 2 entry: wait for red candle which closes below both ema5 and ema20 AND ema5 < ema20 on the entry candle
         key = (symbol, "s2")
         if position is None and key in self.s1_marked_green:
             mark_date, _ = self.s1_marked_green[key]
             if mark_date == candle["time"].date():
-                if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
+                if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20:
                     entry = candle["close"]
                     sl = candle["high"] + 5  # user requirement
                     target_points = abs(sl - entry)
@@ -579,13 +577,37 @@ class StrategyEngine:
                         }
                         logging.info(f"[STRAT2] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
 
-        # ------------------ Manage open position: target, move SL, and time-based exit ------------------
+        # ------------------ Manage open position: target, move SL, green-exit (new), and time-based exit ------------------
         position = self.positions.get(symbol)
         if position:
             entry = position.get("entry_price")
             sl = position.get("sl_price")
             target_price = position.get("target_price")
             tp_pts = position.get("target_points")
+
+            # NEW: Strategy1 special exit rule — if strat1 and any green candle closes above either EMA5 or EMA20 -> exit immediately and cancel pending SL
+            if position.get("strategy") == "strat1" and is_green(candle) and (candle["close"] > ema5 or candle["close"] > ema20):
+                try:
+                    # cancel existing SL order if present
+                    sl_info = position.get("sl_order") or {}
+                    sl_order_id = sl_info.get("id")
+                    cancel_resp = None
+                    if sl_order_id:
+                        cancel_resp = self.fyers.cancel_order(sl_order_id)
+                        logging.info(f"[STRAT1-GREEN-EXIT] Cancelled SL order {sl_order_id}: {cancel_resp}")
+
+                    # exit at market using candle close
+                    market_resp = self.fyers.place_market_buy(symbol, self.lot_size, "STRAT1_GREEN_EXIT")
+                    exit_price = candle["close"]
+                    pnl = compute_pnl_for_short(entry, exit_price, self.lot_size)
+                    log_to_journal(symbol, "EXIT", position["strategy"], entry=entry, sl=sl, exit=exit_price, remarks=f"Green candle close above EMA -> exit; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
+                    if pnl and pnl > 0:
+                        self.profitable_today[symbol] = True
+                    self.positions[symbol] = None
+                    logging.info(f"[STRAT1-GREEN-EXIT] {symbol} exited at {exit_price} pnl={pnl} cancel_resp={cancel_resp}")
+                except Exception as e:
+                    logging.exception(f"Failed to execute strat1 green-exit for {symbol}: {e}")
+                return
 
             # Check if target achieved in this bar (for shorts: price <= target)
             if candle["low"] <= target_price:
