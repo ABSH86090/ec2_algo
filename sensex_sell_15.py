@@ -82,20 +82,16 @@ def _extract_order_id(resp):
     try:
         if not resp:
             return None
-        # common shapes: {'id': '...'}, {'data': {'id': '...'}}, {'order_id': '...'}, or nested
         if isinstance(resp, dict):
-            # direct keys
             for key in ("id", "order_id", "orderId", "orderID", "data"):
                 if key in resp and resp[key]:
                     val = resp[key]
                     if isinstance(val, dict):
-                        # try a few common nested keys
                         for subk in ("id", "order_id", "orderId"):
                             if subk in val and val[subk]:
                                 return str(val[subk])
                     else:
                         return str(val)
-            # sometimes response contains a 'message' with id — ignore
         return None
     except Exception:
         return None
@@ -195,11 +191,13 @@ SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2025, 12, 25),
 }
 
+
 def is_last_thursday(date_obj: datetime.date) -> bool:
     if date_obj.weekday() != 3:
         return False
     next_week = date_obj + datetime.timedelta(days=7)
     return next_week.month != date_obj.month
+
 
 def get_next_expiry():
     today = datetime.date.today()
@@ -214,6 +212,7 @@ def get_next_expiry():
     else:
         expiry = candidate_thu
     return expiry
+
 
 def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
     yy = expiry_date.strftime("%y")
@@ -242,6 +241,7 @@ def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
         m_token = f"{m:02d}"
     return f"{yy}{m_token}{d:02d}"
 
+
 def get_atm_symbols(fyers_client):
     data = {"symbols": "BSE:SENSEX-INDEX"}
     resp = fyers_client.client.quotes(data)
@@ -261,7 +261,7 @@ def get_atm_symbols(fyers_client):
     logging.info(f"[ATM SYMBOLS] CE={ce_symbol}, PE={pe_symbol}")
     return [ce_symbol, pe_symbol]
 
-# ---------------- FYERS CLIENT (kept same) ----------------
+# ---------------- FYERS CLIENT (kept same with small changes to callback) ----------------
 class FyersClient:
     def __init__(self, client_id: str, access_token: str, lot_size: int = 20):
         self.client_id = client_id
@@ -367,9 +367,15 @@ class FyersClient:
 
             c = candle_buffers[symbol]
             if c is None or c["time"] != candle_open_time:
+                # previous candle closed: notify callback with closed=True
                 if c is not None:
                     logging.info(f"[BAR CLOSE] {symbol} {c['time']} O={c['open']} H={c['high']} L={c['low']} C={c['close']} V={c['volume']}")
-                    on_candle_callback(symbol, c)
+                    try:
+                        on_candle_callback(symbol, c, closed=True)
+                    except TypeError:
+                        # backwards compatibility if callback expects 2 args
+                        on_candle_callback(symbol, c)
+                # start new candle
                 candle_buffers[symbol] = {
                     "time": candle_open_time,
                     "open": ltp,
@@ -379,11 +385,22 @@ class FyersClient:
                     "volume": 0,
                     "start_cum_vol": cum_vol
                 }
+                # also notify strategy about current live candle (closed=False)
+                try:
+                    on_candle_callback(symbol, candle_buffers[symbol], closed=False)
+                except TypeError:
+                    on_candle_callback(symbol, candle_buffers[symbol])
             else:
+                # update current candle intrabar
                 c["high"] = max(c["high"], ltp)
                 c["low"] = min(c["low"], ltp)
                 c["close"] = ltp
                 c["volume"] = max(0, cum_vol - c["start_cum_vol"])
+                # notify strategy on every tick for intrabar checks
+                try:
+                    on_candle_callback(symbol, c, closed=False)
+                except TypeError:
+                    on_candle_callback(symbol, c)
 
         def on_open():
             fyers.subscribe(symbols=instrument_ids, data_type="SymbolUpdate")
@@ -402,7 +419,7 @@ class FyersClient:
     def register_order_callback(self, cb): self.order_callbacks.append(cb)
     def register_trade_callback(self, cb): self.trade_callbacks.append(cb)
 
-# ---------------- STRATEGY ENGINE (updated: strat2 EMA condition + strat1 green-exit) ----------------
+# ---------------- STRATEGY ENGINE (updated: handle intrabar + closed bars) ----------------
 class StrategyEngine:
     def __init__(self, fyers_client: FyersClient, lot_size: int = 20):
         self.fyers = fyers_client
@@ -481,24 +498,32 @@ class StrategyEngine:
         position["sl_price"] = new_sl_price
         return new_sl_resp
 
-    def on_candle(self, symbol, candle):
-        self.candles[symbol].append(candle)
+    def on_candle(self, symbol, candle, closed=False):
+        """
+        If closed == True -> this is a closed bar (run entry logic, EMA logs).
+        If closed == False -> intrabar tick update (run target / trail-SL / immediate-exit checks).
+        """
+
+        # Append closed bars to history; intrabar updates are not appended
+        if closed:
+            self.candles[symbol].append(candle)
+
         candles = list(self.candles[symbol])
 
+        # If not enough closed bars for EMA, allow intrabar checks for existing positions only
         if len(candles) < MIN_BARS_FOR_EMA:
-            logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; need {MIN_BARS_FOR_EMA} for EMA20")
-            return
+            if not closed and self.positions.get(symbol):
+                # allow intrabar position management below
+                pass
+            else:
+                if closed:
+                    logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; need {MIN_BARS_FOR_EMA} for EMA20")
+                return
 
+        # Compute EMA using closed bars (do not include partial intrabar bar)
         closes = [c["close"] for c in candles]
-        volumes = [c["volume"] for c in candles]
-        ema5 = self.compute_ema(closes, 5)
-        ema20 = self.compute_ema(closes, 20)
-
-        if ema5 is None or ema20 is None:
-            logging.info(f"[SKIP] {symbol} {candle['time']}: indicators unavailable (EMA5={ema5}, EMA20={ema20})")
-            return
-
-        logging.info(f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} V={candle['volume']} | EMA5={ema5:.2f} EMA20={ema20:.2f}")
+        ema5 = self.compute_ema(closes, 5) if len(closes) >= 5 else None
+        ema20 = self.compute_ema(closes, 20) if len(closes) >= 20 else None
 
         now = datetime.datetime.now().time()
         if not (TRADING_START <= now <= TRADING_END):
@@ -508,181 +533,186 @@ class StrategyEngine:
         # If symbol already had a profitable trade today, do not take any more trades for that symbol
         if self.profitable_today.get(symbol):
             logging.info(f"[SKIP] {symbol} already produced profit today; skipping further entries.")
-            return
+            # still allow position management
+            pass
 
         position = self.positions.get(symbol)
 
-        # ------------------ Strategy 1 ------------------
-        # If a green candle closed above both EMA5 and EMA20 -> mark it
+        # Define helpers
         is_green = lambda c: c["close"] > c["open"]
         is_red = lambda c: c["close"] < c["open"]
 
-        if is_green(candle) and candle["close"] > ema5 and candle["close"] > ema20:
-            self.s1_marked_green[symbol] = (candle["time"].date(), candle["close"])  # record date + price
-            logging.info(f"[S1 MARK] {symbol} marked green close above EMAs at {candle['close']} on {candle['time'].date()}")
+        # ENTRY logic only on closed bars
+        if closed:
+            # Safety: if EMAs unavailable on closed bar skip entry flows
+            if ema5 is None or ema20 is None:
+                logging.info(f"[SKIP] {symbol} {candle['time']}: indicators unavailable (EMA5={ema5}, EMA20={ema20})")
+            else:
+                logging.info(f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} V={candle['volume']} | EMA5={ema5:.2f} EMA20={ema20:.2f}")
 
-        # Strategy 1 entry: wait for red candle which closes below both EMA5 and EMA20
-        if position is None and symbol in self.s1_marked_green and not self.taken_today.get(symbol):
-            mark_date, _ = self.s1_marked_green[symbol]
-            if mark_date == candle["time"].date():
-                if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
-                    entry = candle["close"]
-                    sl = candle["high"]  # SL exactly at high of the red candle (user requirement)
-                    target_points = abs(sl - entry)
-                    
-                    # ------------- NEW: skip if SL too large or too small -------------
-                    if target_points > 125 or target_points < 30:
-                        logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat1: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
-                        # Log skip to journal for traceability
-                        log_to_journal(symbol, "SKIP", "strat1", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
-                        # do not place orders or set position
-                    else:
-                        target_price = entry - target_points  # since we are short
+                # ------------------ Strategy 1 ------------------
+                if is_green(candle) and candle["close"] > ema5 and candle["close"] > ema20:
+                    self.s1_marked_green[symbol] = (candle["time"].date(), candle["close"])  # record date + price
+                    logging.info(f"[S1 MARK] {symbol} marked green close above EMAs at {candle['close']} on {candle['time'].date()}")
 
-                        # Place entry and SL
-                        raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "S1ENTRY")
-                        raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "S1SL")
-                        sl_order_id = _extract_order_id(raw_sl)
-                        entry_order_id = _extract_order_id(raw_entry)
-                        trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
-                        self.positions[symbol] = {
-                            "symbol": symbol,
-                            "strategy": "strat1",
-                            "entry_price": entry,
-                            "sl_price": sl,
-                            "target_price": target_price,
-                            "target_points": target_points,
-                            "sl_order": {"id": sl_order_id, "resp": raw_sl},
-                            "entry_order": {"id": entry_order_id, "resp": raw_entry},
-                            "trade_id": trade_id
-                        }
-                        logging.info(f"[STRAT1] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
-                        # mark that we've taken the one allowed trade for this strike today
-                        self.taken_today[symbol] = True
+                # Strategy 1 entry: wait for red candle which closes below both EMA5 and EMA20
+                if position is None and symbol in self.s1_marked_green and not self.taken_today.get(symbol):
+                    mark_date, _ = self.s1_marked_green[symbol]
+                    if mark_date == candle["time"].date():
+                        if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
+                            entry = candle["close"]
+                            sl = candle["high"]  # SL exactly at high of the red candle (user requirement)
+                            target_points = abs(sl - entry)
 
-        # ------------------ Strategy 2 ------------------
-        # Updated: require ema5 < ema20 when the green candle is formed AND when the red (entry) candle forms.
-        if is_green(candle) and candle["close"] < ema20 and ema5 < ema20:
-            # mark for strat2 only if EMA5 < EMA20 at time of the green candle
-            key = (symbol, "s2")
-            self.s1_marked_green[key] = (candle["time"].date(), candle["close"])  # reusing store; different key
-            logging.info(f"[S2 MARK] {symbol} marked green-close-below-EMA20 with EMA5<EMA20 at {candle['close']} on {candle['time'].date()}")
+                            # ------------- NEW: skip if SL too large or too small -------------
+                            if target_points > 125 or target_points < 30:
+                                logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat1: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
+                                log_to_journal(symbol, "SKIP", "strat1", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
+                            else:
+                                target_price = entry - target_points  # since we are short
 
-        # Strategy 2 entry: wait for red candle which closes below both ema5 and ema20 AND ema5 < ema20 on the entry candle
-        key = (symbol, "s2")
-        if position is None and key in self.s1_marked_green and not self.taken_today.get(symbol):
-            mark_date, _ = self.s1_marked_green[key]
-            if mark_date == candle["time"].date():
-                # Entry requires: red candle close below both EMA5 & EMA20, EMA5 < EMA20, AND the red candle's HIGH must be > EMA5
-                if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["open"] > ema5:
-                    entry = candle["close"]
-                    sl = candle["high"] + 5  # user requirement
-                    target_points = abs(sl - entry)
-                    # ------------- NEW: skip if SL too large or too small -------------
-                    if target_points > 50 or target_points < 20:
-                        logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
-                        log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
-                        # do not place orders or set position
-                    else:
-                        target_price = entry - target_points
+                                # Place entry and SL
+                                raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "S1ENTRY")
+                                raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "S1SL")
+                                sl_order_id = _extract_order_id(raw_sl)
+                                entry_order_id = _extract_order_id(raw_entry)
+                                trade_id = log_to_journal(symbol, "ENTRY", "strat1", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
+                                self.positions[symbol] = {
+                                    "symbol": symbol,
+                                    "strategy": "strat1",
+                                    "entry_price": entry,
+                                    "sl_price": sl,
+                                    "target_price": target_price,
+                                    "target_points": target_points,
+                                    "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                                    "entry_order": {"id": entry_order_id, "resp": raw_entry},
+                                    "trade_id": trade_id,
+                                    "exiting": False
+                                }
+                                logging.info(f"[STRAT1] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
+                                self.taken_today[symbol] = True
 
-                        raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "S2ENTRY")
-                        raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "S2SL")
-                        sl_order_id = _extract_order_id(raw_sl)
-                        entry_order_id = _extract_order_id(raw_entry)
-                        trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
-                        self.positions[symbol] = {
-                            "symbol": symbol,
-                            "strategy": "strat2",
-                            "entry_price": entry,
-                            "sl_price": sl,
-                            "target_price": target_price,
-                            "target_points": target_points,
-                            "sl_order": {"id": sl_order_id, "resp": raw_sl},
-                            "entry_order": {"id": entry_order_id, "resp": raw_entry},
-                            "trade_id": trade_id
-                        }
-                        logging.info(f"[STRAT2] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
-                        # mark that we've taken the one allowed trade for this strike today
-                        self.taken_today[symbol] = True
+                # ------------------ Strategy 2 ------------------
+                if is_green(candle) and candle["close"] < ema20 and ema5 < ema20:
+                    key = (symbol, "s2")
+                    self.s1_marked_green[key] = (candle["time"].date(), candle["close"])  # reusing store; different key
+                    logging.info(f"[S2 MARK] {symbol} marked green-close-below-EMA20 with EMA5<EMA20 at {candle['close']} on {candle['time'].date()}")
+
+                key = (symbol, "s2")
+                if position is None and key in self.s1_marked_green and not self.taken_today.get(symbol):
+                    mark_date, _ = self.s1_marked_green[key]
+                    if mark_date == candle["time"].date():
+                        if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20 and ema5 < ema20 and candle["open"] > ema5:
+                            entry = candle["close"]
+                            sl = candle["high"] + 5  # user requirement
+                            target_points = abs(sl - entry)
+                            # ------------- NEW: skip if SL too large or too small -------------
+                            if target_points > 50 or target_points < 20:
+                                logging.info(f"[SKIP-SL_TOO_LARGE] {symbol} strat2: SL points={target_points:.2f} > {MAX_SL_POINTS}; skipping trade.")
+                                log_to_journal(symbol, "SKIP", "strat2", entry=entry, sl=sl, remarks=f"SL_points={target_points:.2f} > {MAX_SL_POINTS}; skipped", lot_size=self.lot_size)
+                            else:
+                                target_price = entry - target_points
+
+                                raw_entry = self.fyers.place_limit_sell(symbol, self.lot_size, entry, "S2ENTRY")
+                                raw_sl = self.fyers.place_stoploss_buy(symbol, self.lot_size, sl, "S2SL")
+                                sl_order_id = _extract_order_id(raw_sl)
+                                entry_order_id = _extract_order_id(raw_entry)
+                                trade_id = log_to_journal(symbol, "ENTRY", "strat2", entry=entry, sl=sl, remarks="", lot_size=self.lot_size)
+                                self.positions[symbol] = {
+                                    "symbol": symbol,
+                                    "strategy": "strat2",
+                                    "entry_price": entry,
+                                    "sl_price": sl,
+                                    "target_price": target_price,
+                                    "target_points": target_points,
+                                    "sl_order": {"id": sl_order_id, "resp": raw_sl},
+                                    "entry_order": {"id": entry_order_id, "resp": raw_entry},
+                                    "trade_id": trade_id,
+                                    "exiting": False
+                                }
+                                logging.info(f"[STRAT2] ENTRY @{entry} SL @{sl} TARGET @{target_price} for {symbol}")
+                                self.taken_today[symbol] = True
 
         # ------------------ Manage open position: target, move SL, green-exit (new), and time-based exit ------------------
         position = self.positions.get(symbol)
-        if position:
-            entry = position.get("entry_price")
-            sl = position.get("sl_price")
-            target_price = position.get("target_price")
-            tp_pts = position.get("target_points")
+        if not position:
+            return
 
-            # NEW: Strategy1 special exit rule — if strat1 and any green candle closes above either EMA5 or EMA20 -> exit immediately and cancel pending SL
-            if position.get("strategy") == "strat1" and is_green(candle) and (candle["close"] > ema5 or candle["close"] > ema20):
-                try:
-                    # cancel existing SL order if present
-                    sl_info = position.get("sl_order") or {}
-                    sl_order_id = sl_info.get("id")
-                    cancel_resp = None
-                    if sl_order_id:
-                        cancel_resp = self.fyers.cancel_order(sl_order_id)
-                        logging.info(f"[STRAT1-GREEN-EXIT] Cancelled SL order {sl_order_id}: {cancel_resp}")
+        entry = position.get("entry_price")
+        sl = position.get("sl_price")
+        target_price = position.get("target_price")
+        tp_pts = position.get("target_points")
 
-                    # exit at market using candle close
-                    market_resp = self.fyers.place_market_buy(symbol, self.lot_size, "STRAT1_GREEN_EXIT")
-                    exit_price = candle["close"]
-                    pnl = compute_pnl_for_short(entry, exit_price, self.lot_size)
-                    log_to_journal(symbol, "EXIT", position["strategy"], entry=entry, sl=sl, exit=exit_price, remarks=f"Green candle close above EMA -> exit; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
-                    if pnl and pnl > 0:
-                        self.profitable_today[symbol] = True
-                    self.positions.pop(symbol, None)
-                    logging.info(f"[STRAT1-GREEN-EXIT] {symbol} exited at {exit_price} pnl={pnl} cancel_resp={cancel_resp}")
-                except Exception as e:
-                    logging.exception(f"Failed to execute strat1 green-exit for {symbol}: {e}")
-                return
-
-            # Check if target achieved in this bar (for shorts: price <= target)
-            if candle["low"] <= target_price:
-                # target hit -> exit at target_price (place market buy or limit?) place market buy for execution
-                self.fyers.place_market_buy(symbol, self.lot_size, "TARGET_HIT")
-                exit_price = target_price
-                pnl = compute_pnl_for_short(entry, exit_price, self.lot_size)
-                log_to_journal(symbol, "EXIT", position["strategy"], entry=entry, sl=sl, exit=exit_price, remarks="Target hit", lot_size=self.lot_size, trade_id=position.get("trade_id"))
-                # mark profitable if pnl>0
-                if pnl and pnl > 0:
-                    self.profitable_today[symbol] = True
-                self.positions.pop(symbol, None)
-                logging.info(f"[EXIT-TARGET] {symbol} exited at {exit_price} pnl={pnl}")
-                return
-
-            # Move SL to entry after 70%/80% of target achieved depending on strategy
-            # For shorts, favorable move = price lowered by fraction of target_points
-            fraction = 0.7 if position.get("strategy") == "strat1" else 0.7
-            trigger_price = entry - tp_pts * fraction
-            # if low of the candle <= trigger_price then move SL to entry
-            if candle["low"] <= trigger_price and position.get("sl_price") != entry:
-                try:
-                    logging.info(f"[TRAIL] {symbol} reached {fraction*100:.0f}% of TP; moving SL to entry {entry}")
-                    self._cancel_sl_and_place_new(position, entry)
-                except Exception as e:
-                    logging.exception(f"Failed to move SL for {symbol}: {e}")
-
-            # Time-based exit at 3:00 PM if neither SL nor target achieved
-            # We'll interpret "by 3:00 PM" as when the bar's time is >= TRADING_END (15:00)
-            if candle["time"].time() >= TRADING_END:
-                logging.info(f"[TIME EXIT] {symbol} forcing exit at market at {candle['time']}")
-                # cancel SL order if exists
+        # NEW: Strategy1 special exit rule — only evaluate this on closed bars as designed
+        if closed and position.get("strategy") == "strat1" and is_green(candle) and (ema5 is not None and (candle["close"] > ema5 or candle["close"] > ema20)):
+            try:
                 sl_info = position.get("sl_order") or {}
                 sl_order_id = sl_info.get("id")
                 cancel_resp = None
                 if sl_order_id:
                     cancel_resp = self.fyers.cancel_order(sl_order_id)
-                # market buy to exit
-                market_resp = self.fyers.place_market_buy(symbol, self.lot_size, "EOD_EXIT")
-                exit_price = candle["close"]
-                pnl = compute_pnl_for_short(entry, exit_price, self.lot_size)
-                log_to_journal(symbol, "EXIT", position["strategy"], entry=entry, sl=sl, exit=exit_price, remarks=f"EOD exit; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
-                if pnl and pnl > 0:
-                    self.profitable_today[symbol] = True
-                self.positions.pop(symbol, None)
-                logging.info(f"[EXIT-EOD] {symbol} exited at {exit_price} pnl={pnl} cancel_resp={cancel_resp}")
+                    logging.info(f"[STRAT1-GREEN-EXIT] Cancelled SL order {sl_order_id}: {cancel_resp}")
+
+                # exit at market using candle close -> initiate market exit and wait for trade confirmation
+                self.fyers.place_market_buy(symbol, self.lot_size, "STRAT1_GREEN_EXIT")
+                position["exiting"] = True
+                log_to_journal(symbol, "EXIT_INITIATED", position["strategy"], entry=entry, sl=sl, exit=candle["close"], remarks=f"Green candle close above EMA -> exit initiated; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
+                logging.info(f"[STRAT1-GREEN-EXIT] {symbol} exit initiated at approx {candle['close']} cancel_resp={cancel_resp}")
+            except Exception as e:
+                logging.exception(f"Failed to execute strat1 green-exit for {symbol}: {e}")
+            return
+
+        # --- TARGET HIT (must run intrabar) ---
+        if target_price is not None and candle.get("low") <= target_price and not position.get("exiting"):
+            try:
+                # Cancel existing SL first to avoid double fills
+                sl_info = position.get("sl_order") or {}
+                sl_order_id = sl_info.get("id")
+                cancel_resp = None
+                if sl_order_id:
+                    try:
+                        cancel_resp = self.fyers.cancel_order(sl_order_id)
+                        logging.info(f"[TARGET] Cancelled SL order {sl_order_id} before market exit: {cancel_resp}")
+                    except Exception as e:
+                        logging.exception(f"Failed to cancel SL {sl_order_id} before target exit: {e}")
+
+                # place market buy to exit
+                self.fyers.place_market_buy(symbol, self.lot_size, "TARGET_HIT")
+                # mark as exiting — do NOT pop immediately; wait for on_trade confirmation
+                position["exiting"] = True
+                log_to_journal(symbol, "EXIT_INITIATED", position["strategy"], entry=entry, sl=sl, exit=target_price,
+                               remarks="Target hit intrabar; exit initiated (actual fill awaited via on_trade)", lot_size=self.lot_size, trade_id=position.get("trade_id"))
+                logging.info(f"[EXIT-TARGET-INIT] {symbol} initiated market exit @ approx {target_price} (awaiting trade confirmation)")
+            except Exception as e:
+                logging.exception(f"Failed to execute market exit for {symbol} on target: {e}")
+            return
+
+        # --- TRAIL SL (also intrabar) ---
+        fraction = 0.7 if position.get("strategy") == "strat1" else 0.7
+        trigger_price = entry - tp_pts * fraction
+        if candle.get("low") <= trigger_price and position.get("sl_price") != entry and not position.get("exiting"):
+            try:
+                logging.info(f"[TRAIL] {symbol} reached {fraction*100:.0f}% of TP; moving SL to entry {entry}")
+                self._cancel_sl_and_place_new(position, entry)
+            except Exception as e:
+                logging.exception(f"Failed to move SL for {symbol}: {e}")
+
+        # --- EOD exit: handle intrabar or closed bar when time reached ---
+        if candle["time"].time() >= TRADING_END and not position.get("exiting"):
+            try:
+                logging.info(f"[TIME EXIT] {symbol} forcing exit at market at {candle['time']}")
+                sl_info = position.get("sl_order") or {}
+                sl_order_id = sl_info.get("id")
+                cancel_resp = None
+                if sl_order_id:
+                    cancel_resp = self.fyers.cancel_order(sl_order_id)
+                self.fyers.place_market_buy(symbol, self.lot_size, "EOD_EXIT")
+                position["exiting"] = True
+                log_to_journal(symbol, "EXIT_INITIATED", position["strategy"], entry=entry, sl=sl, exit=candle["close"], remarks=f"EOD exit initiated; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
+                logging.info(f"[EXIT-EOD-INIT] {symbol} exit initiated at market (awaiting trade confirmation)")
+            except Exception as e:
+                logging.exception(f"Failed to execute EOD exit for {symbol}: {e}")
+            return
 
     def on_trade(self, msg):
         try:
@@ -703,14 +733,12 @@ class StrategyEngine:
                 return
 
             position = self.positions.get(symbol)
-            # If we receive a buy trade (side == 1) against an open short, treat as SL hit / exit
+            # If we receive a buy trade (side == 1) against an open short, treat as exit
             if position and side == 1:
                 trade_id = position.get("trade_id")
                 entry_price = position.get("entry_price")
                 sl_price = position.get("sl_price")
-                # We don't have exit price in on_trade reliably; log SL_HIT and mark position closed
-                log_to_journal(symbol, "SL_HIT", position["strategy"], entry=entry_price, sl=sl_price, exit=None, remarks=str(msg), lot_size=self.lot_size, trade_id=trade_id)
-                # Attempt to compute pnl if we can extract price
+                # We try to extract executed price
                 exit_price = None
                 try:
                     if isinstance(trades, dict) and trades.get("price"):
@@ -719,9 +747,13 @@ class StrategyEngine:
                         exit_price = float(trades[0].get("price"))
                 except Exception:
                     exit_price = None
+
+                # Finalize journal as EXIT using actual executed price if available
+                log_to_journal(symbol, "EXIT", position["strategy"], entry=entry_price, sl=sl_price, exit=exit_price, remarks=str(msg), lot_size=self.lot_size, trade_id=trade_id)
                 pnl = compute_pnl_for_short(entry_price, exit_price, self.lot_size) if exit_price is not None else None
                 if pnl and pnl > 0:
                     self.profitable_today[symbol] = True
+                # remove the position
                 self.positions.pop(symbol, None)
         except Exception as e:
             logging.exception(f"Error in on_trade processing: {e}")
@@ -732,7 +764,7 @@ if __name__ == "__main__":
     fyers_client = FyersClient(CLIENT_ID, ACCESS_TOKEN, LOT_SIZE)
     engine = StrategyEngine(fyers_client, LOT_SIZE)
 
-    # Wait until 9:15 AM
+    # Wait until 9:25 AM
     while datetime.datetime.now().time() < TRADING_START:
         time.sleep(1)
 
