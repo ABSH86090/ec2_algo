@@ -492,7 +492,7 @@ class StrategyEngine:
                 logging.info(f"Cancelled old SL order: {cancel_resp}")
             except Exception as e:
                 logging.exception(f"Failed to cancel SL order {sl_order_id}: {e}")
-        new_sl_resp = self.fyers.place_stoploss_buy(position["symbol"], self.lot_size, new_sl_price, "TRAIL_SL")
+        new_sl_resp = self.fyers.place_stoploss_buy(position["symbol"], self.lot_size, new_sl_price, "TRAILSL")
         new_sl_id = _extract_order_id(new_sl_resp)
         position["sl_order"] = {"id": new_sl_id, "resp": new_sl_resp}
         position["sl_price"] = new_sl_price
@@ -654,7 +654,7 @@ class StrategyEngine:
                     logging.info(f"[STRAT1-GREEN-EXIT] Cancelled SL order {sl_order_id}: {cancel_resp}")
 
                 # exit at market using candle close -> initiate market exit and wait for trade confirmation
-                self.fyers.place_market_buy(symbol, self.lot_size, "STRAT1_GREEN_EXIT")
+                self.fyers.place_market_buy(symbol, self.lot_size, "STRAT1GREENEXIT")
                 position["exiting"] = True
                 log_to_journal(symbol, "EXIT_INITIATED", position["strategy"], entry=entry, sl=sl, exit=candle["close"], remarks=f"Green candle close above EMA -> exit initiated; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
                 logging.info(f"[STRAT1-GREEN-EXIT] {symbol} exit initiated at approx {candle['close']} cancel_resp={cancel_resp}")
@@ -677,7 +677,7 @@ class StrategyEngine:
                         logging.exception(f"Failed to cancel SL {sl_order_id} before target exit: {e}")
 
                 # place market buy to exit
-                self.fyers.place_market_buy(symbol, self.lot_size, "TARGET_HIT")
+                self.fyers.place_market_buy(symbol, self.lot_size, "TARGETHIT")
                 # mark as exiting — do NOT pop immediately; wait for on_trade confirmation
                 position["exiting"] = True
                 log_to_journal(symbol, "EXIT_INITIATED", position["strategy"], entry=entry, sl=sl, exit=target_price,
@@ -706,7 +706,7 @@ class StrategyEngine:
                 cancel_resp = None
                 if sl_order_id:
                     cancel_resp = self.fyers.cancel_order(sl_order_id)
-                self.fyers.place_market_buy(symbol, self.lot_size, "EOD_EXIT")
+                self.fyers.place_market_buy(symbol, self.lot_size, "EODEXIT")
                 position["exiting"] = True
                 log_to_journal(symbol, "EXIT_INITIATED", position["strategy"], entry=entry, sl=sl, exit=candle["close"], remarks=f"EOD exit initiated; cancel_resp={cancel_resp}", lot_size=self.lot_size, trade_id=position.get("trade_id"))
                 logging.info(f"[EXIT-EOD-INIT] {symbol} exit initiated at market (awaiting trade confirmation)")
