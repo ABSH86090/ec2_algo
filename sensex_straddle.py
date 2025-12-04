@@ -17,10 +17,10 @@ CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")  # Format: APPID-XXXXX:token
 LOT_SIZE = 20
 
-# We still won't send any orders before 9:25, but ATM will be fixed at 9:16
-TRADING_START = datetime.time(9, 25)
-TRADING_END = datetime.time(14, 45)  # 3:00 PM
+# We decide ATM at 9:16 (after first 1-minute close) and start entries at 9:25
 ATM_DECISION_TIME = datetime.time(9, 16)
+TRADING_START = datetime.time(9, 25)
+TRADING_END = datetime.time(14, 45)
 
 JOURNAL_FILE = "sensex_trades.csv"
 
@@ -32,9 +32,8 @@ HISTORY_RESOLUTION = "3"
 MIN_BARS_FOR_EMA = 20
 MAX_HISTORY_LOOKBACK_DAYS = 7
 
-# ------------- max SL points safety (optional) -------------
+# Safety
 MAX_SL_POINTS = 150
-# ------------------------------------------------------------
 
 # Ensure journal file exists with headers
 if not os.path.exists(JOURNAL_FILE):
@@ -72,8 +71,7 @@ def _safe_float(v):
 
 def compute_pnl_for_short(entry_price, exit_price, lot_size):
     """
-    We treat the combined straddle premium as a single instrument whose price is (CE+PE).
-    PnL = (entry_combined - exit_combined) * lot_size
+    Treat combined straddle premium as a single instrument: PnL = (entry - exit) * lot_size
     """
     if entry_price is None or exit_price is None:
         return None
@@ -85,7 +83,6 @@ def compute_pnl_for_short(entry_price, exit_price, lot_size):
         return None
 
 
-# Helper to extract order id from various fyers responses (robust)
 def _extract_order_id(resp):
     try:
         if not resp:
@@ -104,6 +101,16 @@ def _extract_order_id(resp):
     except Exception:
         return None
 
+
+def _to_epoch_seconds(ts):
+    # Accepts int or float timestamp (s or ms). Returns int seconds.
+    try:
+        ts = int(ts)
+        if ts > 10_000_000_000:  # milliseconds
+            ts = ts // 1000
+        return ts
+    except Exception:
+        return None
 
 # journaling
 def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None,
@@ -127,7 +134,6 @@ def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None
             ])
         return tid
 
-    # For everything else, try to update an existing row
     rows = []
     with open(JOURNAL_FILE, mode="r", newline="") as f:
         reader = csv.DictReader(f)
@@ -193,7 +199,6 @@ def log_to_journal(symbol, action, strategy=None, entry=None, sl=None, exit=None
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
-
 
 # ---------------- EXPIRY & SYMBOL UTILS ----------------
 SPECIAL_MARKET_HOLIDAYS = {
@@ -279,7 +284,6 @@ def get_atm_symbols(fyers_client):
     logging.info(f"[ATM SYMBOLS @9:16] CE={ce_symbol}, PE={pe_symbol}, spot={ltp}")
     print(f"[ATM SYMBOLS @9:16] CE={ce_symbol}, PE={pe_symbol}, spot={ltp}")
     return [ce_symbol, pe_symbol]
-
 
 # ---------------- FYERS CLIENT ----------------
 class FyersClient:
@@ -471,11 +475,10 @@ class FyersClient:
         self.trade_callbacks.append(cb)
 
 
-# ---------------- STRATEGY ENGINE (new combined-straddle logic) ----------------
+# ---------------- STRATEGY ENGINE ----------------
 class StrategyEngine:
     """
-    All EMA and candle logic runs on the synthetic symbol "STRADDLE" whose
-    price is CE+PE premium. Orders are placed on the two legs at the same time.
+    EMA and candle logic runs on "STRADDLE" whose price = CE + PE.
     """
 
     def __init__(self, fyers_client: FyersClient, lot_size: int = 20,
@@ -483,25 +486,17 @@ class StrategyEngine:
         self.fyers = fyers_client
         self.lot_size = lot_size
 
-        # option legs for the ATM straddle decided at 9:16
         self.ce_symbol = ce_symbol
         self.pe_symbol = pe_symbol
 
-        # only one trading symbol in strategy (combined premium)
         self.straddle_symbol = "STRADDLE"
+        self.candles = defaultdict(lambda: deque(maxlen=2000))
 
-        # candle history for STRADDLE
-        self.candles = defaultdict(lambda: deque(maxlen=500))
+        self.positions = {}
+        self.profitable_today = {}
+        self.taken_today = {}
 
-        # trading state
-        self.positions = {}      # key: "STRADDLE" -> position dict
-        self.profitable_today = {}  # "STRADDLE" -> bool
-        self.taken_today = {}       # "STRADDLE" -> bool (max 1 trade / day)
-
-        # pattern-state for entry
-        # stage: 0 = waiting for red close below both EMAs
-        #        1 = red done, waiting for a green candle
-        #        2 = green done, waiting for final red candle (with special open / close conditions)
+        # pattern-state
         self.pattern_state = {
             self.straddle_symbol: {
                 "stage": 0,
@@ -515,13 +510,105 @@ class StrategyEngine:
         self.ce_symbol = ce_symbol
         self.pe_symbol = pe_symbol
 
-    def prefill_history(self, symbols, days_back=1):
+    def prefill_history(self, days_back=1):
         """
-        We no longer need per-leg history for logic because EMAs are computed on the
-        live combined premium candles. This method is kept only for compatibility.
-        You can extend it later to backfill STRADDLE history if you want.
+        Prefill synthetic STRADDLE candles by downloading history for CE & PE legs,
+        aligning timestamps and summing their OHLC to form combined candles.
         """
-        logging.info("[PREFILL] Skipping history prefill for combined-straddle strategy.")
+        if not self.ce_symbol or not self.pe_symbol:
+            logging.warning("[PREFILL] CE/PE symbols not set; skipping prefill.")
+            return
+
+        target_symbol = self.straddle_symbol
+        added = 0
+        used_days = 0
+
+        while added < MIN_BARS_FOR_EMA and used_days < MAX_HISTORY_LOOKBACK_DAYS:
+            try:
+                to_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                from_dt = datetime.datetime.now() - datetime.timedelta(days=days_back + used_days)
+                from_date = from_dt.strftime("%Y-%m-%d")
+
+                params_ce = {
+                    "symbol": self.ce_symbol,
+                    "resolution": HISTORY_RESOLUTION,
+                    "date_format": "1",
+                    "range_from": from_date,
+                    "range_to": to_date,
+                    "cont_flag": "1"
+                }
+                params_pe = params_ce.copy()
+                params_pe["symbol"] = self.pe_symbol
+
+                hist_ce = self.fyers.client.history(params_ce)
+                hist_pe = self.fyers.client.history(params_pe)
+
+                ce_candles = hist_ce.get("candles") or []
+                pe_candles = hist_pe.get("candles") or []
+                if not ce_candles or not pe_candles:
+                    logging.info(f"[PREFILL] No history for CE or PE for range {from_date} -> {to_date}")
+                    used_days += 1
+                    continue
+
+                # Map to bucket keyed by 3-minute bucket datetime (safer than strict timestamp match)
+                def to_bucket_dt(c):
+                    ts = _to_epoch_seconds(c[0])
+                    if ts is None:
+                        return None
+                    dt = datetime.datetime.fromtimestamp(ts)
+                    bucket_min = (dt.minute // CANDLE_MINUTES) * CANDLE_MINUTES
+                    return dt.replace(second=0, microsecond=0, minute=bucket_min)
+
+                ce_map = {}
+                for c in ce_candles:
+                    b = to_bucket_dt(c)
+                    if b:
+                        ce_map.setdefault(b, []).append(c)
+                pe_map = {}
+                for c in pe_candles:
+                    b = to_bucket_dt(c)
+                    if b:
+                        pe_map.setdefault(b, []).append(c)
+
+                common_buckets = sorted(set(ce_map.keys()) & set(pe_map.keys()))
+
+                for b in common_buckets:
+                    # choose the last bar in that bucket if multiple (shouldn't happen, but safe)
+                    c_ce = ce_map[b][-1]
+                    c_pe = pe_map[b][-1]
+
+                    # c format: [timestamp, open, high, low, close, volume]
+                    ts_dt = b
+                    combined_open = float(c_ce[1]) + float(c_pe[1])
+                    combined_high = float(c_ce[2]) + float(c_pe[2])
+                    combined_low = float(c_ce[3]) + float(c_pe[3])
+                    combined_close = float(c_ce[4]) + float(c_pe[4])
+                    combined_vol = int(c_ce[5]) + int(c_pe[5]) if len(c_ce) > 5 and len(c_pe) > 5 else 0
+
+                    candle = {
+                        "time": ts_dt,
+                        "open": combined_open,
+                        "high": combined_high,
+                        "low": combined_low,
+                        "close": combined_close,
+                        "volume": combined_vol,
+                    }
+
+                    if TRADING_START <= candle["time"].time() <= TRADING_END:
+                        self.candles[target_symbol].append(candle)
+                        added += 1
+
+                    if added >= MIN_BARS_FOR_EMA:
+                        break
+
+                logging.info(f"[PREFILL] {target_symbol}: +{added} combined bars (round {used_days+1})")
+
+            except Exception as e:
+                logging.exception(f"[PREFILL] Failed to fetch/construct history for {self.ce_symbol}/{self.pe_symbol}: {e}")
+            finally:
+                used_days += 1
+
+        logging.info(f"[PREFILL DONE] {target_symbol}: total prefilled bars={len(self.candles[target_symbol])} (min needed={MIN_BARS_FOR_EMA})")
 
     def compute_ema(self, prices, period):
         if len(prices) < period:
@@ -552,30 +639,19 @@ class StrategyEngine:
             }
 
     def on_candle(self, symbol, candle, closed=False):
-        """
-        symbol is always "STRADDLE".
-        closed == True  -> closed bar (EMAs & entry logic)
-        closed == False -> intrabar updates (for SL checks)
-        """
         if symbol != self.straddle_symbol:
-            # Ignore anything else
             return
 
-        # Append closed bars to history; intrabar updates are not appended
         if closed:
             self.candles[symbol].append(candle)
 
         candles = list(self.candles[symbol])
-
-        # If not enough closed bars for EMA, allow intrabar SL checks but skip entry logic
         if len(candles) < MIN_BARS_FOR_EMA:
             if not closed and self.positions.get(symbol):
-                # intrabar SL checks later
                 pass
             else:
                 if closed:
-                    logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; "
-                                 f"need {MIN_BARS_FOR_EMA} for EMA20")
+                    logging.info(f"[SKIP] {symbol} {candle['time']}: only {len(candles)} bars; need {MIN_BARS_FOR_EMA} for EMA20")
                 return
 
         closes = [c["close"] for c in candles]
@@ -587,158 +663,150 @@ class StrategyEngine:
             logging.info(f"[SKIP] {symbol} outside trading window")
             return
 
-        # pattern state reset if new day
         self._reset_pattern_if_new_day(symbol, candle["time"])
         state = self.pattern_state[symbol]
 
-        # helper bull / bear
         is_green = lambda c: c["close"] > c["open"]
         is_red = lambda c: c["close"] < c["open"]
 
         position = self.positions.get(symbol)
 
-        # ---------------- ENTRY LOGIC (only on closed bars) ----------------
+        # ENTRY logic (closed bars only)
         if closed and ema5 is not None and ema20 is not None:
-            logging.info(f"[BAR CLOSE + IND] {symbol} {candle['time']} "
-                         f"O={candle['open']} H={candle['high']} L={candle['low']} "
-                         f"C={candle['close']} V={candle['volume']} "
-                         f"| EMA5={ema5:.2f} EMA20={ema20:.2f}")
+            logging.info(f"[BAR CLOSE + IND] {symbol} {candle['time']} O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']} | EMA5={ema5:.2f} EMA20={ema20:.2f}")
 
             if self.profitable_today.get(symbol):
                 logging.info(f"[SKIP] {symbol} already had a profitable trade today.")
             else:
-                # Stage-machine for your described pattern
                 if state["stage"] == 0:
-                    # Stage 0: wait for first RED candle which closes below both EMA5 and EMA20
+                    # Wait for first red close below both EMAs
                     if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
                         state["stage"] = 1
                         state["first_red_time"] = candle["time"]
-                        logging.info(f"[PATTERN] Stage 0 -> 1 (first red below EMAs) at {candle['time']}")
+                        logging.info(f"[PATTERN] Stage 0 -> 1 at {candle['time']}")
                 elif state["stage"] == 1:
-                    # Stage 1: we have that red, now wait for a GREEN candle (no EMA condition specified)
+                    # Wait for any green candle
                     if is_green(candle):
                         state["stage"] = 2
                         state["green_time"] = candle["time"]
-                        logging.info(f"[PATTERN] Stage 1 -> 2 (green candle) at {candle['time']}")
-                    # If we get another strong red below EMAs, we can treat it as a fresh starting point
+                        logging.info(f"[PATTERN] Stage 1 -> 2 (green) at {candle['time']}")
                     elif is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
+                        # refresh
                         state["stage"] = 1
                         state["first_red_time"] = candle["time"]
-                        logging.info(f"[PATTERN] Stage 1 refreshed by new red below EMAs at {candle['time']}")
+                        logging.info(f"[PATTERN] Stage 1 refreshed by new red at {candle['time']}")
                 elif state["stage"] == 2:
-                    # Stage 2: wait for FINAL red candle:
-                    # open is above EMA5 but less than EMA20
-                    # close is below both EMA5 and EMA20
                     cond_open = candle["open"] > ema5 and candle["open"] < ema20
                     cond_close = is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20
 
                     if cond_open and cond_close and position is None and not self.taken_today.get(symbol):
                         entry = candle["close"]
-                        sl = candle["high"]  # SL is high of this final red candle
-
+                        sl = candle["high"]
                         sl_points = sl - entry
+
                         if sl_points <= 0:
-                            logging.info(f"[SKIP] SL not above entry (entry={entry}, sl={sl}); invalid.")
+                            logging.info(f"[SKIP] invalid SL (entry={entry}, sl={sl})")
                             state["stage"] = 0
                         elif sl_points > MAX_SL_POINTS:
                             logging.info(f"[SKIP] SL points {sl_points:.2f} > MAX_SL_POINTS={MAX_SL_POINTS}")
                             log_to_journal(symbol, "SKIP", "combined_straddle",
                                            entry=entry, sl=sl,
-                                           remarks=f"SL_points={sl_points:.2f} > MAX_SL_POINTS",
+                                           remarks=f"SL_points={sl_points:.2f} > {MAX_SL_POINTS}",
                                            lot_size=self.lot_size)
                             state["stage"] = 0
                         else:
-                            # -------------- EXECUTE ENTRY --------------
-                            logging.info(f"[ENTRY SIGNAL] {symbol} entry={entry} sl={sl} "
-                                         f"(SL pts={sl_points:.2f})")
+                            logging.info(f"[ENTRY SIGNAL] {symbol} entry={entry} sl={sl} (SL pts={sl_points:.2f})")
 
-                            # Sell both CE and PE at market
                             if not self.ce_symbol or not self.pe_symbol:
                                 logging.error("[ENTRY] CE/PE symbols not set; cannot place straddle.")
                             else:
-                                ce_resp = self.fyers.place_market_sell(
-                                    self.ce_symbol, self.lot_size, tag="STRADDLE_ENTRY_CE"
-                                )
-                                pe_resp = self.fyers.place_market_sell(
-                                    self.pe_symbol, self.lot_size, tag="STRADDLE_ENTRY_PE"
-                                )
-                                trade_id = log_to_journal(
-                                    symbol, "ENTRY", "combined_straddle",
-                                    entry=entry, sl=sl, remarks="",
-                                    lot_size=self.lot_size
-                                )
+                                # Alphanumeric-only tags
+                                ce_resp = self.fyers.place_market_sell(self.ce_symbol, self.lot_size, tag="STRADDLEENTRYCE")
+                                pe_resp = self.fyers.place_market_sell(self.pe_symbol, self.lot_size, tag="STRADDLEENTRYPE")
 
-                                self.positions[symbol] = {
-                                    "symbol": symbol,
-                                    "strategy": "combined_straddle",
-                                    "entry_price": entry,
-                                    "sl_price": sl,
-                                    "trade_id": trade_id,
-                                    "exiting": False,
-                                    "legs": [self.ce_symbol, self.pe_symbol],
-                                    "exit_trades_count": 0,
-                                    "exit_prices_sum": 0.0,
-                                }
-                                self.taken_today[symbol] = True
-                                logging.info(f"[POSITION OPENED] {symbol} ENTRY={entry} SL={sl} "
-                                             f"CE_order={ce_resp} PE_order={pe_resp}")
+                                ce_err = isinstance(ce_resp, dict) and ce_resp.get("code", 0) < 0
+                                pe_err = isinstance(pe_resp, dict) and pe_resp.get("code", 0) < 0
 
-                            # After a full pattern + entry, reset pattern state
+                                if ce_err or pe_err:
+                                    logging.error(f"[ENTRY FAILED] CE_resp={ce_resp} PE_resp={pe_resp}. Not creating position.")
+                                    log_to_journal(symbol, "SKIP", "combined_straddle",
+                                                   entry=entry, sl=sl,
+                                                   remarks=f"Order error CE={ce_resp} PE={pe_resp}",
+                                                   lot_size=self.lot_size)
+                                else:
+                                    trade_id = log_to_journal(
+                                        symbol, "ENTRY", "combined_straddle",
+                                        entry=entry, sl=sl, remarks="",
+                                        lot_size=self.lot_size
+                                    )
+
+                                    self.positions[symbol] = {
+                                        "symbol": symbol,
+                                        "strategy": "combined_straddle",
+                                        "entry_price": entry,
+                                        "sl_price": sl,
+                                        "trade_id": trade_id,
+                                        "exiting": False,
+                                        "legs": [self.ce_symbol, self.pe_symbol],
+                                        "exit_trades_count": 0,
+                                        "exit_prices_sum": 0.0,
+                                        "entry_bar_time": candle["time"],   # ignore SL on this candle
+                                    }
+                                    self.taken_today[symbol] = True
+                                    logging.info(f"[POSITION OPENED] {symbol} ENTRY={entry} SL={sl} CE_order={ce_resp} PE_order={pe_resp}")
+
+                            # reset pattern
                             state["stage"] = 0
                             state["first_red_time"] = None
                             state["green_time"] = None
                     else:
-                        # Pattern invalidated / something else -> you might choose to reset
+                        # if new red below EMAs appears, restart pattern
                         if is_red(candle) and candle["close"] < ema5 and candle["close"] < ema20:
-                            # restart from new first red
                             state["stage"] = 1
                             state["first_red_time"] = candle["time"]
                             state["green_time"] = None
-                            logging.info(f"[PATTERN] Stage 2 reset to Stage 1 (new red) at {candle['time']}")
+                            logging.info(f"[PATTERN] Stage 2 -> 1 (new red) at {candle['time']}")
 
-        # ---------------- MANAGE OPEN POSITION: SL on combined premium + EOD exit ----------------
+        # Manage open position
         position = self.positions.get(symbol)
         if not position:
             return
 
         entry = position.get("entry_price")
         sl = position.get("sl_price")
+        entry_bar_time = position.get("entry_bar_time")
 
-        # Intrabar SL check on combined premium:
-        # "If the combined premium at anytime reaches the high of the red candle, exit the trade."
+        # SL intrabar: skip check on the same candle that produced the entry
         if candle["high"] >= sl and not position.get("exiting"):
-            try:
-                logging.info(f"[SL HIT] {symbol}: candle_high={candle['high']} >= SL={sl}. Exiting straddle.")
-
-                # Exit both legs at market
-                if self.ce_symbol:
-                    self.fyers.place_market_buy(self.ce_symbol, self.lot_size, tag="STRADDLE_SL_EXIT_CE")
-                if self.pe_symbol:
-                    self.fyers.place_market_buy(self.pe_symbol, self.lot_size, tag="STRADDLE_SL_EXIT_PE")
-
-                position["exiting"] = True
-
-                # We log a provisional exit at SL for journal; final actual prices will come via on_trade
-                log_to_journal(
-                    symbol, "EXIT_INITIATED", position["strategy"],
-                    entry=entry, sl=sl, exit=sl,
-                    remarks="SL hit on combined premium; market exit initiated",
-                    lot_size=self.lot_size,
-                    trade_id=position.get("trade_id"),
-                )
-            except Exception as e:
-                logging.exception(f"Failed to execute SL exit for {symbol}: {e}")
+            if entry_bar_time is not None and candle["time"] == entry_bar_time:
+                logging.info(f"[SL SKIP] Ignoring SL check on the entry candle (time={candle['time']})")
+            else:
+                try:
+                    logging.info(f"[SL HIT] {symbol}: candle_high={candle['high']} >= SL={sl}. Exiting straddle.")
+                    if self.ce_symbol:
+                        self.fyers.place_market_buy(self.ce_symbol, self.lot_size, tag="STRADDLESLEXITCE")
+                    if self.pe_symbol:
+                        self.fyers.place_market_buy(self.pe_symbol, self.lot_size, tag="STRADDLESLEXITPE")
+                    position["exiting"] = True
+                    log_to_journal(
+                        symbol, "EXIT_INITIATED", position["strategy"],
+                        entry=entry, sl=sl, exit=sl,
+                        remarks="SL hit on combined premium; market exit initiated",
+                        lot_size=self.lot_size,
+                        trade_id=position.get("trade_id"),
+                    )
+                except Exception as e:
+                    logging.exception(f"Failed to execute SL exit for {symbol}: {e}")
             return
 
-        # End-of-day safety exit
+        # EOD exit
         if candle["time"].time() >= TRADING_END and not position.get("exiting"):
             try:
                 logging.info(f"[TIME EXIT] {symbol} forcing exit at market at {candle['time']}")
                 if self.ce_symbol:
-                    self.fyers.place_market_buy(self.ce_symbol, self.lot_size, tag="STRADDLE_EOD_EXIT_CE")
+                    self.fyers.place_market_buy(self.ce_symbol, self.lot_size, tag="STRADDLEEODEXITCE")
                 if self.pe_symbol:
-                    self.fyers.place_market_buy(self.pe_symbol, self.lot_size, tag="STRADDLE_EOD_EXIT_PE")
-
+                    self.fyers.place_market_buy(self.pe_symbol, self.lot_size, tag="STRADDLEEODEXITPE")
                 position["exiting"] = True
                 log_to_journal(
                     symbol, "EXIT_INITIATED", position["strategy"],
@@ -753,15 +821,14 @@ class StrategyEngine:
 
     def on_trade(self, msg):
         """
-        We treat BUY trades on either leg as exits for the open straddle position.
-        Once both legs are bought back, the position is considered fully closed.
+        BUY trades on either leg are exits for the open straddle.
+        Combine executed prices for final exit bookkeeping.
         """
         try:
             trades = msg.get("trades") or msg.get("data") or msg
             if not trades:
                 return
 
-            # Normalize to list of dicts
             if isinstance(trades, dict):
                 trades_list = [trades]
             else:
@@ -770,15 +837,12 @@ class StrategyEngine:
             for t in trades_list:
                 symbol = t.get("symbol") or t.get("s") or t.get("sym")
                 side = t.get("side")
-
                 if not symbol:
                     continue
-
-                # Only care about BUY side=1 which closes our short legs
+                # We're interested only in BUY trades closing our shorts
                 if side != 1:
                     continue
 
-                # We currently only have one combined position ("STRADDLE"), if any
                 pos = self.positions.get(self.straddle_symbol)
                 if not pos:
                     continue
@@ -786,7 +850,6 @@ class StrategyEngine:
                 if symbol not in pos.get("legs", []):
                     continue
 
-                # Extract executed price
                 exit_price_leg = None
                 try:
                     if t.get("price") is not None:
@@ -798,7 +861,7 @@ class StrategyEngine:
                     pos["exit_trades_count"] += 1
                     pos["exit_prices_sum"] += exit_price_leg
 
-                # When both legs are bought back, finalize journal as EXIT
+                # When both legs are bought back, finalize
                 if pos["exit_trades_count"] >= len(pos.get("legs", [])):
                     combined_exit_price = pos["exit_prices_sum"]
                     trade_id = pos.get("trade_id")
@@ -817,7 +880,6 @@ class StrategyEngine:
                     if pnl is not None and pnl > 0:
                         self.profitable_today[self.straddle_symbol] = True
 
-                    # Remove position
                     self.positions.pop(self.straddle_symbol, None)
                     logging.info(f"[POSITION CLOSED] STRADDLE exit_price={combined_exit_price} pnl={pnl}")
                     break
@@ -825,13 +887,12 @@ class StrategyEngine:
         except Exception as e:
             logging.exception(f"Error in on_trade processing: {e}")
 
-
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     logging.info("[BOOT] Starting main…")
     fyers_client = FyersClient(CLIENT_ID, ACCESS_TOKEN, LOT_SIZE)
 
-    # 1) Wait until 9:16 AM (after first 1-minute candle closes) to fix ATM strike
+    # 1) Wait until 9:16 AM to decide ATM premium
     logging.info("Waiting for 9:16 AM to decide ATM premium…")
     while datetime.datetime.now().time() < ATM_DECISION_TIME:
         time.sleep(1)
@@ -846,8 +907,8 @@ if __name__ == "__main__":
 
     engine = StrategyEngine(fyers_client, LOT_SIZE, ce_symbol=ce_symbol, pe_symbol=pe_symbol)
 
-    # Prefill no-op for now (can be extended if you want historical EMAs)
-    engine.prefill_history(["STRADDLE"], days_back=1)
+    # Prefill STRADDLE history for EMA calculation
+    engine.prefill_history(days_back=1)
 
     # 2) Wait until trading start time for entries
     logging.info(f"Waiting for TRADING_START={TRADING_START} to begin processing candles…")
