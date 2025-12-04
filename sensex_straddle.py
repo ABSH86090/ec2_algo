@@ -19,8 +19,8 @@ LOT_SIZE = 20
 
 # We decide ATM at 9:16 (after first 1-minute close) and start entries at 9:25
 ATM_DECISION_TIME = datetime.time(9, 16)
-TRADING_START = datetime.time(9, 25)
-TRADING_END = datetime.time(14, 45)
+TRADING_START = datetime.time(9, 17)
+TRADING_END = datetime.time(14, 59)
 
 JOURNAL_FILE = "sensex_trades.csv"
 
