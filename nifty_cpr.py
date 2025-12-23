@@ -254,7 +254,7 @@ class NiftyCPRStrategy:
         if "S5" not in self.trades_taken[symbol]:
 
             # Phase 1: 30 mins below S1 & EMA26 < EMA50
-            if candle["high"] < cpr["S1"] and ema26 < ema50:
+            if candle["high"] < cpr["S1"] and candle["low"] > cpr["S2"] and ema26 < ema50:
                 self.s5_below_s1_count[symbol] += 1
             else:
                 self.s5_below_s1_count[symbol] = 0
@@ -274,10 +274,10 @@ class NiftyCPRStrategy:
             if (
                 self.s5_green_seen[symbol]
                 and red
-                and candle["high"] > ema26
-                and candle["high"] > ema50
-                and candle["low"] < ema26
-                and candle["low"] < ema50
+                and candle["open"] > ema26
+                and candle["open"] > ema50
+                and candle["close"] < ema26
+                and candle["close"] < ema50
                 and candle["close"] < cpr["S1"]
             ):
                 self.enter(symbol, "SELL", candle, "S5", rr=2, level_target=cpr["S2"])
