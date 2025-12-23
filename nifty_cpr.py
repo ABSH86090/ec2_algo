@@ -29,7 +29,8 @@ SCENARIO_3_END = datetime.time(14, 30)
 
 EMA_FAST = 5
 EMA_SLOW = 20
-EMA_MID = 50
+EMA_26 = 26
+EMA_50 = 50
 
 LOG_FILE = "nifty_cpr_option_strategy.log"
 
@@ -129,7 +130,6 @@ class FyersClient:
             "orderTag": self._tag(tag)
         })
 
-    # ---------- SL-L ONLY ----------
     def place_sl(self, symbol, side, trigger, tag):
         trigger = round_to_tick(trigger)
         limit_price = trigger + TICK_SIZE if side == 1 else trigger - TICK_SIZE
@@ -137,7 +137,7 @@ class FyersClient:
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
-            "type": 4,  # SL-L
+            "type": 4,
             "side": side,
             "stopPrice": trigger,
             "limitPrice": round_to_tick(limit_price),
@@ -145,9 +145,6 @@ class FyersClient:
             "validity": "DAY",
             "orderTag": self._tag(tag)
         })
-
-    def cancel(self, oid):
-        return self.client.cancel_order({"id": oid})
 
 # =========================================================
 # STRATEGY ENGINE
@@ -161,7 +158,10 @@ class NiftyCPRStrategy:
         self.trades_taken = defaultdict(set)
         self.first_candle_above_bc = {}
 
-    # ---------- INIT CPR ----------
+        # Scenario 5 state
+        self.s5_below_s1_count = defaultdict(int)
+        self.s5_green_seen = defaultdict(bool)
+
     def init_cpr(self, symbols):
         prev = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         for s in symbols:
@@ -177,12 +177,13 @@ class NiftyCPRStrategy:
                 _, o, hi, lo, c, _ = h["candles"][0]
                 self.cpr[s] = calculate_cpr(hi, lo, c)
 
-    # ---------- CANDLE ----------
     def on_candle(self, symbol, candle):
         self.candles[symbol].append(candle)
         closes = [c["close"] for c in self.candles[symbol]]
 
-        ema50 = ema(closes, EMA_MID)[-1]
+        ema26 = ema(closes, EMA_26)[-1]
+        ema50 = ema(closes, EMA_50)[-1]
+
         green = candle["close"] > candle["open"]
         red = candle["close"] < candle["open"]
         now = candle["time"].time()
@@ -195,27 +196,35 @@ class NiftyCPRStrategy:
         if symbol not in self.first_candle_above_bc:
             self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
-        # ---------- NO EMA EXIT ----------
+        # ---------- NO NEW ENTRY IF POSITION EXISTS ----------
         if symbol in self.positions:
             return
 
-        # ---------- SCENARIO 1 ----------
+        # =====================================================
+        # SCENARIO 1
+        # =====================================================
         if (
             "S1" not in self.trades_taken[symbol]
             and now <= SCENARIO_123_END
-            and green and candle["close"] > cpr["R1"]
+            and green
+            and candle["close"] > cpr["R1"]
         ):
-            self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
+            self.enter(symbol, "BUY", candle, "S1", rr=2, level_target=cpr["R2"])
 
-        # ---------- SCENARIO 2 ----------
+        # =====================================================
+        # SCENARIO 2
+        # =====================================================
         if (
             "S2" not in self.trades_taken[symbol]
             and now <= SCENARIO_123_END
-            and red and candle["close"] < cpr["S1"]
+            and red
+            and candle["close"] < cpr["S1"]
         ):
-            self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
+            self.enter(symbol, "SELL", candle, "S2", rr=2, level_target=cpr["S2"])
 
-        # ---------- SCENARIO 3 ----------
+        # =====================================================
+        # SCENARIO 3
+        # =====================================================
         if (
             "S3" not in self.trades_taken[symbol]
             and now <= SCENARIO_3_END
@@ -225,18 +234,59 @@ class NiftyCPRStrategy:
             and candle["high"] > ema50
             and candle["close"] < ema50
         ):
-            self.enter(symbol, "SELL", candle, "S3", 2, None)
+            self.enter(symbol, "SELL", candle, "S3", rr=2, level_target=None)
 
-        # ---------- SCENARIO 4 ----------
+        # =====================================================
+        # SCENARIO 4
+        # =====================================================
         if (
             "S4" not in self.trades_taken[symbol]
             and now <= SCENARIO_4_END
             and self.first_candle_above_bc.get(symbol)
-            and red and candle["close"] < cpr["BC"]
+            and red
+            and candle["close"] < cpr["BC"]
         ):
-            self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
+            self.enter(symbol, "SELL", candle, "S4", rr=2, level_target=cpr["S1"])
 
-    # ---------- ENTRY ----------
+        # =====================================================
+        # SCENARIO 5
+        # =====================================================
+        if "S5" not in self.trades_taken[symbol]:
+
+            # Phase 1: 30 mins below S1 & EMA26 < EMA50
+            if candle["high"] < cpr["S1"] and ema26 < ema50:
+                self.s5_below_s1_count[symbol] += 1
+            else:
+                self.s5_below_s1_count[symbol] = 0
+                self.s5_green_seen[symbol] = False
+
+            # Phase 2: Green candle above EMAs but below S1
+            if (
+                self.s5_below_s1_count[symbol] >= 2
+                and green
+                and candle["close"] > ema26
+                and candle["close"] > ema50
+                and candle["close"] < cpr["S1"]
+            ):
+                self.s5_green_seen[symbol] = True
+
+            # Phase 3: Red rejection candle
+            if (
+                self.s5_green_seen[symbol]
+                and red
+                and candle["high"] > ema26
+                and candle["high"] > ema50
+                and candle["low"] < ema26
+                and candle["low"] < ema50
+                and candle["close"] < cpr["S1"]
+            ):
+                self.enter(symbol, "SELL", candle, "S5", rr=2, level_target=cpr["S2"])
+                self.s5_green_seen[symbol] = False
+                self.s5_below_s1_count[symbol] = 0
+
+    # =====================================================
+    # ENTRY
+    # =====================================================
     def enter(self, symbol, side, candle, scenario, rr, level_target):
         entry = candle["close"]
         sl = candle["low"] if side == "BUY" else candle["high"]
@@ -253,10 +303,8 @@ class NiftyCPRStrategy:
                 else max(rr_target, level_target)
             )
 
-        # Entry
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
 
-        # Correct SL side
         sl_side = -1 if side == "BUY" else 1
         sl_resp = self.fyers.place_sl(symbol, sl_side, sl, f"{scenario}SL")
 
