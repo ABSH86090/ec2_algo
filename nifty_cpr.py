@@ -1,15 +1,13 @@
 import datetime
 import logging
 import os
-import csv
 import time
-import json
 import re
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersWebsocket import order_ws, data_ws
+from fyers_apiv3.FyersWebsocket import data_ws
 
 # =========================================================
 # CONFIG
@@ -38,9 +36,6 @@ LOG_FILE = "nifty_cpr_option_strategy.log"
 # =========================================================
 # LOGGING
 # =========================================================
-for h in logging.root.handlers[:]:
-    logging.root.removeHandler(h)
-
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -92,14 +87,7 @@ def format_expiry(expiry):
     yy = expiry.strftime("%y")
     m = expiry.month
     d = expiry.day
-    if m == 10:
-        mt = "O"
-    elif m == 11:
-        mt = "N"
-    elif m == 12:
-        mt = "D"
-    else:
-        mt = f"{m:02d}"
+    mt = {10: "O", 11: "N", 12: "D"}.get(m, f"{m:02d}")
     return f"{yy}{mt}{d:02d}"
 
 def get_atm_nifty_symbols(fyers):
@@ -130,35 +118,29 @@ class FyersClient:
     def _tag(self, tag):
         return re.sub(r"[^A-Za-z0-9]", "", tag)[:20]
 
-    def market_buy(self, symbol, tag):
+    def market(self, symbol, side, tag):
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
             "type": 2,
-            "side": 1,
+            "side": side,
             "productType": "INTRADAY",
             "validity": "DAY",
             "orderTag": self._tag(tag)
         })
 
-    def market_sell(self, symbol, tag):
-        return self.client.place_order({
-            "symbol": symbol,
-            "qty": LOT_SIZE,
-            "type": 2,
-            "side": -1,
-            "productType": "INTRADAY",
-            "validity": "DAY",
-            "orderTag": self._tag(tag)
-        })
+    # ---------- SL-L ONLY ----------
+    def place_sl(self, symbol, side, trigger, tag):
+        trigger = round_to_tick(trigger)
+        limit_price = trigger + TICK_SIZE if side == 1 else trigger - TICK_SIZE
 
-    def sl_sell(self, symbol, sl, tag):
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
-            "type": 3,
-            "side": -1,
-            "stopPrice": round_to_tick(sl),
+            "type": 4,  # SL-L
+            "side": side,
+            "stopPrice": trigger,
+            "limitPrice": round_to_tick(limit_price),
             "productType": "INTRADAY",
             "validity": "DAY",
             "orderTag": self._tag(tag)
@@ -177,8 +159,9 @@ class NiftyCPRStrategy:
         self.cpr = {}
         self.positions = {}
         self.trades_taken = defaultdict(set)
+        self.first_candle_above_bc = {}
 
-    # ---------- PREFILL CPR ----------
+    # ---------- INIT CPR ----------
     def init_cpr(self, symbols):
         prev = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         for s in symbols:
@@ -193,18 +176,13 @@ class NiftyCPRStrategy:
             if h.get("candles"):
                 _, o, hi, lo, c, _ = h["candles"][0]
                 self.cpr[s] = calculate_cpr(hi, lo, c)
-                logger.info(f"CPR {s}: {self.cpr[s]}")
 
     # ---------- CANDLE ----------
     def on_candle(self, symbol, candle):
         self.candles[symbol].append(candle)
-        candles = list(self.candles[symbol])
+        closes = [c["close"] for c in self.candles[symbol]]
 
-        closes = [c["close"] for c in candles]
-        ema5 = ema(closes, EMA_FAST)[-1]
-        ema20 = ema(closes, EMA_SLOW)[-1]
         ema50 = ema(closes, EMA_MID)[-1]
-
         green = candle["close"] > candle["open"]
         red = candle["close"] < candle["open"]
         now = candle["time"].time()
@@ -213,15 +191,12 @@ class NiftyCPRStrategy:
         if not cpr:
             return
 
-        # ---------- EXIT ----------
+        # ---------- FIRST CANDLE BC CHECK ----------
+        if symbol not in self.first_candle_above_bc:
+            self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
+
+        # ---------- NO EMA EXIT ----------
         if symbol in self.positions:
-            scenario = self.positions[symbol]["scenario"]
-            if scenario != "S3":
-                if (
-                    (red and candle["close"] < ema5 and candle["close"] < ema20) or
-                    (green and candle["close"] > ema5 and candle["close"] > ema20)
-                ):
-                    self.exit(symbol, "EMAEXIT")
             return
 
         # ---------- SCENARIO 1 ----------
@@ -250,12 +225,13 @@ class NiftyCPRStrategy:
             and candle["high"] > ema50
             and candle["close"] < ema50
         ):
-            self.enter(symbol, "SELL", candle, "S3", rr=2, level_target=None)
+            self.enter(symbol, "SELL", candle, "S3", 2, None)
 
         # ---------- SCENARIO 4 ----------
         if (
             "S4" not in self.trades_taken[symbol]
             and now <= SCENARIO_4_END
+            and self.first_candle_above_bc.get(symbol)
             and red and candle["close"] < cpr["BC"]
         ):
             self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
@@ -266,17 +242,23 @@ class NiftyCPRStrategy:
         sl = candle["low"] if side == "BUY" else candle["high"]
         risk = abs(entry - sl)
 
-        target = entry + rr * risk if side == "BUY" else entry - rr * risk
-        final_target = target if level_target is None else (
-            max(target, level_target) if side == "BUY" else min(target, level_target)
-        )
+        rr_target = entry + rr * risk if side == "BUY" else entry - rr * risk
 
-        if side == "BUY":
-            self.fyers.market_buy(symbol, f"{scenario}ENTRY")
+        if level_target is None:
+            final_target = rr_target
         else:
-            self.fyers.market_sell(symbol, f"{scenario}ENTRY")
+            final_target = (
+                min(rr_target, level_target)
+                if side == "BUY"
+                else max(rr_target, level_target)
+            )
 
-        sl_resp = self.fyers.sl_sell(symbol, sl, f"{scenario}SL")
+        # Entry
+        self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
+
+        # Correct SL side
+        sl_side = -1 if side == "BUY" else 1
+        sl_resp = self.fyers.place_sl(symbol, sl_side, sl, f"{scenario}SL")
 
         self.positions[symbol] = {
             "side": side,
@@ -290,26 +272,6 @@ class NiftyCPRStrategy:
         logger.info(
             f"{scenario} {side} {symbol} ENTRY={entry} SL={sl} TARGET={final_target}"
         )
-
-    # ---------- EXIT ----------
-    def exit(self, symbol, reason):
-        pos = self.positions.get(symbol)
-        if not pos:
-            return
-
-        try:
-            if pos.get("sl_id"):
-                self.fyers.cancel(pos["sl_id"])
-        except Exception as e:
-            logger.warning(f"SL cancel failed {symbol}: {e}")
-
-        if pos["side"] == "BUY":
-            self.fyers.market_sell(symbol, f"{reason}EXIT")
-        else:
-            self.fyers.market_buy(symbol, f"{reason}EXIT")
-
-        logger.info(f"EXIT {symbol} {reason}")
-        del self.positions[symbol]
 
 # =========================================================
 # MAIN
@@ -357,4 +319,5 @@ if __name__ == "__main__":
         on_message=on_message,
         log_path=""
     )
+
     fyers_ws.connect()
