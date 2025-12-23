@@ -234,7 +234,7 @@ class NiftyCPRStrategy:
             and candle["high"] > ema50
             and candle["close"] < ema50
         ):
-            self.enter(symbol, "SELL", candle, "S3", rr=2, level_target=None)
+            self.enter(symbol, "SELL", candle, "S3", rr=2, level_target=cpr["TC"])
 
         # =====================================================
         # SCENARIO 4
