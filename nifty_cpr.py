@@ -229,9 +229,9 @@ class NiftyCPRStrategy:
             "S3" not in self.trades_taken[symbol]
             and now <= SCENARIO_3_END
             and red
-            and candle["high"] > cpr["R1"]
+            and candle["open"] > cpr["R1"]
             and candle["close"] < cpr["R1"]
-            and candle["high"] > ema50
+            and candle["open"] > ema50
             and candle["close"] < ema50
         ):
             self.enter(symbol, "SELL", candle, "S3", rr=2, level_target=cpr["TC"])
