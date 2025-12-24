@@ -263,6 +263,11 @@ class NiftyCPRStrategy:
         entry = candle["close"]
         sl = candle["low"] if side == "BUY" else candle["high"]
         risk = abs(entry - sl)
+        if risk > 10:
+            logger.info(
+                f"[SKIP] {scenario} {symbol} | SL_POINTS={risk:.2f} > 10"
+            )
+            return
         target = min(entry + rr * risk, level_target) if side == "BUY" else max(entry - rr * risk, level_target)
 
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
