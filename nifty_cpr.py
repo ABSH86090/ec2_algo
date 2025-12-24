@@ -17,7 +17,7 @@ load_dotenv()
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 
-LOT_SIZE = 150
+LOT_SIZE = 300
 TICK_SIZE = 0.05
 
 TRADING_START = datetime.time(9, 15)
@@ -75,7 +75,7 @@ def calculate_cpr(h, l, c):
     }
 
 # =========================================================
-# NIFTY EXPIRY & ATM SYMBOL (TUESDAY)
+# NIFTY EXPIRY & ATM SYMBOL
 # =========================================================
 def is_last_tuesday(date_obj):
     return date_obj.weekday() == 1 and (date_obj + datetime.timedelta(days=7)).month != date_obj.month
@@ -94,18 +94,10 @@ def format_nifty_expiry(expiry):
 
 def get_atm_nifty_symbols(fyers):
     resp = fyers.client.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-    if not resp.get("d"):
-        raise Exception("Failed to fetch NIFTY spot price")
-
     ltp = float(resp["d"][0]["v"]["lp"])
     atm = round(ltp / 50) * 50
-
     expiry = format_nifty_expiry(get_next_nifty_expiry())
-    ce = f"NSE:NIFTY{expiry}{atm}CE"
-    pe = f"NSE:NIFTY{expiry}{atm}PE"
-
-    logger.info(f"[ATM SYMBOLS] CE={ce}, PE={pe}")
-    return [ce, pe]
+    return [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
 
 # =========================================================
 # FYERS CLIENT
@@ -165,13 +157,12 @@ class NiftyCPRStrategy:
         self.s5_below_s1_count = defaultdict(int)
         self.s5_green_seen = defaultdict(bool)
 
-        # >>> NEW : Scenario 6 trackers
+        # -------- Scenario 6 trackers --------
         self.s6_green_count = defaultdict(int)
         self.s6_lows = defaultdict(list)
 
     def init_cpr(self, symbols):
         prev = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
         for s in symbols:
             h = self.fyers.client.history({
                 "symbol": s,
@@ -181,19 +172,9 @@ class NiftyCPRStrategy:
                 "range_to": prev,
                 "cont_flag": "1"
             })
-
-            if not h.get("candles"):
-                continue
-
-            _, o, hi, lo, c, _ = h["candles"][0]
-            levels = calculate_cpr(hi, lo, c)
-            self.cpr[s] = levels
-
-            logger.info(
-                f"[CPR INIT] {s} | TC={levels['TC']:.2f} BC={levels['BC']:.2f} "
-                f"R1={levels['R1']:.2f} R2={levels['R2']:.2f} "
-                f"S1={levels['S1']:.2f} S2={levels['S2']:.2f}"
-            )
+            if h.get("candles"):
+                _, _, hi, lo, c, _ = h["candles"][0]
+                self.cpr[s] = calculate_cpr(hi, lo, c)
 
     def on_candle(self, symbol, candle):
         self.candles[symbol].append(candle)
@@ -254,44 +235,35 @@ class NiftyCPRStrategy:
             if self.s5_below_s1_count[symbol] >= 2 and green and candle["close"] > ema26 and candle["close"] > ema50 and candle["close"] < cpr["S1"]:
                 self.s5_green_seen[symbol] = True
 
-            if (
-                self.s5_green_seen[symbol]
-                and red
-                and candle["open"] > ema26
-                and candle["open"] > ema50
-                and candle["close"] < ema26
-                and candle["close"] < ema50
-                and candle["close"] < cpr["S1"]
-            ):
+            if self.s5_green_seen[symbol] and red and candle["close"] < ema26 and candle["close"] < ema50:
                 self.enter(symbol, "SELL", candle, "S5", 2, cpr["S2"])
                 self.s5_green_seen[symbol] = False
                 self.s5_below_s1_count[symbol] = 0
 
-        # ---------------- S6 (NEW) ----------------
-        if "S6" not in self.trades_taken[symbol]:
-            if green and cpr["S2"] < candle["close"] < cpr["S1"]:
-                self.s6_green_count[symbol] += 1
-                self.s6_lows[symbol].append(candle["low"])
-            else:
-                self.s6_green_count[symbol] = 0
-                self.s6_lows[symbol] = []
+        # ---------------- S6 (MULTIPLE TRADES ALLOWED) ----------------
+        if green and cpr["S2"] < candle["close"] < cpr["S1"]:
+            self.s6_green_count[symbol] += 1
+            self.s6_lows[symbol].append(candle["low"])
+        else:
+            self.s6_green_count[symbol] = 0
+            self.s6_lows[symbol] = []
 
-            if self.s6_green_count[symbol] == 3:
-                self.enter(
-                    symbol,
-                    "BUY",
-                    candle,
-                    "S6",
-                    2,
-                    None,
-                    custom_sl=min(self.s6_lows[symbol])
-                )
-                self.s6_green_count[symbol] = 0
-                self.s6_lows[symbol] = []
+        if self.s6_green_count[symbol] == 3:
+            self.enter(
+                symbol,
+                "BUY",
+                candle,
+                "S6",
+                2,
+                None,
+                custom_sl=min(self.s6_lows[symbol])
+            )
+            self.s6_green_count[symbol] = 0
+            self.s6_lows[symbol] = []
 
     def enter(self, symbol, side, candle, scenario, rr, level_target=None, custom_sl=None):
         entry = candle["close"]
-        sl = custom_sl if custom_sl is not None else (
+        sl = custom_sl if custom_sl else (
             candle["low"] if side == "BUY" else candle["high"]
         )
 
@@ -314,7 +286,10 @@ class NiftyCPRStrategy:
         self.fyers.place_sl(symbol, -1 if side == "BUY" else 1, sl, f"{scenario}SL")
 
         self.positions[symbol] = {"side": side, "target": target}
-        self.trades_taken[symbol].add(scenario)
+
+        # ⛔ Do NOT block S6 for future trades
+        if scenario != "S6":
+            self.trades_taken[symbol].add(scenario)
 
         logger.info(f"{scenario} {side} {symbol} ENTRY={entry} SL={sl} TARGET={target}")
 
@@ -342,13 +317,7 @@ if __name__ == "__main__":
         if c is None or c["time"] != t:
             if c:
                 engine.on_candle(symbol, c)
-            candle_buffers[symbol] = {
-                "time": t,
-                "open": ltp,
-                "high": ltp,
-                "low": ltp,
-                "close": ltp
-            }
+            candle_buffers[symbol] = {"time": t, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
         else:
             c["high"] = max(c["high"], ltp)
             c["low"] = min(c["low"], ltp)
