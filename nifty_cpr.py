@@ -77,30 +77,65 @@ def calculate_cpr(h, l, c):
     }
 
 # =========================================================
-# NIFTY EXPIRY & ATM SYMBOL
+# NIFTY EXPIRY & ATM SYMBOL (TUESDAY EXPIRY)
 # =========================================================
+def is_last_tuesday(date_obj: datetime.date) -> bool:
+    if date_obj.weekday() != 1:  # Tuesday
+        return False
+    next_week = date_obj + datetime.timedelta(days=7)
+    return next_week.month != date_obj.month
+
+
 def get_next_nifty_expiry():
     today = datetime.date.today()
-    wd = today.weekday()  # Tue = 1
-    return today + datetime.timedelta(days=(1 - wd) % 7)
+    weekday = today.weekday()
 
-def format_expiry(expiry):
-    yy = expiry.strftime("%y")
-    m = expiry.month
-    d = expiry.day
-    mt = {10: "O", 11: "N", 12: "D"}.get(m, f"{m:02d}")
-    return f"{yy}{mt}{d:02d}"
+    if weekday == 1:  # Tuesday
+        return today
+
+    days_to_tue = (1 - weekday) % 7
+    return today + datetime.timedelta(days=days_to_tue)
+
+
+def format_nifty_expiry(expiry_date: datetime.date) -> str:
+    yy = expiry_date.strftime("%y")
+
+    # Monthly expiry (last Tuesday)
+    if is_last_tuesday(expiry_date):
+        mon = expiry_date.strftime("%b").upper()
+        return f"{yy}{mon}"
+
+    # Weekly expiry
+    m = expiry_date.month
+    d = expiry_date.day
+
+    if m == 10:
+        m_token = "O"
+    elif m == 11:
+        m_token = "N"
+    elif m == 12:
+        m_token = "D"
+    else:
+        m_token = f"{m:02d}"
+
+    return f"{yy}{m_token}{d:02d}"
+
 
 def get_atm_nifty_symbols(fyers):
-    q = fyers.client.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-    ltp = float(q["d"][0]["v"]["lp"])
+    resp = fyers.client.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+    if not resp.get("d"):
+        raise Exception(f"Failed to fetch NIFTY spot: {resp}")
+
+    ltp = float(resp["d"][0]["v"]["lp"])
     atm = round(ltp / 50) * 50
 
-    expiry = format_expiry(get_next_nifty_expiry())
-    ce = f"NSE:NIFTY{expiry}{atm}CE"
-    pe = f"NSE:NIFTY{expiry}{atm}PE"
+    expiry_date = get_next_nifty_expiry()
+    expiry_str = format_nifty_expiry(expiry_date)
 
-    logger.info(f"ATM Symbols: {ce}, {pe}")
+    ce = f"NSE:NIFTY{expiry_str}{atm}CE"
+    pe = f"NSE:NIFTY{expiry_str}{atm}PE"
+
+    logger.info(f"[ATM SYMBOLS] CE={ce}, PE={pe}")
     return [ce, pe]
 
 # =========================================================
@@ -158,7 +193,6 @@ class NiftyCPRStrategy:
         self.trades_taken = defaultdict(set)
         self.first_candle_above_bc = {}
 
-        # Scenario 5 state
         self.s5_below_s1_count = defaultdict(int)
         self.s5_green_seen = defaultdict(bool)
 
@@ -192,39 +226,31 @@ class NiftyCPRStrategy:
         if not cpr:
             return
 
-        # ---------- FIRST CANDLE BC CHECK ----------
         if symbol not in self.first_candle_above_bc:
             self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
-        # ---------- NO NEW ENTRY IF POSITION EXISTS ----------
         if symbol in self.positions:
             return
 
-        # =====================================================
-        # SCENARIO 1
-        # =====================================================
+        # ---------- SCENARIO 1 ----------
         if (
             "S1" not in self.trades_taken[symbol]
             and now <= SCENARIO_123_END
             and green
             and candle["close"] > cpr["R1"]
         ):
-            self.enter(symbol, "BUY", candle, "S1", rr=2, level_target=cpr["R2"])
+            self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
 
-        # =====================================================
-        # SCENARIO 2
-        # =====================================================
+        # ---------- SCENARIO 2 ----------
         if (
             "S2" not in self.trades_taken[symbol]
             and now <= SCENARIO_123_END
             and red
             and candle["close"] < cpr["S1"]
         ):
-            self.enter(symbol, "SELL", candle, "S2", rr=2, level_target=cpr["S2"])
+            self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
 
-        # =====================================================
-        # SCENARIO 3
-        # =====================================================
+        # ---------- SCENARIO 3 ----------
         if (
             "S3" not in self.trades_taken[symbol]
             and now <= SCENARIO_3_END
@@ -234,11 +260,9 @@ class NiftyCPRStrategy:
             and candle["open"] > ema50
             and candle["close"] < ema50
         ):
-            self.enter(symbol, "SELL", candle, "S3", rr=2, level_target=cpr["TC"])
+            self.enter(symbol, "SELL", candle, "S3", 2, cpr["TC"])
 
-        # =====================================================
-        # SCENARIO 4
-        # =====================================================
+        # ---------- SCENARIO 4 ----------
         if (
             "S4" not in self.trades_taken[symbol]
             and now <= SCENARIO_4_END
@@ -246,21 +270,17 @@ class NiftyCPRStrategy:
             and red
             and candle["close"] < cpr["BC"]
         ):
-            self.enter(symbol, "SELL", candle, "S4", rr=2, level_target=cpr["S1"])
+            self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
 
-        # =====================================================
-        # SCENARIO 5
-        # =====================================================
+        # ---------- SCENARIO 5 ----------
         if "S5" not in self.trades_taken[symbol]:
 
-            # Phase 1: 30 mins below S1 & EMA26 < EMA50
             if candle["high"] < cpr["S1"] and candle["low"] > cpr["S2"] and ema26 < ema50:
                 self.s5_below_s1_count[symbol] += 1
             else:
                 self.s5_below_s1_count[symbol] = 0
                 self.s5_green_seen[symbol] = False
 
-            # Phase 2: Green candle above EMAs but below S1
             if (
                 self.s5_below_s1_count[symbol] >= 2
                 and green
@@ -270,7 +290,6 @@ class NiftyCPRStrategy:
             ):
                 self.s5_green_seen[symbol] = True
 
-            # Phase 3: Red rejection candle
             if (
                 self.s5_green_seen[symbol]
                 and red
@@ -280,46 +299,27 @@ class NiftyCPRStrategy:
                 and candle["close"] < ema50
                 and candle["close"] < cpr["S1"]
             ):
-                self.enter(symbol, "SELL", candle, "S5", rr=2, level_target=cpr["S2"])
+                self.enter(symbol, "SELL", candle, "S5", 2, cpr["S2"])
                 self.s5_green_seen[symbol] = False
                 self.s5_below_s1_count[symbol] = 0
 
-    # =====================================================
-    # ENTRY
-    # =====================================================
     def enter(self, symbol, side, candle, scenario, rr, level_target):
         entry = candle["close"]
         sl = candle["low"] if side == "BUY" else candle["high"]
         risk = abs(entry - sl)
 
         rr_target = entry + rr * risk if side == "BUY" else entry - rr * risk
-
-        if level_target is None:
-            final_target = rr_target
-        else:
-            final_target = (
-                min(rr_target, level_target)
-                if side == "BUY"
-                else max(rr_target, level_target)
-            )
+        final_target = min(rr_target, level_target) if side == "BUY" else max(rr_target, level_target)
 
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
 
         sl_side = -1 if side == "BUY" else 1
-        sl_resp = self.fyers.place_sl(symbol, sl_side, sl, f"{scenario}SL")
+        self.fyers.place_sl(symbol, sl_side, sl, f"{scenario}SL")
 
-        self.positions[symbol] = {
-            "side": side,
-            "sl_id": sl_resp.get("id"),
-            "target": final_target,
-            "scenario": scenario
-        }
-
+        self.positions[symbol] = {"side": side, "target": final_target}
         self.trades_taken[symbol].add(scenario)
 
-        logger.info(
-            f"{scenario} {side} {symbol} ENTRY={entry} SL={sl} TARGET={final_target}"
-        )
+        logger.info(f"{scenario} {side} {symbol} ENTRY={entry} SL={sl} TARGET={final_target}")
 
 # =========================================================
 # MAIN
