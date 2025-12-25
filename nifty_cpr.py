@@ -17,7 +17,7 @@ load_dotenv()
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 
-LOT_SIZE = 150
+LOT_SIZE = 300
 TICK_SIZE = 0.05
 
 TRADING_START = datetime.time(9, 15)
@@ -144,14 +144,6 @@ class FyersClient:
     def cancel_order(self, order_id):
         return self.client.cancel_order({"id": order_id})
 
-    def modify_sl(self, order_id, new_trigger):
-        new_trigger = round_to_tick(new_trigger)
-        return self.client.modify_order({
-            "id": order_id,
-            "stopPrice": new_trigger,
-            "limitPrice": round_to_tick(new_trigger + TICK_SIZE)
-        })
-
 # =========================================================
 # STRATEGY ENGINE
 # =========================================================
@@ -166,9 +158,6 @@ class NiftyCPRStrategy:
         self.first_candle_above_bc = {}
         self.s5_below_s1_count = defaultdict(int)
         self.s5_green_seen = defaultdict(bool)
-
-        self.s6_green_count = defaultdict(int)
-        self.s6_lows = defaultdict(list)
 
     def init_cpr(self, symbols):
         prev = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -203,24 +192,25 @@ class NiftyCPRStrategy:
         if symbol not in self.first_candle_above_bc:
             self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
-        # ---- S1 to S5 unchanged ----
+        # ---------------- S1 ----------------
         if "S1" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and green and candle["close"] > cpr["R1"]:
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
 
+        # ---------------- S2 ----------------
         if "S2" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and red and candle["close"] < cpr["S1"]:
             self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
 
+        # ---------------- S3 ----------------
         if (
             "S3" not in self.trades_taken[symbol]
             and now <= SCENARIO_3_END
             and red
             and candle["open"] > cpr["R1"]
             and candle["close"] < cpr["R1"]
-            and candle["open"] > ema50
-            and candle["close"] < ema50
         ):
-            self.enter(symbol, "SELL", candle, "S3", 2, cpr["TC"])
+            self.enter(symbol, "SELL", candle, "S3", 5, cpr["TC"])
 
+        # ---------------- S4 ----------------
         if (
             "S4" not in self.trades_taken[symbol]
             and now <= SCENARIO_4_END
@@ -230,6 +220,7 @@ class NiftyCPRStrategy:
         ):
             self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
 
+        # ---------------- S5 ----------------
         if "S5" not in self.trades_taken[symbol]:
             if candle["high"] < cpr["S1"] and candle["low"] > cpr["S2"] and ema26 < ema50:
                 self.s5_below_s1_count[symbol] += 1
@@ -245,43 +236,29 @@ class NiftyCPRStrategy:
                 self.s5_green_seen[symbol] = False
                 self.s5_below_s1_count[symbol] = 0
 
-        # ---- S6 ----
-        if green and cpr["S2"] < candle["close"] < cpr["S1"]:
-            self.s6_green_count[symbol] += 1
-            self.s6_lows[symbol].append(candle["low"])
-        else:
-            self.s6_green_count[symbol] = 0
-            self.s6_lows[symbol] = []
-
-        if self.s6_green_count[symbol] == 3:
-            self.enter(symbol, "BUY", candle, "S6", 2, None, min(self.s6_lows[symbol]))
-            self.s6_green_count[symbol] = 0
-            self.s6_lows[symbol] = []
-
-    def enter(self, symbol, side, candle, scenario, rr, level_target=None, custom_sl=None):
+    def enter(self, symbol, side, candle, scenario, rr, level_target):
         entry = candle["close"]
-        sl = custom_sl if custom_sl else (candle["low"] if side == "BUY" else candle["high"])
+        sl = candle["low"] if side == "BUY" else candle["high"]
         risk = abs(entry - sl)
-        if risk > 10:
+        if risk > 15:
             return
 
-        target = entry + rr * risk if side == "BUY" else entry - rr * risk
+        target = (
+            min(entry + rr * risk, level_target)
+            if side == "BUY"
+            else max(entry - rr * risk, level_target)
+        )
 
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
         sl_resp = self.fyers.place_sl(symbol, -1 if side == "BUY" else 1, sl, f"{scenario}SL")
 
         self.positions[symbol] = {
             "side": side,
-            "scenario": scenario,
-            "entry": entry,
-            "risk": risk,
             "target": target,
-            "sl_order_id": sl_resp.get("id"),
-            "be_done": False
+            "sl_order_id": sl_resp.get("id")
         }
 
-        if scenario != "S6":
-            self.trades_taken[symbol].add(scenario)
+        self.trades_taken[symbol].add(scenario)
 
     def on_tick(self, symbol, ltp):
         if symbol not in self.positions:
@@ -289,16 +266,9 @@ class NiftyCPRStrategy:
 
         pos = self.positions[symbol]
         side = pos["side"]
-        scenario = pos["scenario"]
+        target = pos["target"]
 
-        # ---- S6: Breakeven at 1R ----
-        if scenario == "S6" and not pos["be_done"]:
-            if side == "BUY" and ltp >= pos["entry"] + pos["risk"]:
-                self.fyers.modify_sl(pos["sl_order_id"], pos["entry"])
-                pos["be_done"] = True
-
-        # ---- Target exit (ALL) ----
-        if (side == "BUY" and ltp >= pos["target"]) or (side == "SELL" and ltp <= pos["target"]):
+        if (side == "BUY" and ltp >= target) or (side == "SELL" and ltp <= target):
             self.fyers.cancel_order(pos["sl_order_id"])
             self.fyers.market(symbol, -1 if side == "BUY" else 1, "TARGETEXIT")
             del self.positions[symbol]
