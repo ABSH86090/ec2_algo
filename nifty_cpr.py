@@ -17,7 +17,7 @@ load_dotenv()
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 
-LOT_SIZE = 300
+LOT_SIZE = 150
 TICK_SIZE = 0.05
 
 TRADING_START = datetime.time(9, 15)
