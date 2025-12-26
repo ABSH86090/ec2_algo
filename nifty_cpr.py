@@ -255,6 +255,7 @@ class NiftyCPRStrategy:
             "S1" not in self.trades_taken[symbol]
             and now <= SCENARIO_1_END
             and green
+            and candle["low"] <= cpr["R1"] - R1_BUFFER
             and candle["close"] >= cpr["R1"] + R1_BUFFER
         ):
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
