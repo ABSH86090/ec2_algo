@@ -12,14 +12,12 @@ from fyers_apiv3.FyersWebsocket import data_ws
 # =========================================================
 # CONFIG
 # =========================================================
-DEBUG_LOGS = True
-
 load_dotenv()
 
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 
-LOT_SIZE = 300
+LOT_SIZE = 150
 TICK_SIZE = 0.05
 
 TRADING_START = datetime.time(9, 15)
@@ -33,6 +31,8 @@ EMA_26 = 26
 EMA_50 = 50
 
 LOG_FILE = "nifty_cpr_option_strategy.log"
+
+MAX_CPR_LOOKBACK_DAYS = 10   # handles holidays / long weekends
 
 # =========================================================
 # LOGGING
@@ -76,6 +76,43 @@ def calculate_cpr(h, l, c):
         "S2": p - (h - l),
     }
 
+def get_last_trading_day_candle(fyers, symbol):
+    today = datetime.date.today()
+    logger.info(f"[CPR] Searching last trading day for {symbol}")
+
+    for i in range(1, MAX_CPR_LOOKBACK_DAYS + 1):
+        check_date = today - datetime.timedelta(days=i)
+        date_str = check_date.strftime("%Y-%m-%d")
+
+        logger.info(f"[CPR] Checking DAILY candle for {date_str}")
+
+        try:
+            h = fyers.client.history({
+                "symbol": symbol,
+                "resolution": "D",
+                "date_format": "1",
+                "range_from": date_str,
+                "range_to": date_str,
+                "cont_flag": "1"
+            })
+        except Exception as e:
+            logger.error(f"[CPR] History API error on {date_str}: {e}")
+            continue
+
+        candles = h.get("candles", [])
+        if candles:
+            _, _, high, low, close, _ = candles[0]
+            logger.info(
+                f"[CPR] Using trading day {date_str} "
+                f"H={high} L={low} C={close}"
+            )
+            return check_date, high, low, close
+
+        logger.info(f"[CPR] No candle on {date_str} (holiday/weekend)")
+
+    logger.error(f"[CPR] Failed to find trading day in last {MAX_CPR_LOOKBACK_DAYS} days")
+    return None, None, None, None
+
 # =========================================================
 # NIFTY EXPIRY & ATM SYMBOL
 # =========================================================
@@ -99,16 +136,9 @@ def get_atm_nifty_symbols(fyers):
     ltp = float(resp["d"][0]["v"]["lp"])
     atm = round(ltp / 50) * 50
     expiry = format_nifty_expiry(get_next_nifty_expiry())
-
-    ce = f"NSE:NIFTY{expiry}{atm}CE"
-    pe = f"NSE:NIFTY{expiry}{atm}PE"
-
-    logger.info(
-        f"[SYMBOL INIT] SPOT={ltp:.2f} ATM={atm} "
-        f"CE={ce} PE={pe}"
-    )
-
-    return [ce, pe]
+    symbols = [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
+    logger.info(f"[SYMBOL] ATM Symbols: {symbols}")
+    return symbols
 
 # =========================================================
 # FYERS CLIENT
@@ -127,6 +157,7 @@ class FyersClient:
         return re.sub(r"[^A-Za-z0-9]", "", tag)[:20]
 
     def market(self, symbol, side, tag):
+        logger.info(f"[ORDER] MARKET {symbol} side={side} tag={tag}")
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
@@ -140,6 +171,7 @@ class FyersClient:
     def place_sl(self, symbol, side, trigger, tag):
         trigger = round_to_tick(trigger)
         limit_price = trigger + TICK_SIZE if side == 1 else trigger - TICK_SIZE
+        logger.info(f"[ORDER] SL {symbol} trigger={trigger} side={side}")
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
@@ -153,6 +185,7 @@ class FyersClient:
         })
 
     def cancel_order(self, order_id):
+        logger.info(f"[ORDER] Cancel SL order {order_id}")
         return self.client.cancel_order({"id": order_id})
 
 # =========================================================
@@ -171,35 +204,32 @@ class NiftyCPRStrategy:
         self.s5_green_seen = defaultdict(bool)
 
     def init_cpr(self, symbols):
-        prev = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info("========== CPR INITIALIZATION START ==========")
 
-        for s in symbols:
-            h = self.fyers.client.history({
-                "symbol": s,
-                "resolution": "D",
-                "date_format": "1",
-                "range_from": prev,
-                "range_to": prev,
-                "cont_flag": "1"
-            })
-
-            if not h.get("candles"):
-                logger.warning(f"[CPR INIT] No data for {s}")
+        for symbol in symbols:
+            trade_date, h, l, c = get_last_trading_day_candle(self.fyers, symbol)
+            if not trade_date:
                 continue
 
-            _, _, hi, lo, c, _ = h["candles"][0]
-            levels = calculate_cpr(hi, lo, c)
-            self.cpr[s] = levels
+            levels = calculate_cpr(h, l, c)
+            self.cpr[symbol] = levels
 
             logger.info(
-                f"[CPR INIT] {s} "
-                f"H={hi:.2f} L={lo:.2f} C={c:.2f} | "
-                f"TC={levels['TC']:.2f} BC={levels['BC']:.2f} | "
-                f"R1={levels['R1']:.2f} R2={levels['R2']:.2f} | "
-                f"S1={levels['S1']:.2f} S2={levels['S2']:.2f}"
+                f"[CPR] {symbol} | Date={trade_date} | "
+                f"TC={round(levels['TC'],2)} BC={round(levels['BC'],2)} "
+                f"R1={round(levels['R1'],2)} R2={round(levels['R2'],2)} "
+                f"S1={round(levels['S1'],2)} S2={round(levels['S2'],2)}"
             )
 
+        logger.info("========== CPR INITIALIZATION END ==========")
+
     def on_candle(self, symbol, candle):
+        logger.debug(
+            f"[CANDLE] {symbol} {candle['time']} "
+            f"O={candle['open']} H={candle['high']} "
+            f"L={candle['low']} C={candle['close']}"
+        )
+
         self.candles[symbol].append(candle)
         closes = [c["close"] for c in self.candles[symbol]]
 
@@ -214,62 +244,62 @@ class NiftyCPRStrategy:
         if not cpr or symbol in self.positions:
             return
 
-        if DEBUG_LOGS:
-            logger.info(
-                f"[BAR CLOSE] {symbol} "
-                f"O={candle['open']:.2f} H={candle['high']:.2f} "
-                f"L={candle['low']:.2f} C={candle['close']:.2f} | "
-                f"EMA26={ema26:.2f} EMA50={ema50:.2f}"
-            )
+        if symbol not in self.first_candle_above_bc:
+            self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
-        # =======================
-        # SCENARIO 1
-        # =======================
-        if "S1" in self.trades_taken[symbol]:
-            logger.info("[S1 SKIP] Already traded")
-        elif now > SCENARIO_123_END:
-            logger.info("[S1 SKIP] Time window over")
-        elif not green:
-            logger.info("[S1 SKIP] Candle not green")
-        elif candle["close"] <= cpr["R1"]:
-            logger.info(f"[S1 SKIP] Close <= R1 ({candle['close']:.2f} <= {cpr['R1']:.2f})")
-        else:
+        # -------- SCENARIOS (unchanged logic) --------
+        if "S1" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and green and candle["close"] > cpr["R1"]:
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
-            return
 
-        # =======================
-        # SCENARIO 2
-        # =======================
-        if "S2" in self.trades_taken[symbol]:
-            logger.info("[S2 SKIP] Already traded")
-        elif now > SCENARIO_123_END:
-            logger.info("[S2 SKIP] Time window over")
-        elif not red:
-            logger.info("[S2 SKIP] Candle not red")
-        elif candle["close"] >= cpr["S1"]:
-            logger.info(f"[S2 SKIP] Close >= S1 ({candle['close']:.2f} >= {cpr['S1']:.2f})")
-        else:
+        if "S2" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and red and candle["close"] < cpr["S1"]:
             self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
-            return
 
-        logger.info(f"[NO TRADE] {symbol} No scenario met")
+        if (
+            "S3" not in self.trades_taken[symbol]
+            and now <= SCENARIO_3_END
+            and red
+            and candle["open"] > cpr["R1"]
+            and candle["close"] < cpr["R1"]
+        ):
+            self.enter(symbol, "SELL", candle, "S3", 5, cpr["TC"])
+
+        if (
+            "S4" not in self.trades_taken[symbol]
+            and now <= SCENARIO_4_END
+            and self.first_candle_above_bc.get(symbol)
+            and red
+            and candle["close"] < cpr["BC"]
+        ):
+            self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
+
+        if "S5" not in self.trades_taken[symbol]:
+            if candle["high"] < cpr["S1"] and candle["low"] > cpr["S2"] and ema26 < ema50:
+                self.s5_below_s1_count[symbol] += 1
+            else:
+                self.s5_below_s1_count[symbol] = 0
+                self.s5_green_seen[symbol] = False
+
+            if self.s5_below_s1_count[symbol] >= 2 and green and candle["close"] > ema26 and candle["close"] > ema50 and candle["close"] < cpr["S1"]:
+                self.s5_green_seen[symbol] = True
+
+            if self.s5_green_seen[symbol] and red and candle["close"] < ema26 and candle["close"] < ema50:
+                self.enter(symbol, "SELL", candle, "S5", 2, cpr["S2"])
+                self.s5_green_seen[symbol] = False
+                self.s5_below_s1_count[symbol] = 0
 
     def enter(self, symbol, side, candle, scenario, rr, level_target):
         entry = candle["close"]
         sl = candle["low"] if side == "BUY" else candle["high"]
         risk = abs(entry - sl)
-
-        if risk > 10:
-            logger.info(
-                f"[SKIP TRADE] {scenario} {symbol} "
-                f"ENTRY={entry:.2f} SL={sl:.2f} SL_PTS={risk:.2f} > 10"
-            )
+        if risk > 15:
+            logger.info(f"[SKIP] {symbol} {scenario} risk too high: {risk}")
             return
 
-        target = (
-            min(entry + rr * risk, level_target)
-            if side == "BUY"
-            else max(entry - rr * risk, level_target)
+        target = min(entry + rr * risk, level_target) if side == "BUY" else max(entry - rr * risk, level_target)
+
+        logger.info(
+            f"[ENTRY] {scenario} {symbol} {side} "
+            f"ENTRY={entry} SL={sl} TARGET={target}"
         )
 
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
@@ -283,11 +313,6 @@ class NiftyCPRStrategy:
 
         self.trades_taken[symbol].add(scenario)
 
-        logger.info(
-            f"[ENTRY] {scenario} {symbol} "
-            f"ENTRY={entry:.2f} SL={sl:.2f} TARGET={target:.2f}"
-        )
-
     def on_tick(self, symbol, ltp):
         if symbol not in self.positions:
             return
@@ -297,9 +322,7 @@ class NiftyCPRStrategy:
         target = pos["target"]
 
         if (side == "BUY" and ltp >= target) or (side == "SELL" and ltp <= target):
-            logger.info(
-                f"[TARGET HIT] {symbol} LTP={ltp:.2f} TARGET={target:.2f}"
-            )
+            logger.info(f"[EXIT] TARGET HIT {symbol} LTP={ltp}")
             self.fyers.cancel_order(pos["sl_order_id"])
             self.fyers.market(symbol, -1 if side == "BUY" else 1, "TARGETEXIT")
             del self.positions[symbol]
@@ -308,6 +331,8 @@ class NiftyCPRStrategy:
 # MAIN
 # =========================================================
 if __name__ == "__main__":
+    logger.info("========== STRATEGY START ==========")
+
     fyers = FyersClient()
     engine = NiftyCPRStrategy(fyers)
 
@@ -343,7 +368,6 @@ if __name__ == "__main__":
             c["close"] = ltp
 
     def on_open():
-        logger.info("Websocket connected")
         fyers_ws.subscribe(symbols=symbols, data_type="SymbolUpdate")
         fyers_ws.keep_running()
 
