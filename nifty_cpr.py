@@ -47,6 +47,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logger.info("========== STRATEGY STARTED ==========")
+
 # =========================================================
 # TELEGRAM LOGGING
 # =========================================================
@@ -61,7 +63,7 @@ def send_telegram_message(text):
         }
         requests.post(url, json=payload, timeout=3)
     except Exception:
-        pass  # never break trading due to Telegram
+        pass
 
 class TelegramLogHandler(logging.Handler):
     def emit(self, record):
@@ -115,6 +117,7 @@ def get_last_trading_day_candle(fyers, symbol):
     for i in range(1, MAX_CPR_LOOKBACK_DAYS + 1):
         check_date = today - datetime.timedelta(days=i)
         date_str = check_date.strftime("%Y-%m-%d")
+
         try:
             h = fyers.client.history({
                 "symbol": symbol,
@@ -157,7 +160,11 @@ def get_atm_nifty_symbols(fyers):
     ltp = float(resp["d"][0]["v"]["lp"])
     atm = round(ltp / 50) * 50
     expiry = format_nifty_expiry(get_next_nifty_expiry())
-    return [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
+    symbols = [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
+
+    logger.info(f"[SYMBOLS] ATM NIFTY symbols selected: {symbols}")
+
+    return symbols
 
 # =========================================================
 # FYERS CLIENT
@@ -220,10 +227,28 @@ class NiftyCPRStrategy:
         self.s5_green_seen = defaultdict(bool)
 
     def init_cpr(self, symbols):
+        logger.info("========== CPR INITIALIZATION START ==========")
+
         for symbol in symbols:
             trade_date, h, l, c = get_last_trading_day_candle(self.fyers, symbol)
-            if trade_date:
-                self.cpr[symbol] = calculate_cpr(h, l, c)
+            if not trade_date:
+                logger.warning(f"[CPR] No valid trading day found for {symbol}")
+                continue
+
+            levels = calculate_cpr(h, l, c)
+            self.cpr[symbol] = levels
+
+            logger.info(
+                f"[CPR] {symbol} | Date={trade_date} | "
+                f"TC={round(levels['TC'],2)} "
+                f"BC={round(levels['BC'],2)} "
+                f"R1={round(levels['R1'],2)} "
+                f"R2={round(levels['R2'],2)} "
+                f"S1={round(levels['S1'],2)} "
+                f"S2={round(levels['S2'],2)}"
+            )
+
+        logger.info("========== CPR INITIALIZATION END ==========")
 
     def on_candle(self, symbol, candle):
         self.candles[symbol].append(candle)
@@ -290,6 +315,8 @@ class NiftyCPRStrategy:
             return
 
         target = min(entry + rr * risk, level_target) if side == "BUY" else max(entry - rr * risk, level_target)
+
+        logger.info(f"[ENTRY] {scenario} {symbol} {side} ENTRY={entry} SL={sl} TARGET={target}")
 
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
         sl_resp = self.fyers.place_sl(symbol, -1 if side == "BUY" else 1, sl, f"{scenario}SL")
@@ -362,6 +389,7 @@ if __name__ == "__main__":
             c["close"] = ltp
 
     def on_open():
+        logger.info("Websocket connected")
         fyers_ws.subscribe(symbols=symbols, data_type="SymbolUpdate")
         fyers_ws.keep_running()
 
