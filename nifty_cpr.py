@@ -264,7 +264,7 @@ class NiftyCPRStrategy:
             and red
             and candle["close"] <= cpr["S1"] - S1_BUFFER
         ):
-            self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
+            self.enter(symbol, "SELL", candle, "S2", 5, cpr["S2"])
 
         # Scenario 3
         if (
@@ -282,7 +282,7 @@ class NiftyCPRStrategy:
             and now <= SCENARIO_4_END
             and self.first_candle_above_bc.get(symbol)
             and red
-            and candle["close"] < cpr["BC"]
+            and candle["close"] <= cpr["BC"] - R1_BUFFER
         ):
             self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
 
