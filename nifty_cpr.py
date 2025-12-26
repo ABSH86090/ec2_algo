@@ -37,6 +37,8 @@ EMA_50 = 50
 LOG_FILE = "nifty_cpr_option_strategy.log"
 MAX_CPR_LOOKBACK_DAYS = 10
 
+S1_BUFFER = 0.5
+
 # =========================================================
 # LOGGING
 # =========================================================
@@ -46,7 +48,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
-
 logger.info("========== STRATEGY STARTED ==========")
 
 # =========================================================
@@ -57,19 +58,18 @@ def send_telegram_message(text):
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:4000]
-        }
-        requests.post(url, json=payload, timeout=3)
+        requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]},
+            timeout=3
+        )
     except Exception:
         pass
 
 class TelegramLogHandler(logging.Handler):
     def emit(self, record):
         try:
-            msg = self.format(record)
-            send_telegram_message(msg)
+            send_telegram_message(self.format(record))
         except Exception:
             pass
 
@@ -163,7 +163,6 @@ def get_atm_nifty_symbols(fyers):
     symbols = [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
 
     logger.info(f"[SYMBOLS] ATM NIFTY symbols selected: {symbols}")
-
     return symbols
 
 # =========================================================
@@ -223,31 +222,21 @@ class NiftyCPRStrategy:
         self.trades_taken = defaultdict(set)
 
         self.first_candle_above_bc = {}
-        self.s5_below_s1_count = defaultdict(int)
-        self.s5_green_seen = defaultdict(bool)
+
+        # --- Scenario 2 state ---
+        self.s2_red_below_s1 = defaultdict(bool)
+        self.s2_green_above_s1 = defaultdict(bool)
+
+        # --- Scenario 5 state ---
+        self.s5_below_s1_close_count = defaultdict(int)
+        self.s5_green_above_emas = defaultdict(bool)
 
     def init_cpr(self, symbols):
         logger.info("========== CPR INITIALIZATION START ==========")
-
         for symbol in symbols:
-            trade_date, h, l, c = get_last_trading_day_candle(self.fyers, symbol)
-            if not trade_date:
-                logger.warning(f"[CPR] No valid trading day found for {symbol}")
-                continue
-
-            levels = calculate_cpr(h, l, c)
-            self.cpr[symbol] = levels
-
-            logger.info(
-                f"[CPR] {symbol} | Date={trade_date} | "
-                f"TC={round(levels['TC'],2)} "
-                f"BC={round(levels['BC'],2)} "
-                f"R1={round(levels['R1'],2)} "
-                f"R2={round(levels['R2'],2)} "
-                f"S1={round(levels['S1'],2)} "
-                f"S2={round(levels['S2'],2)}"
-            )
-
+            d, h, l, c = get_last_trading_day_candle(self.fyers, symbol)
+            if d:
+                self.cpr[symbol] = calculate_cpr(h, l, c)
         logger.info("========== CPR INITIALIZATION END ==========")
 
     def on_candle(self, symbol, candle):
@@ -268,12 +257,32 @@ class NiftyCPRStrategy:
         if symbol not in self.first_candle_above_bc:
             self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
+        # ---------------- S1 (UNCHANGED) ----------------
         if "S1" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and green and candle["close"] > cpr["R1"]:
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
 
-        if "S2" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and red and candle["close"] < cpr["S1"]:
-            self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
+        # ---------------- S2 (UPDATED) ----------------
+        S1 = cpr["S1"]
 
+        if red and candle["close"] < S1 - S1_BUFFER:
+            self.s2_red_below_s1[symbol] = True
+
+        if self.s2_red_below_s1[symbol] and green and candle["close"] > S1 + S1_BUFFER:
+            self.s2_green_above_s1[symbol] = True
+
+        if (
+            "S2" not in self.trades_taken[symbol]
+            and now <= SCENARIO_123_END
+            and self.s2_green_above_s1[symbol]
+            and red
+            and candle["open"] > S1
+            and candle["close"] < S1
+        ):
+            self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
+            self.s2_red_below_s1[symbol] = False
+            self.s2_green_above_s1[symbol] = False
+
+        # ---------------- S3 (UNCHANGED) ----------------
         if (
             "S3" not in self.trades_taken[symbol]
             and now <= SCENARIO_3_END
@@ -283,6 +292,7 @@ class NiftyCPRStrategy:
         ):
             self.enter(symbol, "SELL", candle, "S3", 5, cpr["TC"])
 
+        # ---------------- S4 (UNCHANGED) ----------------
         if (
             "S4" not in self.trades_taken[symbol]
             and now <= SCENARIO_4_END
@@ -292,20 +302,33 @@ class NiftyCPRStrategy:
         ):
             self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
 
-        if "S5" not in self.trades_taken[symbol]:
-            if candle["high"] < cpr["S1"] and candle["low"] > cpr["S2"] and ema26 < ema50:
-                self.s5_below_s1_count[symbol] += 1
-            else:
-                self.s5_below_s1_count[symbol] = 0
-                self.s5_green_seen[symbol] = False
+        # ---------------- S5 (UPDATED) ----------------
+        if candle["close"] < S1:
+            self.s5_below_s1_close_count[symbol] += 1
 
-            if self.s5_below_s1_count[symbol] >= 2 and green and candle["close"] > ema26 and candle["close"] > ema50 and candle["close"] < cpr["S1"]:
-                self.s5_green_seen[symbol] = True
+        ema_gap_ok = abs(ema26 - ema50) <= 0.05 * ema50
 
-            if self.s5_green_seen[symbol] and red and candle["close"] < ema26 and candle["close"] < ema50:
-                self.enter(symbol, "SELL", candle, "S5", 2, cpr["S2"])
-                self.s5_green_seen[symbol] = False
-                self.s5_below_s1_count[symbol] = 0
+        if (
+            self.s5_below_s1_close_count[symbol] >= 30
+            and ema_gap_ok
+            and green
+            and candle["close"] > ema26
+            and candle["close"] > ema50
+        ):
+            self.s5_green_above_emas[symbol] = True
+
+        if (
+            "S5" not in self.trades_taken[symbol]
+            and self.s5_green_above_emas[symbol]
+            and red
+            and candle["open"] > ema26
+            and candle["open"] > ema50
+            and candle["close"] < ema26
+            and candle["close"] < ema50
+        ):
+            self.enter(symbol, "SELL", candle, "S5", 2, cpr["S2"])
+            self.s5_green_above_emas[symbol] = False
+            self.s5_below_s1_close_count[symbol] = 0
 
     def enter(self, symbol, side, candle, scenario, rr, level_target):
         entry = candle["close"]
@@ -336,15 +359,13 @@ class NiftyCPRStrategy:
 
         pos = self.positions[symbol]
         side = pos["side"]
-        target = pos["target"]
-        sl = pos["sl_price"]
 
-        if (side == "BUY" and ltp <= sl) or (side == "SELL" and ltp >= sl):
+        if (side == "BUY" and ltp <= pos["sl_price"]) or (side == "SELL" and ltp >= pos["sl_price"]):
             logger.info(f"[EXIT] SL HIT {symbol} LTP={ltp}")
             del self.positions[symbol]
             return
 
-        if (side == "BUY" and ltp >= target) or (side == "SELL" and ltp <= target):
+        if (side == "BUY" and ltp >= pos["target"]) or (side == "SELL" and ltp <= pos["target"]):
             logger.info(f"[EXIT] TARGET HIT {symbol} LTP={ltp}")
             self.fyers.cancel_order(pos["sl_order_id"])
             self.fyers.market(symbol, -1 if side == "BUY" else 1, "TARGETEXIT")
