@@ -214,10 +214,21 @@ class NiftyCPRStrategy:
         self.first_candle_above_bc = {}
 
     def init_cpr(self, symbols):
-        for s in symbols:
-            d, h, l, c = get_last_trading_day_candle(self.fyers, s)
-            if d:
-                self.cpr[s] = calculate_cpr(h, l, c)
+        for symbol in symbols:
+            trade_date, h, l, c = get_last_trading_day_candle(self.fyers, symbol)
+            if not trade_date:
+                logger.warning(f"[CPR INIT] No previous candle found for {symbol}")
+                continue
+
+            cpr = calculate_cpr(h, l, c)
+            self.cpr[symbol] = cpr
+
+            logger.info(
+                f"[CPR INIT] {symbol} | DATE={trade_date} | "
+                f"TC={round(cpr['TC'],2)} BC={round(cpr['BC'],2)} | "
+                f"R1={round(cpr['R1'],2)} R2={round(cpr['R2'],2)} | "
+                f"S1={round(cpr['S1'],2)} S2={round(cpr['S2'],2)}"
+            )
 
     def on_candle(self, symbol, candle):
         self.candles[symbol].append(candle)
@@ -246,16 +257,16 @@ class NiftyCPRStrategy:
         ):
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
 
-        # Scenario 2 (buffered S1)
+        # Scenario 2
         if (
             "S2" not in self.trades_taken[symbol]
             and now <= SCENARIO_123_END
             and red
             and candle["close"] <= cpr["S1"] - S1_BUFFER
         ):
-            self.enter(symbol, "SELL", candle, "S2", 5, cpr["S2"])
+            self.enter(symbol, "SELL", candle, "S2", 2, cpr["S2"])
 
-        # Scenario 3 (buffered R1)
+        # Scenario 3
         if (
             "S3" not in self.trades_taken[symbol]
             and now <= SCENARIO_3_END
@@ -271,7 +282,7 @@ class NiftyCPRStrategy:
             and now <= SCENARIO_4_END
             and self.first_candle_above_bc.get(symbol)
             and red
-            and candle["close"] <= cpr["BC"] - R1_BUFFER
+            and candle["close"] < cpr["BC"]
         ):
             self.enter(symbol, "SELL", candle, "S4", 2, cpr["S1"])
 
