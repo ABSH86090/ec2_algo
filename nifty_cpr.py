@@ -31,8 +31,7 @@ EMA_26 = 26
 EMA_50 = 50
 
 LOG_FILE = "nifty_cpr_option_strategy.log"
-
-MAX_CPR_LOOKBACK_DAYS = 10   # handles holidays / long weekends
+MAX_CPR_LOOKBACK_DAYS = 10
 
 # =========================================================
 # LOGGING
@@ -78,13 +77,9 @@ def calculate_cpr(h, l, c):
 
 def get_last_trading_day_candle(fyers, symbol):
     today = datetime.date.today()
-    logger.info(f"[CPR] Searching last trading day for {symbol}")
-
     for i in range(1, MAX_CPR_LOOKBACK_DAYS + 1):
         check_date = today - datetime.timedelta(days=i)
         date_str = check_date.strftime("%Y-%m-%d")
-
-        logger.info(f"[CPR] Checking DAILY candle for {date_str}")
 
         try:
             h = fyers.client.history({
@@ -95,26 +90,18 @@ def get_last_trading_day_candle(fyers, symbol):
                 "range_to": date_str,
                 "cont_flag": "1"
             })
-        except Exception as e:
-            logger.error(f"[CPR] History API error on {date_str}: {e}")
+        except Exception:
             continue
 
         candles = h.get("candles", [])
         if candles:
             _, _, high, low, close, _ = candles[0]
-            logger.info(
-                f"[CPR] Using trading day {date_str} "
-                f"H={high} L={low} C={close}"
-            )
             return check_date, high, low, close
 
-        logger.info(f"[CPR] No candle on {date_str} (holiday/weekend)")
-
-    logger.error(f"[CPR] Failed to find trading day in last {MAX_CPR_LOOKBACK_DAYS} days")
     return None, None, None, None
 
 # =========================================================
-# NIFTY EXPIRY & ATM SYMBOL
+# NIFTY ATM SYMBOL
 # =========================================================
 def is_last_tuesday(date_obj):
     return date_obj.weekday() == 1 and (date_obj + datetime.timedelta(days=7)).month != date_obj.month
@@ -136,9 +123,7 @@ def get_atm_nifty_symbols(fyers):
     ltp = float(resp["d"][0]["v"]["lp"])
     atm = round(ltp / 50) * 50
     expiry = format_nifty_expiry(get_next_nifty_expiry())
-    symbols = [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
-    logger.info(f"[SYMBOL] ATM Symbols: {symbols}")
-    return symbols
+    return [f"NSE:NIFTY{expiry}{atm}CE", f"NSE:NIFTY{expiry}{atm}PE"]
 
 # =========================================================
 # FYERS CLIENT
@@ -157,7 +142,6 @@ class FyersClient:
         return re.sub(r"[^A-Za-z0-9]", "", tag)[:20]
 
     def market(self, symbol, side, tag):
-        logger.info(f"[ORDER] MARKET {symbol} side={side} tag={tag}")
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
@@ -171,7 +155,6 @@ class FyersClient:
     def place_sl(self, symbol, side, trigger, tag):
         trigger = round_to_tick(trigger)
         limit_price = trigger + TICK_SIZE if side == 1 else trigger - TICK_SIZE
-        logger.info(f"[ORDER] SL {symbol} trigger={trigger} side={side}")
         return self.client.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
@@ -185,7 +168,6 @@ class FyersClient:
         })
 
     def cancel_order(self, order_id):
-        logger.info(f"[ORDER] Cancel SL order {order_id}")
         return self.client.cancel_order({"id": order_id})
 
 # =========================================================
@@ -204,32 +186,12 @@ class NiftyCPRStrategy:
         self.s5_green_seen = defaultdict(bool)
 
     def init_cpr(self, symbols):
-        logger.info("========== CPR INITIALIZATION START ==========")
-
         for symbol in symbols:
             trade_date, h, l, c = get_last_trading_day_candle(self.fyers, symbol)
-            if not trade_date:
-                continue
-
-            levels = calculate_cpr(h, l, c)
-            self.cpr[symbol] = levels
-
-            logger.info(
-                f"[CPR] {symbol} | Date={trade_date} | "
-                f"TC={round(levels['TC'],2)} BC={round(levels['BC'],2)} "
-                f"R1={round(levels['R1'],2)} R2={round(levels['R2'],2)} "
-                f"S1={round(levels['S1'],2)} S2={round(levels['S2'],2)}"
-            )
-
-        logger.info("========== CPR INITIALIZATION END ==========")
+            if trade_date:
+                self.cpr[symbol] = calculate_cpr(h, l, c)
 
     def on_candle(self, symbol, candle):
-        logger.debug(
-            f"[CANDLE] {symbol} {candle['time']} "
-            f"O={candle['open']} H={candle['high']} "
-            f"L={candle['low']} C={candle['close']}"
-        )
-
         self.candles[symbol].append(candle)
         closes = [c["close"] for c in self.candles[symbol]]
 
@@ -247,7 +209,7 @@ class NiftyCPRStrategy:
         if symbol not in self.first_candle_above_bc:
             self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
-        # -------- SCENARIOS (unchanged logic) --------
+        # -------- SCENARIOS (UNCHANGED) --------
         if "S1" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and green and candle["close"] > cpr["R1"]:
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
 
@@ -292,15 +254,9 @@ class NiftyCPRStrategy:
         sl = candle["low"] if side == "BUY" else candle["high"]
         risk = abs(entry - sl)
         if risk > 15:
-            logger.info(f"[SKIP] {symbol} {scenario} risk too high: {risk}")
             return
 
         target = min(entry + rr * risk, level_target) if side == "BUY" else max(entry - rr * risk, level_target)
-
-        logger.info(
-            f"[ENTRY] {scenario} {symbol} {side} "
-            f"ENTRY={entry} SL={sl} TARGET={target}"
-        )
 
         self.fyers.market(symbol, 1 if side == "BUY" else -1, f"{scenario}ENTRY")
         sl_resp = self.fyers.place_sl(symbol, -1 if side == "BUY" else 1, sl, f"{scenario}SL")
@@ -308,6 +264,7 @@ class NiftyCPRStrategy:
         self.positions[symbol] = {
             "side": side,
             "target": target,
+            "sl_price": sl,          # <<< SL PATCH (added)
             "sl_order_id": sl_resp.get("id")
         }
 
@@ -320,6 +277,14 @@ class NiftyCPRStrategy:
         pos = self.positions[symbol]
         side = pos["side"]
         target = pos["target"]
+        sl = pos["sl_price"]
+
+        # ================= SL PATCH =================
+        if (side == "BUY" and ltp <= sl) or (side == "SELL" and ltp >= sl):
+            logger.info(f"[EXIT] SL HIT {symbol} LTP={ltp}")
+            del self.positions[symbol]
+            return
+        # ============================================
 
         if (side == "BUY" and ltp >= target) or (side == "SELL" and ltp <= target):
             logger.info(f"[EXIT] TARGET HIT {symbol} LTP={ltp}")
@@ -331,8 +296,6 @@ class NiftyCPRStrategy:
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("========== STRATEGY START ==========")
-
     fyers = FyersClient()
     engine = NiftyCPRStrategy(fyers)
 
