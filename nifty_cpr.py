@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import re
+import requests
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
@@ -16,6 +17,9 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 LOT_SIZE = 150
 TICK_SIZE = 0.05
@@ -42,6 +46,37 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# =========================================================
+# TELEGRAM LOGGING
+# =========================================================
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text[:4000]
+        }
+        requests.post(url, json=payload, timeout=3)
+    except Exception:
+        pass  # never break trading due to Telegram
+
+class TelegramLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            send_telegram_message(msg)
+        except Exception:
+            pass
+
+telegram_handler = TelegramLogHandler()
+telegram_handler.setLevel(logging.INFO)
+telegram_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+)
+logger.addHandler(telegram_handler)
 
 # =========================================================
 # UTILS
@@ -80,7 +115,6 @@ def get_last_trading_day_candle(fyers, symbol):
     for i in range(1, MAX_CPR_LOOKBACK_DAYS + 1):
         check_date = today - datetime.timedelta(days=i)
         date_str = check_date.strftime("%Y-%m-%d")
-
         try:
             h = fyers.client.history({
                 "symbol": symbol,
@@ -209,7 +243,6 @@ class NiftyCPRStrategy:
         if symbol not in self.first_candle_above_bc:
             self.first_candle_above_bc[symbol] = candle["close"] > cpr["BC"]
 
-        # -------- SCENARIOS (UNCHANGED) --------
         if "S1" not in self.trades_taken[symbol] and now <= SCENARIO_123_END and green and candle["close"] > cpr["R1"]:
             self.enter(symbol, "BUY", candle, "S1", 2, cpr["R2"])
 
@@ -264,7 +297,7 @@ class NiftyCPRStrategy:
         self.positions[symbol] = {
             "side": side,
             "target": target,
-            "sl_price": sl,          # <<< SL PATCH (added)
+            "sl_price": sl,
             "sl_order_id": sl_resp.get("id")
         }
 
@@ -279,12 +312,10 @@ class NiftyCPRStrategy:
         target = pos["target"]
         sl = pos["sl_price"]
 
-        # ================= SL PATCH =================
         if (side == "BUY" and ltp <= sl) or (side == "SELL" and ltp >= sl):
             logger.info(f"[EXIT] SL HIT {symbol} LTP={ltp}")
             del self.positions[symbol]
             return
-        # ============================================
 
         if (side == "BUY" and ltp >= target) or (side == "SELL" and ltp <= target):
             logger.info(f"[EXIT] TARGET HIT {symbol} LTP={ltp}")
