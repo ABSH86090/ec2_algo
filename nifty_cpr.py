@@ -28,6 +28,8 @@ TRADING_START = datetime.time(9, 15)
 TRADING_END = datetime.time(15, 0)
 
 SCENARIO_123_END = datetime.time(9, 45)
+SCENARIO_1_END = datetime.time(9, 45)
+SCENARIO_2_END = datetime.time(14, 30)
 SCENARIO_4_END = datetime.time(10, 0)
 SCENARIO_3_END = datetime.time(14, 30)
 
@@ -251,7 +253,7 @@ class NiftyCPRStrategy:
         # Scenario 1
         if (
             "S1" not in self.trades_taken[symbol]
-            and now <= SCENARIO_123_END
+            and now <= SCENARIO_1_END
             and green
             and candle["close"] >= cpr["R1"] + R1_BUFFER
         ):
@@ -260,11 +262,11 @@ class NiftyCPRStrategy:
         # Scenario 2
         if (
             "S2" not in self.trades_taken[symbol]
-            and now <= SCENARIO_123_END
+            and now <= SCENARIO_2_END
             and red
             and candle["close"] <= cpr["S1"] - S1_BUFFER
         ):
-            self.enter(symbol, "SELL", candle, "S2", 5, cpr["S2"])
+            self.enter(symbol, "SELL", candle, "S2", 5, cpr["S2"] - 1.0)
 
         # Scenario 3
         if (
