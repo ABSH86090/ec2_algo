@@ -25,7 +25,7 @@ INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
 TRADING_END_TIME = datetime.time(15, 0)
 MAX_CPR_LOOKBACK_DAYS = 10
 
-MAX_RANGE_USAGE = 0.30   # 30% proximity filter
+MAX_RANGE_USAGE = 0.30
 
 LOG_FILE = "nifty_cpr_multi_scenario_15m.log"
 
@@ -62,7 +62,6 @@ def calculate_cpr(h, l, c):
     tc = 2 * p - bc
     bc, tc = min(bc, tc), max(bc, tc)
     return {
-        "P": p,
         "BC": bc,
         "TC": tc,
         "R1": 2 * p - l,
@@ -88,27 +87,19 @@ def get_last_trading_day_cpr(fyers):
             _, _, h, l, c, _ = candles[0]
             cpr = calculate_cpr(h, l, c)
 
-            # ---- LOG FILE ----
             logger.info(
-                f"[CPR INIT] INDEX={INDEX_SYMBOL} | "
-                f"BC={round(cpr['BC'],2)} TC={round(cpr['TC'],2)} | "
-                f"R1={round(cpr['R1'],2)} R2={round(cpr['R2'],2)} | "
-                f"S1={round(cpr['S1'],2)} S2={round(cpr['S2'],2)}"
+                f"[CPR INIT] BC={cpr['BC']:.2f} TC={cpr['TC']:.2f} | "
+                f"R1={cpr['R1']:.2f} R2={cpr['R2']:.2f} | "
+                f"S1={cpr['S1']:.2f} S2={cpr['S2']:.2f}"
             )
 
-            # ---- TELEGRAM (OPTION 1) ----
             send_telegram(
-                f"📊 CPR LEVELS (NIFTY)\n\n"
-                f"BC : {round(cpr['BC'],2)}\n"
-                f"TC : {round(cpr['TC'],2)}\n\n"
-                f"R1 : {round(cpr['R1'],2)}\n"
-                f"R2 : {round(cpr['R2'],2)}\n\n"
-                f"S1 : {round(cpr['S1'],2)}\n"
-                f"S2 : {round(cpr['S2'],2)}"
+                f"📊 CPR LEVELS (NIFTY)\n"
+                f"BC {cpr['BC']:.2f} | TC {cpr['TC']:.2f}\n"
+                f"R1 {cpr['R1']:.2f} | R2 {cpr['R2']:.2f}\n"
+                f"S1 {cpr['S1']:.2f} | S2 {cpr['S2']:.2f}"
             )
-
             return cpr
-
     raise Exception("CPR not found")
 
 # =========================================================
@@ -125,23 +116,16 @@ def format_expiry(expiry):
     yy = expiry.strftime("%y")
     if is_last_tuesday(expiry):
         return f"{yy}{expiry.strftime('%b').upper()}"
-    m_map = {10: "O", 11: "N", 12: "D"}
-    return f"{yy}{m_map.get(expiry.month, expiry.strftime('%m'))}{expiry.day:02d}"
+    m = {10: "O", 11: "N", 12: "D"}
+    return f"{yy}{m.get(expiry.month, expiry.strftime('%m'))}{expiry.day:02d}"
 
-def get_option_symbols(index_ltp, side):
-    atm = round(index_ltp / 50) * 50
+def get_option_symbols(ltp, side):
+    atm = round(ltp / 50) * 50
     expiry = format_expiry(get_next_expiry())
-
     if side == "PUT":
-        return (
-            f"NSE:NIFTY{expiry}{atm - 100}PE",  # BUY OTM2
-            f"NSE:NIFTY{expiry}{atm + 50}PE"    # SELL ITM1
-        )
+        return f"NSE:NIFTY{expiry}{atm - 100}PE", f"NSE:NIFTY{expiry}{atm + 50}PE"
     else:
-        return (
-            f"NSE:NIFTY{expiry}{atm + 100}CE",  # BUY OTM2
-            f"NSE:NIFTY{expiry}{atm - 50}CE"    # SELL ITM1
-        )
+        return f"NSE:NIFTY{expiry}{atm + 100}CE", f"NSE:NIFTY{expiry}{atm - 50}CE"
 
 # =========================================================
 # BASE SCENARIO
@@ -153,36 +137,37 @@ class CPRScenario:
         self.cpr = cpr
         self.trade_taken = False
         self.active = False
+        self.skip_today = False
         self.entry_high = None
         self.legs = {}
 
     def buy(self, symbol):
-        return self.fyers.place_order({
+        self.fyers.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
             "type": 2,
             "side": 1,
             "productType": "INTRADAY",
             "validity": "DAY",
-            "orderTag": self.name + "_BUY"
+            "orderTag": f"{self.name}_BUY"
         })
 
     def sell(self, symbol):
-        return self.fyers.place_order({
+        self.fyers.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
             "type": 2,
             "side": -1,
             "productType": "INTRADAY",
             "validity": "DAY",
-            "orderTag": self.name + "_SELL"
+            "orderTag": f"{self.name}_SELL"
         })
 
     def enter_spread(self, hedge, sell_leg):
-        if self.trade_taken:
+        if self.trade_taken or self.skip_today:
             return
         self.buy(hedge)
-        time.sleep(0.5)
+        time.sleep(0.4)
         self.sell(sell_leg)
         self.trade_taken = True
         self.active = True
@@ -194,24 +179,31 @@ class CPRScenario:
         if not self.active:
             return
         self.buy(self.legs["sell"])
-        time.sleep(0.5)
+        time.sleep(0.4)
         self.sell(self.legs["hedge"])
         self.active = False
         logger.info(f"[{self.name}] EXIT")
         send_telegram(f"✅ {self.name} EXIT")
 
 # =========================================================
-# SCENARIOS (UNCHANGED LOGIC)
+# SCENARIOS
 # =========================================================
 class Scenario1(CPRScenario):
     def evaluate(self, candles, ltp):
-        last = candles[-1]
+        first = candles[0]
+
+        # 🔴 GAP FILTER
+        if first[1] >= self.cpr["R1"]:
+            self.skip_today = True
+            logger.info("[SCENARIO1] Skipped – market opened above R1")
+            return
+
         if self.trade_taken:
+            last = candles[-1]
             if last[4] < self.cpr["R1"] or last[2] >= self.cpr["R2"]:
                 self.exit_spread()
             return
 
-        first = candles[0]
         if not (first[1] > self.cpr["TC"] and first[4] > self.cpr["TC"]):
             return
 
@@ -219,8 +211,7 @@ class Scenario1(CPRScenario):
             if c[4] > self.cpr["R1"]:
                 used = c[2] - self.cpr["R1"]
                 total = self.cpr["R2"] - self.cpr["R1"]
-                if total <= 0 or (used / total) >= MAX_RANGE_USAGE:
-                    logger.info("[SCENARIO1] Skipped – too close to R2")
+                if total <= 0 or used / total >= MAX_RANGE_USAGE:
                     return
                 hedge, sell = get_option_symbols(ltp, "PUT")
                 self.enter_spread(hedge, sell)
@@ -228,13 +219,20 @@ class Scenario1(CPRScenario):
 
 class Scenario2(CPRScenario):
     def evaluate(self, candles, ltp):
-        last = candles[-1]
+        first = candles[0]
+
+        # 🔴 GAP FILTER
+        if first[1] <= self.cpr["S1"]:
+            self.skip_today = True
+            logger.info("[SCENARIO2] Skipped – market opened below S1")
+            return
+
         if self.trade_taken:
+            last = candles[-1]
             if last[4] > self.cpr["S1"] or last[3] <= self.cpr["S2"]:
                 self.exit_spread()
             return
 
-        first = candles[0]
         if not (first[1] < self.cpr["BC"] and first[4] < self.cpr["BC"]):
             return
 
@@ -242,8 +240,7 @@ class Scenario2(CPRScenario):
             if c[4] < self.cpr["S1"]:
                 used = self.cpr["S1"] - c[3]
                 total = self.cpr["S1"] - self.cpr["S2"]
-                if total <= 0 or (used / total) >= MAX_RANGE_USAGE:
-                    logger.info("[SCENARIO2] Skipped – too close to S2")
+                if total <= 0 or used / total >= MAX_RANGE_USAGE:
                     return
                 hedge, sell = get_option_symbols(ltp, "CALL")
                 self.enter_spread(hedge, sell)
@@ -251,8 +248,8 @@ class Scenario2(CPRScenario):
 
 class Scenario3(CPRScenario):
     def evaluate(self, candles, ltp):
-        last = candles[-1]
         if self.trade_taken:
+            last = candles[-1]
             if last[4] > self.entry_high or last[3] <= self.cpr["S1"]:
                 self.exit_spread()
             return
@@ -266,8 +263,7 @@ class Scenario3(CPRScenario):
             if close < o and close < self.cpr["BC"]:
                 used = self.cpr["BC"] - l
                 total = self.cpr["BC"] - self.cpr["S1"]
-                if total <= 0 or (used / total) >= MAX_RANGE_USAGE:
-                    logger.info("[SCENARIO3] Skipped – too close to S1")
+                if total <= 0 or used / total >= MAX_RANGE_USAGE:
                     return
                 hedge, sell = get_option_symbols(ltp, "CALL")
                 self.entry_high = h
@@ -275,7 +271,7 @@ class Scenario3(CPRScenario):
                 break
 
 # =========================================================
-# DATA FETCH
+# DATA
 # =========================================================
 def fetch_15m_index_candles(fyers):
     today = datetime.date.today().strftime("%Y-%m-%d")
@@ -297,7 +293,7 @@ def get_index_ltp(fyers):
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("=== NIFTY CPR MULTI-SCENARIO STRATEGY STARTED ===")
+    logger.info("=== NIFTY CPR STRATEGY STARTED ===")
 
     fyers = fyersModel.FyersModel(
         client_id=CLIENT_ID,
