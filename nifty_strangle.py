@@ -159,6 +159,30 @@ def get_nifty_strangle_symbols(fyers):
     return ce_symbol, pe_symbol
 
 # =========================================================
+# FYERS TICK TIME NORMALIZATION (SENSEX PARITY)
+# =========================================================
+def extract_tick_epoch(msg):
+    """
+    Normalize FYERS tick time across instruments.
+    Returns epoch seconds or None.
+    """
+    ts = (
+        msg.get("last_traded_time")   # options (most reliable)
+        or msg.get("timestamp")       # some live feeds
+        or msg.get("tt")              # alternate key
+        or msg.get("exch_feed_time")  # snapshots / market closed
+    )
+
+    try:
+        ts = int(ts)
+        if ts > 10_000_000_000:  # milliseconds → seconds
+            ts //= 1000
+        return ts
+    except Exception:
+        return None
+
+
+# =========================================================
 # FYERS CLIENT
 # =========================================================
 class FyersClient:
@@ -345,8 +369,10 @@ if __name__ == "__main__":
             return
 
         premium = last[ce] + last[pe]
-        ts = msg.get("timestamp")
-        dt = datetime.datetime.fromtimestamp(ts)
+        epoch = extract_tick_epoch(msg)
+        if epoch is None:
+            return
+        dt = datetime.datetime.fromtimestamp(epoch)
 
         bucket = dt.replace(
             second=0, microsecond=0,
