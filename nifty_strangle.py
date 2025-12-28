@@ -159,28 +159,22 @@ def get_nifty_strangle_symbols(fyers):
     return ce_symbol, pe_symbol
 
 # =========================================================
-# FYERS TICK TIME NORMALIZATION (SENSEX PARITY)
+# FYERS TICK TIME NORMALIZATION
 # =========================================================
 def extract_tick_epoch(msg):
-    """
-    Normalize FYERS tick time across instruments.
-    Returns epoch seconds or None.
-    """
     ts = (
-        msg.get("last_traded_time")   # options (most reliable)
-        or msg.get("timestamp")       # some live feeds
-        or msg.get("tt")              # alternate key
-        or msg.get("exch_feed_time")  # snapshots / market closed
+        msg.get("last_traded_time")
+        or msg.get("timestamp")
+        or msg.get("tt")
+        or msg.get("exch_feed_time")
     )
-
     try:
         ts = int(ts)
-        if ts > 10_000_000_000:  # milliseconds → seconds
+        if ts > 10_000_000_000:
             ts //= 1000
         return ts
     except Exception:
         return None
-
 
 # =========================================================
 # FYERS CLIENT
@@ -218,7 +212,7 @@ class FyersClient:
         })
 
 # =========================================================
-# STRATEGY ENGINE (SENSEX FRAMEWORK STYLE)
+# STRATEGY ENGINE
 # =========================================================
 class StrategyEngine:
     def __init__(self, fyers, ce, pe):
@@ -252,27 +246,34 @@ class StrategyEngine:
         ema5 = self.ema(closes[-EMA_FAST:], EMA_FAST)
         ema20 = self.ema(closes[-EMA_SLOW:], EMA_SLOW)
 
-        # ===== FIRST CANDLE GATE =====
+        # =====================================================
+        # INITIAL EMA + FIRST CANDLE GATE LOGS (ONCE)
+        # =====================================================
         if closed and not self.initial_ema_logged and candle["time"].time() == datetime.time(9, 18):
             self.initial_ema_logged = True
             color = "RED" if candle["close"] < candle["open"] else "GREEN"
 
             logger.info(
-                f"[INITIAL EMA] EMA5={ema5:.2f} EMA20={ema20:.2f} FirstCandle={color}"
+                f"[INITIAL EMA] TIME={candle['time']} | "
+                f"EMA5={ema5:.2f} | EMA20={ema20:.2f} | "
+                f"FIRST_CANDLE={color}"
             )
 
             if color != "RED" or ema5 >= ema20:
+                logger.info("[FIRST CANDLE CHECK] ❌ FAILED — STRATEGY DISABLED")
                 self.disabled_for_day = True
-                logger.info("[DISABLED] First candle condition failed")
                 return
-
-            self.stage = 1
-            return
+            else:
+                logger.info("[FIRST CANDLE CHECK] ✅ PASSED — LOOKING FOR SETUP")
+                self.stage = 1
+                return
 
         if self.disabled_for_day:
             return
 
-        # ===== ENTRY FSM =====
+        # =====================================================
+        # ENTRY FSM
+        # =====================================================
         if closed and self.stage == 1:
             if candle["close"] > candle["open"]:
                 self.stage = 2
@@ -294,7 +295,9 @@ class StrategyEngine:
 
                 logger.info(f"[ENTRY] Entry={entry:.2f} SL={sl:.2f}")
                 send_telegram(
-                    f"📉 STRANGLE ENTRY\nEntry={entry:.2f}\nSL={sl:.2f}\nEMA5={ema5:.2f}\nEMA20={ema20:.2f}"
+                    f"📉 STRANGLE ENTRY\n"
+                    f"Entry={entry:.2f}\nSL={sl:.2f}\n"
+                    f"EMA5={ema5:.2f}\nEMA20={ema20:.2f}"
                 )
 
                 self.fyers.sell_market(self.ce, "STRANGLECE")
@@ -306,7 +309,9 @@ class StrategyEngine:
                 log_trade("ENTRY", entry, sl, trade_id=self.position["trade_id"])
                 self.stage = 3
 
-        # ===== SL / EOD EXIT =====
+        # =====================================================
+        # SL / EOD EXIT
+        # =====================================================
         if self.position:
             if candle["high"] >= self.position["sl"] and candle["time"] != self.entry_bar_time:
                 logger.info("[SL HIT] Exiting")
@@ -372,12 +377,9 @@ if __name__ == "__main__":
         epoch = extract_tick_epoch(msg)
         if epoch is None:
             return
-        dt = datetime.datetime.fromtimestamp(epoch)
 
-        bucket = dt.replace(
-            second=0, microsecond=0,
-            minute=(dt.minute // 3) * 3
-        )
+        dt = datetime.datetime.fromtimestamp(epoch)
+        bucket = dt.replace(second=0, microsecond=0, minute=(dt.minute // 3) * 3)
 
         if candle is None or candle["time"] != bucket:
             if candle:
