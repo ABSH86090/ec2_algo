@@ -25,7 +25,7 @@ INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
 TRADING_END_TIME = datetime.time(15, 0)
 MAX_CPR_LOOKBACK_DAYS = 10
 
-MAX_RANGE_USAGE = 0.30   # 🔴 30% proximity filter
+MAX_RANGE_USAGE = 0.30   # 30% proximity filter
 
 LOG_FILE = "nifty_cpr_multi_scenario_15m.log"
 
@@ -39,6 +39,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger()
 
+# =========================================================
+# TELEGRAM
+# =========================================================
 def send_telegram(msg):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
@@ -47,7 +50,7 @@ def send_telegram(msg):
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]},
                 timeout=3
             )
-        except:
+        except Exception:
             pass
 
 # =========================================================
@@ -84,12 +87,28 @@ def get_last_trading_day_cpr(fyers):
         if candles:
             _, _, h, l, c, _ = candles[0]
             cpr = calculate_cpr(h, l, c)
+
+            # ---- LOG FILE ----
             logger.info(
-                f"[CPR] BC={cpr['BC']} TC={cpr['TC']} "
-                f"R1={cpr['R1']} R2={cpr['R2']} "
-                f"S1={cpr['S1']} S2={cpr['S2']}"
+                f"[CPR INIT] INDEX={INDEX_SYMBOL} | "
+                f"BC={round(cpr['BC'],2)} TC={round(cpr['TC'],2)} | "
+                f"R1={round(cpr['R1'],2)} R2={round(cpr['R2'],2)} | "
+                f"S1={round(cpr['S1'],2)} S2={round(cpr['S2'],2)}"
             )
+
+            # ---- TELEGRAM (OPTION 1) ----
+            send_telegram(
+                f"📊 CPR LEVELS (NIFTY)\n\n"
+                f"BC : {round(cpr['BC'],2)}\n"
+                f"TC : {round(cpr['TC'],2)}\n\n"
+                f"R1 : {round(cpr['R1'],2)}\n"
+                f"R2 : {round(cpr['R2'],2)}\n\n"
+                f"S1 : {round(cpr['S1'],2)}\n"
+                f"S2 : {round(cpr['S2'],2)}"
+            )
+
             return cpr
+
     raise Exception("CPR not found")
 
 # =========================================================
@@ -169,7 +188,7 @@ class CPRScenario:
         self.active = True
         self.legs = {"hedge": hedge, "sell": sell_leg}
         logger.info(f"[{self.name}] ENTRY {hedge} / {sell_leg}")
-        send_telegram(f"{self.name} ENTRY\n{hedge}\n{sell_leg}")
+        send_telegram(f"🚀 {self.name} ENTRY\n{hedge}\n{sell_leg}")
 
     def exit_spread(self):
         if not self.active:
@@ -179,15 +198,14 @@ class CPRScenario:
         self.sell(self.legs["hedge"])
         self.active = False
         logger.info(f"[{self.name}] EXIT")
-        send_telegram(f"{self.name} EXIT")
+        send_telegram(f"✅ {self.name} EXIT")
 
 # =========================================================
-# SCENARIO 1 – PUT SPREAD
+# SCENARIOS (UNCHANGED LOGIC)
 # =========================================================
 class Scenario1(CPRScenario):
     def evaluate(self, candles, ltp):
         last = candles[-1]
-
         if self.trade_taken:
             if last[4] < self.cpr["R1"] or last[2] >= self.cpr["R2"]:
                 self.exit_spread()
@@ -208,13 +226,9 @@ class Scenario1(CPRScenario):
                 self.enter_spread(hedge, sell)
                 break
 
-# =========================================================
-# SCENARIO 2 – CALL SPREAD
-# =========================================================
 class Scenario2(CPRScenario):
     def evaluate(self, candles, ltp):
         last = candles[-1]
-
         if self.trade_taken:
             if last[4] > self.cpr["S1"] or last[3] <= self.cpr["S2"]:
                 self.exit_spread()
@@ -235,13 +249,9 @@ class Scenario2(CPRScenario):
                 self.enter_spread(hedge, sell)
                 break
 
-# =========================================================
-# SCENARIO 3 – MEAN REVERSION
-# =========================================================
 class Scenario3(CPRScenario):
     def evaluate(self, candles, ltp):
         last = candles[-1]
-
         if self.trade_taken:
             if last[4] > self.entry_high or last[3] <= self.cpr["S1"]:
                 self.exit_spread()
