@@ -185,7 +185,10 @@ def format_expiry_for_symbol(expiry_date):
         return f"{yy}{expiry_date.strftime('%b').upper()}"
     m = expiry_date.month
     d = expiry_date.day
-    m_token = {10: "O", 11: "N", 12: "D"}.get(m, f"{m:02d}")
+    if m in (10, 11, 12):
+        m_token = {10: "O", 11: "N", 12: "D"}[m]
+    else:
+        m_token = str(m)
     return f"{yy}{m_token}{d:02d}"
 
 def get_atm_symbols(fyers):
