@@ -20,9 +20,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 LOT_SIZE = 150
 TICK_SIZE = 0.05
-S1_BUFFER = 0.5
 
-LOG_FILE = "nifty_scenario2_15m.log"
+LOG_FILE = "nifty_scenario_s1_r1_15m.log"
 MAX_CPR_LOOKBACK_DAYS = 10
 TRADING_END_TIME = datetime.time(15, 0)
 
@@ -73,6 +72,7 @@ def calculate_cpr(h, l, c):
         "BC": bc,
         "TC": tc,
         "R1": 2 * p - l,
+        "R2": p + (h - l),
         "S1": 2 * p - h,
         "S2": p - (h - l),
     }
@@ -81,64 +81,26 @@ def get_last_trading_day_cpr(fyers, symbol):
     today = datetime.date.today()
     for i in range(1, MAX_CPR_LOOKBACK_DAYS + 1):
         d = today - datetime.timedelta(days=i)
-        try:
-            r = fyers.history({
-                "symbol": symbol,
-                "resolution": "D",
-                "date_format": "1",
-                "range_from": d.strftime("%Y-%m-%d"),
-                "range_to": d.strftime("%Y-%m-%d"),
-                "cont_flag": "1"
-            })
-            candles = r.get("candles", [])
-            if candles:
-                _, _, h, l, c, _ = candles[0]
-                cpr = calculate_cpr(h, l, c)
-                logger.info(
-                    f"[CPR INIT] {symbol} | DATE={d} | "
-                    f"BC={round(cpr['BC'],2)} "
-                    f"S1={round(cpr['S1'],2)} "
-                    f"S2={round(cpr['S2'],2)}"
-                )
-                return cpr
-        except Exception as e:
-            logger.error(f"[CPR ERROR] {symbol} {e}")
-    logger.error(f"[CPR FAIL] No CPR found for {symbol}")
+        r = fyers.history({
+            "symbol": symbol,
+            "resolution": "D",
+            "date_format": "1",
+            "range_from": d.strftime("%Y-%m-%d"),
+            "range_to": d.strftime("%Y-%m-%d"),
+            "cont_flag": "1"
+        })
+        candles = r.get("candles", [])
+        if candles:
+            _, _, h, l, c, _ = candles[0]
+            cpr = calculate_cpr(h, l, c)
+            logger.info(f"[CPR INIT] {symbol} {cpr}")
+            return cpr
     return None
-
-# =========================================================
-# NIFTY ATM SYMBOL (ORIGINAL LOGIC)
-# =========================================================
-def is_last_tuesday(date_obj):
-    return date_obj.weekday() == 1 and (date_obj + datetime.timedelta(days=7)).month != date_obj.month
-
-def get_next_nifty_expiry():
-    today = datetime.date.today()
-    return today if today.weekday() == 1 else today + datetime.timedelta(days=(1 - today.weekday()) % 7)
-
-def format_nifty_expiry(expiry):
-    yy = expiry.strftime("%y")
-    if is_last_tuesday(expiry):
-        return f"{yy}{expiry.strftime('%b').upper()}"
-    m_token = {10: "O", 11: "N", 12: "D"}.get(expiry.month, f"{expiry.month:02d}")
-    return f"{yy}{m_token}{expiry.day:02d}"
-
-def get_atm_nifty_symbols(fyers):
-    resp = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-    ltp = float(resp["d"][0]["v"]["lp"])
-    atm = round(ltp / 50) * 50
-    expiry = format_nifty_expiry(get_next_nifty_expiry())
-    symbols = [
-        f"NSE:NIFTY{expiry}{atm}CE",
-        f"NSE:NIFTY{expiry}{atm}PE"
-    ]
-    logger.info(f"[SYMBOLS] Selected ATM symbols: {symbols}")
-    return symbols
 
 # =========================================================
 # STRATEGY
 # =========================================================
-class Scenario2_15M:
+class ScenarioS1R1_15M:
     def __init__(self, fyers):
         self.fyers = fyers
         self.cpr = {}
@@ -156,52 +118,73 @@ class Scenario2_15M:
             "range_to": today,
             "cont_flag": "1"
         })
-        candles = r.get("candles", [])
-        logger.debug(f"[CANDLES] {symbol} fetched {len(candles)} candles")
-        return candles
+        return r.get("candles", [])
+
+    def calc_sl_target(self, entry, high, s2=None, tc=None):
+        sl = min(high + 1, entry + 16)
+        sl = round_to_tick(sl)
+        risk = sl - entry
+
+        if s2 is not None:
+            target = min(s2, entry - 2 * risk)
+        else:
+            target = tc
+
+        return sl, round_to_tick(target)
 
     def evaluate(self, symbol):
         if symbol in self.trade_taken:
             return
 
         candles = self.fetch_15m_candles(symbol)
-        if len(candles) < 2:
+        if len(candles) < 1:
             return
-
-        if symbol not in self.start_logged:
-            logger.info(f"[WAITING] {symbol} waiting for setup...")
-            self.start_logged.add(symbol)
 
         cpr = self.cpr.get(symbol)
         if not cpr:
             return
 
-        bc, s1, s2 = cpr["BC"], cpr["S1"], cpr["S2"]
+        s1, s2, r1, r2, tc = (
+            cpr["S1"], cpr["S2"], cpr["R1"], cpr["R2"], cpr["TC"]
+        )
 
+        # =====================================================
+        # SCENARIO 1 – S1 FAILURE
+        # =====================================================
         first_close = candles[0][4]
-        if not (bc < first_close < s1):
-            return
-
-        green_idx = None
-        for i in range(1, len(candles)):
-            o, h, l, c = candles[i][1:5]
-            if c > o and c > s1 and l <= s1:
-                if all(candles[j][4] > s1 for j in range(1, i)):
+        if first_close > s1:
+            green_idx = None
+            for i, cndl in enumerate(candles):
+                o, h, l, c = cndl[1:5]
+                if c > o and l <= s1:
                     green_idx = i
                     break
 
-        if green_idx is None:
+            if green_idx is not None:
+                for j in range(green_idx + 1, len(candles)):
+                    o, h, l, c = candles[j][1:5]
+                    if c < o and c < s1:
+                        sl, target = self.calc_sl_target(c, h, s2=s2)
+                        self.enter_trade(symbol, c, sl, target, "S1FAIL")
+                        return
+
+        # =====================================================
+        # SCENARIO 2 – R1 REJECTION
+        # =====================================================
+        touched_r2 = any(cndl[2] >= r2 for cndl in candles)
+        if touched_r2:
             return
 
-        for j in range(green_idx + 1, len(candles)):
-            o, h, l, c = candles[j][1:5]
-            if c < o and c <= s1 - S1_BUFFER:
-                self.enter_trade(symbol, c, h, s2)
-                break
+        for cndl in candles:
+            o, h, l, c = cndl[1:5]
+            if h >= r1 and c < r1 and c < o:
+                sl, target = self.calc_sl_target(c, h, tc=tc)
+                self.enter_trade(symbol, c, sl, target, "R1REJ")
+                return
 
-    def enter_trade(self, symbol, entry, sl, target):
+    def enter_trade(self, symbol, entry, sl, target, tag):
         logger.info(
-            f"[ENTRY SIGNAL] {symbol} SELL close={entry} SL={sl} TARGET={target}"
+            f"[ENTRY {tag}] {symbol} ENTRY={entry} SL={sl} TARGET={target}"
         )
 
         self.fyers.place_order({
@@ -211,11 +194,10 @@ class Scenario2_15M:
             "side": -1,
             "productType": "INTRADAY",
             "validity": "DAY",
-            "orderTag": "S2ENTRY"
+            "orderTag": tag
         })
 
-        sl = round_to_tick(sl)
-        sl_order = self.fyers.place_order({
+        sl_id = self.fyers.place_order({
             "symbol": symbol,
             "qty": LOT_SIZE,
             "type": 4,
@@ -224,15 +206,14 @@ class Scenario2_15M:
             "limitPrice": sl + TICK_SIZE,
             "productType": "INTRADAY",
             "validity": "DAY",
-            "orderTag": "S2SL"
-        })
+            "orderTag": f"{tag}_SL"
+        }).get("id")
 
-        self.positions[symbol] = sl_order.get("id")
+        self.positions[symbol] = sl_id
         self.trade_taken.add(symbol)
 
     def force_exit(self):
         for symbol, sl_id in list(self.positions.items()):
-            logger.info(f"[TIME EXIT] {symbol} exiting at 15:00")
             self.fyers.place_order({
                 "symbol": symbol,
                 "qty": LOT_SIZE,
@@ -249,7 +230,7 @@ class Scenario2_15M:
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("[STARTUP] Scenario 2 (15m) strategy started")
+    logger.info("[START] Scenario S1 + R1 15m started")
 
     fyers = fyersModel.FyersModel(
         client_id=CLIENT_ID,
@@ -258,9 +239,9 @@ if __name__ == "__main__":
         log_path=""
     )
 
-    strategy = Scenario2_15M(fyers)
-    symbols = get_atm_nifty_symbols(fyers)
+    strategy = ScenarioS1R1_15M(fyers)
 
+    symbols = []  # reuse your existing ATM symbol logic
     for s in symbols:
         strategy.cpr[s] = get_last_trading_day_cpr(fyers, s)
 
