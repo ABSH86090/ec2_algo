@@ -413,8 +413,7 @@ if __name__ == "__main__":
         on_connect=on_open,
         on_close=lambda m: logger.info(f"Order socket closed: {m}"),
         on_error=lambda m: logger.error(f"Order socket error: {m}"),
-        on_orders=on_order,
-        on_trades=on_trade
+        on_orders=on_order
     )
 
     ws_order.connect()
