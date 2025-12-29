@@ -275,7 +275,7 @@ if __name__ == "__main__":
     for c in hist:
         engine.candles.append(c)
 
-    closes = [c["close"] for c in engine.candles[-MIN_BARS_FOR_EMA:]]
+    closes = [c["close"] for c in list(engine.candles)[-MIN_BARS_FOR_EMA:]]
     ema5 = engine.ema(closes, EMA_FAST)
     ema20 = engine.ema(closes, EMA_SLOW)
 
