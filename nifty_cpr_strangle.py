@@ -100,17 +100,19 @@ class StrangleS1S2Combined15M:
         self.s1 = self.cpr["S1"]
         self.s2 = self.cpr["S2"]
 
-        msg = (
+        cpr_msg = (
             f"📊 STRANGLE CPR INITIALIZED\n"
             f"S1 = {self.s1:.2f}\n"
             f"S2 = {self.s2:.2f}"
         )
+        logger.info(cpr_msg)
+        send_telegram(cpr_msg)
 
-        logger.info(msg)
-        send_telegram(msg)
+        # 🔹 Initial premium log
+        self.log_initial_premium()
 
     # -----------------------------------------------------
-    # Robust previous-day CPR with lookback
+    # Robust CPR with 7-day lookback
     # -----------------------------------------------------
     def compute_prevday_cpr(self):
         today = datetime.date.today()
@@ -150,6 +152,33 @@ class StrangleS1S2Combined15M:
 
         send_telegram("⚠️ CPR ERROR: No historical data found (7-day lookback)")
         raise Exception("No historical data found for CPR")
+
+    # -----------------------------------------------------
+    # Initial premium logger
+    # -----------------------------------------------------
+    def log_initial_premium(self):
+        q = self.fyers.quotes({
+            "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
+        })
+
+        prices = {x["n"]: x["v"]["lp"] for x in q.get("d", [])}
+        ce = prices.get(self.sym["SELL_CE"])
+        pe = prices.get(self.sym["SELL_PE"])
+
+        if ce is None or pe is None:
+            logger.warning("[INIT] Unable to fetch initial premiums")
+            return
+
+        total = ce + pe
+
+        msg = (
+            f"💰 STRANGLE PREMIUM (INIT)\n"
+            f"CE = {ce:.2f}\n"
+            f"PE = {pe:.2f}\n"
+            f"TOTAL = {total:.2f}"
+        )
+        logger.info(msg)
+        send_telegram(msg)
 
     # -----------------------------------------------------
     # Latest 15m combined candle
