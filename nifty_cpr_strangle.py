@@ -41,7 +41,7 @@ def send_telegram(msg):
             pass
 
 # =========================================================
-# CPR ON COMBINED STRANGLE
+# CPR
 # =========================================================
 def calculate_cpr_levels(high, low, close):
     p = (high + low + close) / 3
@@ -95,52 +95,61 @@ class StrangleS1S2Combined15M:
         self.traded = False
         self.sl = None
 
+        # 🔹 CPR INIT
         self.cpr = self.compute_prevday_cpr()
         self.s1 = self.cpr["S1"]
         self.s2 = self.cpr["S2"]
 
-        logger.info(
-            f"[CPR INIT] S1={self.s1:.2f} S2={self.s2:.2f}"
-        )
-        send_telegram(
-            f"📊 STRANGLE CPR\nS1={self.s1:.2f}\nS2={self.s2:.2f}"
+        msg = (
+            f"📊 STRANGLE CPR INITIALIZED\n"
+            f"S1 = {self.s1:.2f}\n"
+            f"S2 = {self.s2:.2f}"
         )
 
+        logger.info(msg)
+        send_telegram(msg)
+
     # -----------------------------------------------------
-    # Previous-day combined CPR
+    # Robust previous-day CPR with lookback
     # -----------------------------------------------------
     def compute_prevday_cpr(self):
-        prev = datetime.date.today() - datetime.timedelta(days=1)
+        today = datetime.date.today()
 
-        def hist(symbol):
+        def hist(symbol, day):
             r = self.fyers.history({
                 "symbol": symbol,
                 "resolution": "15",
                 "date_format": "1",
-                "range_from": prev.strftime("%Y-%m-%d"),
-                "range_to": prev.strftime("%Y-%m-%d"),
+                "range_from": day.strftime("%Y-%m-%d"),
+                "range_to": day.strftime("%Y-%m-%d"),
                 "cont_flag": "1"
             })
             return r.get("candles", [])
 
-        ce_c = hist(self.sym["SELL_CE"])
-        pe_c = hist(self.sym["SELL_PE"])
+        for i in range(1, 8):
+            day = today - datetime.timedelta(days=i)
 
-        if not ce_c or not pe_c:
-            raise Exception("No history for CPR")
+            ce_c = hist(self.sym["SELL_CE"], day)
+            pe_c = hist(self.sym["SELL_PE"], day)
 
-        highs, lows, closes = [], [], []
+            if ce_c and pe_c:
+                highs, lows, closes = [], [], []
 
-        for c1, c2 in zip(ce_c, pe_c):
-            highs.append(c1[2] + c2[2])
-            lows.append(c1[3] + c2[3])
-            closes.append(c1[4] + c2[4])
+                for c1, c2 in zip(ce_c, pe_c):
+                    highs.append(c1[2] + c2[2])
+                    lows.append(c1[3] + c2[3])
+                    closes.append(c1[4] + c2[4])
 
-        return calculate_cpr_levels(
-            max(highs),
-            min(lows),
-            closes[-1]
-        )
+                logger.info(f"[CPR] Using data from {day}")
+
+                return calculate_cpr_levels(
+                    max(highs),
+                    min(lows),
+                    closes[-1]
+                )
+
+        send_telegram("⚠️ CPR ERROR: No historical data found (7-day lookback)")
+        raise Exception("No historical data found for CPR")
 
     # -----------------------------------------------------
     # Latest 15m combined candle
@@ -162,6 +171,7 @@ class StrangleS1S2Combined15M:
 
         ce = last(self.sym["SELL_CE"])
         pe = last(self.sym["SELL_PE"])
+
         if not ce or not pe:
             return None
 
@@ -181,21 +191,19 @@ class StrangleS1S2Combined15M:
         if not c:
             return
 
-        # ----- Entry condition -----
         if c["close"] < self.s1:
-            mid_level = self.s1 - 0.5 * (self.s1 - self.s2)
+            mid = self.s1 - 0.5 * (self.s1 - self.s2)
 
-            # 🔴 NEW SKIP RULE
-            if c["close"] < mid_level:
+            if c["close"] < mid:
                 logger.info(
-                    f"[SKIP] Close {c['close']:.2f} too close to S2 "
-                    f"(Mid={mid_level:.2f})"
+                    f"[SKIP] Close {c['close']:.2f} too close to S2 (Mid={mid:.2f})"
                 )
                 return
 
             logger.info(
                 f"[ENTRY] Close={c['close']:.2f} < S1 | SL={c['high']:.2f}"
             )
+
             send_telegram(
                 f"📉 STRANGLE ENTRY\n"
                 f"Close={c['close']:.2f}\n"
@@ -204,12 +212,11 @@ class StrangleS1S2Combined15M:
                 f"SL={c['high']:.2f}"
             )
 
-            # Buy hedges first
             for tag, side, sym in [
                 ("HEDGECE", 1, self.sym["HEDGE_CE"]),
                 ("HEDGEPE", 1, self.sym["HEDGE_PE"]),
-                ("STRANGLECE", -1, self.sym["SELL_CE"]),
-                ("STRANGLEPE", -1, self.sym["SELL_PE"]),
+                ("SELLCE", -1, self.sym["SELL_CE"]),
+                ("SELLPE", -1, self.sym["SELL_PE"]),
             ]:
                 self.fyers.place_order({
                     "symbol": sym,
@@ -225,7 +232,7 @@ class StrangleS1S2Combined15M:
             self.traded = True
 
     # -----------------------------------------------------
-    # EXIT LOGIC
+    # EXIT
     # -----------------------------------------------------
     def check_exit(self):
         if not self.traded:
@@ -234,20 +241,13 @@ class StrangleS1S2Combined15M:
         q = self.fyers.quotes({
             "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
         })
-        d = q.get("d", [])
-        prices = {x["n"]: x["v"]["lp"] for x in d}
-
+        prices = {x["n"]: x["v"]["lp"] for x in q.get("d", [])}
         premium = prices[self.sym["SELL_CE"]] + prices[self.sym["SELL_PE"]]
 
-        # 🔴 SL EXIT
         if premium >= self.sl:
             reason = "SL HIT"
-
-        # 🔴 NEW S2 EXIT
         elif premium <= self.s2:
             reason = "S2 HIT"
-
-        # 🔴 TIME EXIT
         elif datetime.datetime.now().time() >= TRADING_END:
             reason = "TIME EXIT"
         else:
