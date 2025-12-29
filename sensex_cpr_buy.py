@@ -408,8 +408,13 @@ if __name__ == "__main__":
 
     ws_order = order_ws.FyersOrderSocket(
         access_token=fyers.auth,
-        on_message=on_order,
-        log_path=""
+        write_to_file=False,
+        log_path="",
+        on_connect=on_open,
+        on_close=lambda m: logger.info(f"Order socket closed: {m}"),
+        on_error=lambda m: logger.error(f"Order socket error: {m}"),
+        on_orders=on_order,
+        on_trades=on_trade
     )
 
     ws_order.connect()
