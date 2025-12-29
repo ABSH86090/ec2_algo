@@ -6,10 +6,10 @@ import time
 import uuid
 import sys
 import requests
-from collections import defaultdict, deque
+from collections import deque
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersWebsocket import order_ws, data_ws
+from fyers_apiv3.FyersWebsocket import data_ws
 
 # =========================================================
 # CONFIG
@@ -25,7 +25,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LOT_SIZE = 150
 
 ATM_DECISION_TIME = datetime.time(9, 16)
-TRADING_START = datetime.time(9, 18)
 TRADING_END = datetime.time(15, 0)
 
 CANDLE_MINUTES = 3
@@ -36,18 +35,14 @@ EMA_SLOW = 20
 EMA_GAP_MIN = 5
 
 MIN_BARS_FOR_EMA = 25
-HIST_PREFILL_BARS = 60
+HIST_PREFILL_BARS = 80   # More history → stable EMA
 MAX_SL_POINTS = 200
 
-JOURNAL_FILE = "nifty_strangle_trades.csv"
 LOG_FILE = "nifty_strangle_framework.log"
 
 # =========================================================
 # LOGGING + TELEGRAM
 # =========================================================
-for h in logging.root.handlers[:]:
-    logging.root.removeHandler(h)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -70,12 +65,6 @@ def send_telegram(msg):
             )
         except Exception:
             pass
-
-class TelegramHandler(logging.Handler):
-    def emit(self, record):
-        send_telegram(self.format(record))
-
-logger.addHandler(TelegramHandler())
 
 # =========================================================
 # SYMBOL UTILS
@@ -193,11 +182,18 @@ class StrategyEngine:
         self.stage = 0
         self.disabled_for_day = False
 
+    # ✅ Correct EMA (SMA seeded)
     def ema(self, values, period):
-        ema = values[0]
+        if len(values) < period:
+            return None
+
+        sma = sum(values[:period]) / period
+        ema = sma
         k = 2 / (period + 1)
-        for v in values[1:]:
+
+        for v in values[period:]:
             ema = v * k + ema * (1 - k)
+
         return ema
 
     def on_candle(self, candle, closed):
@@ -207,11 +203,11 @@ class StrategyEngine:
         if len(self.candles) < MIN_BARS_FOR_EMA or self.disabled_for_day:
             return
 
-        closes = [c["close"] for c in list(engine.candles)[-MIN_BARS_FOR_EMA:]]
+        closes = [c["close"] for c in list(self.candles)[-HIST_PREFILL_BARS:]]
         ema5 = self.ema(closes, EMA_FAST)
         ema20 = self.ema(closes, EMA_SLOW)
 
-        # ENTRY LOGIC (UNCHANGED)
+        # ================= ENTRY FSM =================
         if closed and self.stage == 0:
             if candle["close"] < candle["open"] and ema5 < ema20:
                 self.stage = 1
@@ -245,6 +241,7 @@ class StrategyEngine:
                 self.position = {"entry": entry, "sl": sl}
                 self.stage = 3
 
+        # ================= SL / EOD =================
         if self.position:
             if candle["high"] >= self.position["sl"]:
                 logger.info("[SL HIT]")
@@ -252,6 +249,7 @@ class StrategyEngine:
 
                 self.fyers.buy_market(self.ce, "EXITCE")
                 self.fyers.buy_market(self.pe, "EXITPE")
+
                 self.disabled_for_day = True
                 self.position = None
 
@@ -272,15 +270,19 @@ if __name__ == "__main__":
 
     # ===== PREFILL HISTORY =====
     hist = fetch_historical_premium(fyers, ce, pe)
+
     for c in hist:
         engine.candles.append(c)
 
-    closes = [c["close"] for c in list(engine.candles)[-MIN_BARS_FOR_EMA:]]
-    ema5 = engine.ema(closes, EMA_FAST)
-    ema20 = engine.ema(closes, EMA_SLOW)
+    if len(engine.candles) >= MIN_BARS_FOR_EMA:
+        closes = [c["close"] for c in list(engine.candles)[-HIST_PREFILL_BARS:]]
+        ema5 = engine.ema(closes, EMA_FAST)
+        ema20 = engine.ema(closes, EMA_SLOW)
 
-    logger.info(f"[EMA READY] EMA5={ema5:.2f} EMA20={ema20:.2f}")
-    send_telegram(f"📊 EMA READY\nEMA5={ema5:.2f}\nEMA20={ema20:.2f}")
+        logger.info(f"[EMA READY] EMA5={ema5:.2f} EMA20={ema20:.2f}")
+        send_telegram(f"📊 EMA READY\nEMA5={ema5:.2f}\nEMA20={ema20:.2f}")
+    else:
+        logger.warning("[EMA PREFILL FAILED] Not enough historical candles")
 
     # ===== WEBSOCKET =====
     last = {}
@@ -291,7 +293,7 @@ if __name__ == "__main__":
         return int(ts // 1000) if ts and ts > 10_000_000_000 else int(ts)
 
     def on_tick(msg):
-        global candle
+        nonlocal candle
         if "symbol" not in msg or "ltp" not in msg:
             return
 
