@@ -21,7 +21,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LOT_SIZE = 150
 TICK_SIZE = 0.05
 
-LOG_FILE = "nifty_scenario_s1_r1_15m.log"
+LOG_FILE = "nifty_s1_r1_15m.log"
 MAX_CPR_LOOKBACK_DAYS = 10
 TRADING_END_TIME = datetime.time(15, 0)
 
@@ -93,9 +93,49 @@ def get_last_trading_day_cpr(fyers, symbol):
         if candles:
             _, _, h, l, c, _ = candles[0]
             cpr = calculate_cpr(h, l, c)
-            logger.info(f"[CPR INIT] {symbol} {cpr}")
+            logger.info(
+                f"[CPR INIT] {symbol} | "
+                f"BC={round(cpr['BC'],2)} "
+                f"TC={round(cpr['TC'],2)} "
+                f"R1={round(cpr['R1'],2)} "
+                f"R2={round(cpr['R2'],2)} "
+                f"S1={round(cpr['S1'],2)} "
+                f"S2={round(cpr['S2'],2)}"
+            )
             return cpr
+    logger.error(f"[CPR FAIL] {symbol}")
     return None
+
+# =========================================================
+# ATM NIFTY SYMBOL LOGIC
+# =========================================================
+def is_last_tuesday(d):
+    return d.weekday() == 1 and (d + datetime.timedelta(days=7)).month != d.month
+
+def get_next_nifty_expiry():
+    today = datetime.date.today()
+    return today if today.weekday() == 1 else today + datetime.timedelta(days=(1 - today.weekday()) % 7)
+
+def format_nifty_expiry(expiry):
+    yy = expiry.strftime("%y")
+    if is_last_tuesday(expiry):
+        return f"{yy}{expiry.strftime('%b').upper()}"
+    m = {10: "O", 11: "N", 12: "D"}.get(expiry.month, f"{expiry.month:02d}")
+    return f"{yy}{m}{expiry.day:02d}"
+
+def get_atm_nifty_symbols(fyers):
+    resp = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
+    ltp = float(resp["d"][0]["v"]["lp"])
+    atm = round(ltp / 50) * 50
+    expiry = format_nifty_expiry(get_next_nifty_expiry())
+
+    symbols = [
+        f"NSE:NIFTY{expiry}{atm}CE",
+        f"NSE:NIFTY{expiry}{atm}PE"
+    ]
+
+    logger.info(f"[SYMBOLS] ATM symbols selected: {symbols}")
+    return symbols
 
 # =========================================================
 # STRATEGY
@@ -106,7 +146,6 @@ class ScenarioS1R1_15M:
         self.cpr = {}
         self.trade_taken = set()
         self.positions = {}
-        self.start_logged = set()
 
     def fetch_15m_candles(self, symbol):
         today = datetime.date.today().strftime("%Y-%m-%d")
@@ -137,49 +176,45 @@ class ScenarioS1R1_15M:
             return
 
         candles = self.fetch_15m_candles(symbol)
-        if len(candles) < 1:
+        if not candles:
             return
 
         cpr = self.cpr.get(symbol)
         if not cpr:
             return
 
-        s1, s2, r1, r2, tc = (
-            cpr["S1"], cpr["S2"], cpr["R1"], cpr["R2"], cpr["TC"]
-        )
+        s1, s2, r1, r2, tc = cpr["S1"], cpr["S2"], cpr["R1"], cpr["R2"], cpr["TC"]
 
-        # =====================================================
-        # SCENARIO 1 – S1 FAILURE
-        # =====================================================
-        first_close = candles[0][4]
-        if first_close > s1:
+        # =========================
+        # SCENARIO 1: S1 FAILURE
+        # =========================
+        if candles[0][4] > s1:
             green_idx = None
-            for i, cndl in enumerate(candles):
-                o, h, l, c = cndl[1:5]
+            for i, cd in enumerate(candles):
+                o, h, l, c = cd[1:5]
                 if c > o and l <= s1:
                     green_idx = i
                     break
 
             if green_idx is not None:
-                for j in range(green_idx + 1, len(candles)):
-                    o, h, l, c = candles[j][1:5]
+                for cd in candles[green_idx + 1:]:
+                    o, h, l, c = cd[1:5]
                     if c < o and c < s1:
-                        sl, target = self.calc_sl_target(c, h, s2=s2)
-                        self.enter_trade(symbol, c, sl, target, "S1FAIL")
+                        sl, tgt = self.calc_sl_target(c, h, s2=s2)
+                        self.enter_trade(symbol, c, sl, tgt, "S1FAIL")
                         return
 
-        # =====================================================
-        # SCENARIO 2 – R1 REJECTION
-        # =====================================================
-        touched_r2 = any(cndl[2] >= r2 for cndl in candles)
-        if touched_r2:
+        # =========================
+        # SCENARIO 2: R1 REJECTION
+        # =========================
+        if any(cd[2] >= r2 for cd in candles):
             return
 
-        for cndl in candles:
-            o, h, l, c = cndl[1:5]
+        for cd in candles:
+            o, h, l, c = cd[1:5]
             if h >= r1 and c < r1 and c < o:
-                sl, target = self.calc_sl_target(c, h, tc=tc)
-                self.enter_trade(symbol, c, sl, target, "R1REJ")
+                sl, tgt = self.calc_sl_target(c, h, tc=tc)
+                self.enter_trade(symbol, c, sl, tgt, "R1REJ")
                 return
 
     def enter_trade(self, symbol, entry, sl, target, tag):
@@ -214,6 +249,7 @@ class ScenarioS1R1_15M:
 
     def force_exit(self):
         for symbol, sl_id in list(self.positions.items()):
+            logger.info(f"[TIME EXIT] {symbol}")
             self.fyers.place_order({
                 "symbol": symbol,
                 "qty": LOT_SIZE,
@@ -230,7 +266,7 @@ class ScenarioS1R1_15M:
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("[START] Scenario S1 + R1 15m started")
+    logger.info("[STARTUP] S1 + R1 15m strategy started")
 
     fyers = fyersModel.FyersModel(
         client_id=CLIENT_ID,
@@ -241,7 +277,8 @@ if __name__ == "__main__":
 
     strategy = ScenarioS1R1_15M(fyers)
 
-    symbols = []  # reuse your existing ATM symbol logic
+    symbols = get_atm_nifty_symbols(fyers)
+
     for s in symbols:
         strategy.cpr[s] = get_last_trading_day_cpr(fyers, s)
 
