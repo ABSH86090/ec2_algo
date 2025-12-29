@@ -291,7 +291,7 @@ if __name__ == "__main__":
         return int(ts // 1000) if ts and ts > 10_000_000_000 else int(ts)
 
     def on_tick(msg):
-        nonlocal candle
+        global candle
         if "symbol" not in msg or "ltp" not in msg:
             return
 
