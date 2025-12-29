@@ -83,6 +83,9 @@ def get_symbols(fyers):
         "SELL_PE": f"NSE:NIFTY{expiry}{pe}PE",
         "HEDGE_CE": f"NSE:NIFTY{expiry}{ce+300}CE",
         "HEDGE_PE": f"NSE:NIFTY{expiry}{pe-300}PE",
+        "CE_STRIKE": ce,
+        "PE_STRIKE": pe,
+        "EXPIRY": expiry
     }
 
 # =========================================================
@@ -94,6 +97,16 @@ class StrangleS1S2Combined15M:
         self.sym = symbols
         self.traded = False
         self.sl = None
+
+        # 🔹 LOG STRIKES AT START
+        strike_msg = (
+            f"🎯 STRANGLE STRIKES\n"
+            f"Expiry : {self.sym['EXPIRY']}\n"
+            f"CE Sell : {self.sym['CE_STRIKE']} CE\n"
+            f"PE Sell : {self.sym['PE_STRIKE']} PE"
+        )
+        logger.info(strike_msg)
+        send_telegram(strike_msg)
 
         # 🔹 CPR INIT
         self.cpr = self.compute_prevday_cpr()
@@ -108,11 +121,8 @@ class StrangleS1S2Combined15M:
         logger.info(cpr_msg)
         send_telegram(cpr_msg)
 
-        # 🔹 Initial premium log
-        self.log_initial_premium()
-
     # -----------------------------------------------------
-    # Robust CPR with 7-day lookback
+    # Robust CPR with lookback
     # -----------------------------------------------------
     def compute_prevday_cpr(self):
         today = datetime.date.today()
@@ -150,35 +160,8 @@ class StrangleS1S2Combined15M:
                     closes[-1]
                 )
 
-        send_telegram("⚠️ CPR ERROR: No historical data found (7-day lookback)")
+        send_telegram("⚠️ CPR ERROR: No historical data found")
         raise Exception("No historical data found for CPR")
-
-    # -----------------------------------------------------
-    # Initial premium logger
-    # -----------------------------------------------------
-    def log_initial_premium(self):
-        q = self.fyers.quotes({
-            "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
-        })
-
-        prices = {x["n"]: x["v"]["lp"] for x in q.get("d", [])}
-        ce = prices.get(self.sym["SELL_CE"])
-        pe = prices.get(self.sym["SELL_PE"])
-
-        if ce is None or pe is None:
-            logger.warning("[INIT] Unable to fetch initial premiums")
-            return
-
-        total = ce + pe
-
-        msg = (
-            f"💰 STRANGLE PREMIUM (INIT)\n"
-            f"CE = {ce:.2f}\n"
-            f"PE = {pe:.2f}\n"
-            f"TOTAL = {total:.2f}"
-        )
-        logger.info(msg)
-        send_telegram(msg)
 
     # -----------------------------------------------------
     # Latest 15m combined candle
@@ -225,7 +208,7 @@ class StrangleS1S2Combined15M:
 
             if c["close"] < mid:
                 logger.info(
-                    f"[SKIP] Close {c['close']:.2f} too close to S2 (Mid={mid:.2f})"
+                    f"[SKIP] Close {c['close']:.2f} too close to S2"
                 )
                 return
 
