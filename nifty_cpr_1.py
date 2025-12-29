@@ -285,11 +285,13 @@ if __name__ == "__main__":
     while True:
         now = datetime.datetime.now().time()
 
-        for s in symbols:
-            strategy.evaluate(s)
-
         if now >= TRADING_END_TIME:
             strategy.force_exit()
             break
+
+        for s in symbols:
+            strategy.evaluate(s)
+
+        
 
         time.sleep(60)
