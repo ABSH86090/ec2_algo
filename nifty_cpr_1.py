@@ -199,7 +199,7 @@ class ScenarioS1R1_15M:
             if green_idx is not None:
                 for cd in candles[green_idx + 1:]:
                     o, h, l, c = cd[1:5]
-                    if c < o and c < s1:
+                    if c < o and s2 < c < s1:
                         sl, tgt = self.calc_sl_target(c, h, s2=s2)
                         self.enter_trade(symbol, c, sl, tgt, "S1FAIL")
                         return
