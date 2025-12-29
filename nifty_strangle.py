@@ -207,7 +207,7 @@ class StrategyEngine:
         if len(self.candles) < MIN_BARS_FOR_EMA or self.disabled_for_day:
             return
 
-        closes = [c["close"] for c in self.candles[-MIN_BARS_FOR_EMA:]]
+        closes = [c["close"] for c in list(engine.candles)[-MIN_BARS_FOR_EMA:]]
         ema5 = self.ema(closes, EMA_FAST)
         ema20 = self.ema(closes, EMA_SLOW)
 
