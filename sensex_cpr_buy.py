@@ -207,7 +207,7 @@ class ScenarioEngine:
         # PUT scenarios
         if p["close"] > self.cpr["BC"] and c["close"] < self.cpr["BC"] and c["close"] > self.cpr["S1"] and ema5 < ema20:
             return "PUT"
-        if p["close"] > self.cpr["S1"] and c["close"] < self.cpr["S1"]:
+        if p["close"] > self.cpr["S1"] and c["close"] < self.cpr["S1"] and ema5 < ema20:
             return "PUT"
         if p["high"] >= self.cpr["R1"] and c["close"] < self.cpr["R1"] and ema5 < ema20:
             return "PUT"
