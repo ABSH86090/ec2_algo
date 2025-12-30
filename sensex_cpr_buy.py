@@ -252,7 +252,7 @@ class TradeManager:
         mtm = pnl_points * qty
 
         # Partial exit
-        if mtm >= 3000 and self.pos["stage"] == 0:
+        if mtm >= 1200 and self.pos["stage"] == 0:
             self.fyers.sell_mkt(self.pos["symbol"], PARTIAL_QTY, "BOOK3000")
             self.pos["qty_left"] -= PARTIAL_QTY
             self.fyers.modify_sl(
@@ -265,7 +265,7 @@ class TradeManager:
             send_telegram("✅ PARTIAL EXIT\nSL → COST")
 
         # Trail SL
-        if mtm >= 5000 and self.pos["stage"] == 1:
+        if mtm >= 2000 and self.pos["stage"] == 1:
             new_sl = entry + 30
             self.fyers.modify_sl(
                 self.pos["sl_id"],
