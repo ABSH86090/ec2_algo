@@ -279,6 +279,21 @@ if __name__ == "__main__":
 
     for c in fetch_historical_premium(fyers, ce, pe):
         engine.candles.append(c)
+    # ===== EMA BOOT LOG =====
+    if len(engine.candles) >= MIN_BARS_FOR_EMA:
+        closes = [c["close"] for c in list(engine.candles)[-HIST_PREFILL_BARS:]]
+        ema5 = engine.ema(closes, EMA_FAST)
+        ema20 = engine.ema(closes, EMA_SLOW)
+        logger.info(
+            f"[EMA BOOT] EMA5={ema5:.2f} EMA20={ema20:.2f} GAP={ema20 - ema5:.2f}"
+        )
+        send_telegram(
+            f"📊 EMA READY (BOOT)\n"
+            f"EMA5={ema5:.2f}\n"
+            f"EMA20={ema20:.2f}\n"
+            f"GAP={ema20 - ema5:.2f}"
+        )
+
 
     # ========= WEBSOCKET =========
     last = {}
