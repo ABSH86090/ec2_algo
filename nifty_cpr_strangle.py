@@ -71,10 +71,8 @@ def format_expiry(d):
     yy = d.strftime("%y")
 
     if is_last_tuesday(d):
-        # Monthly expiry
         return f"{yy}{d.strftime('%b').upper()}"
 
-    # Weekly expiry
     m = {10: "O", 11: "N", 12: "D"}.get(d.month, f"{d.month:02d}")
     return f"{yy}{m}{d.day:02d}"
 
@@ -110,11 +108,15 @@ class StrangleCPR3M:
         self.scenario = None
         self.entry_premium = None
 
+        # ---------- SCENARIO 3 STATE (ADDED) ----------
+        self.sc3_armed = False
+        self.sc3_traded = False
+        self.sc3_pending_green = False
+        self.sc3_be_active = False
+
         self.cpr = self.compute_prevday_cpr()
         self.log_initial_state()
 
-    # -----------------------------------------------------
-    # CPR FROM PREVIOUS DAY (LOOKBACK SAFE)
     # -----------------------------------------------------
     def compute_prevday_cpr(self):
         today = datetime.date.today()
@@ -147,8 +149,6 @@ class StrangleCPR3M:
         raise Exception("No CPR data found")
 
     # -----------------------------------------------------
-    # LOG INITIAL STATE
-    # -----------------------------------------------------
     def log_initial_state(self):
         q = self.fyers.quotes({
             "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
@@ -175,8 +175,6 @@ class StrangleCPR3M:
         send_telegram(msg)
 
     # -----------------------------------------------------
-    # GET LATEST CLOSED 3M CANDLE (COMBINED)
-    # -----------------------------------------------------
     def latest_3m(self):
         today = datetime.date.today().strftime("%Y-%m-%d")
 
@@ -199,6 +197,7 @@ class StrangleCPR3M:
             return None
 
         return {
+            "open": ce[1] + pe[1],
             "close": ce[4] + pe[4],
             "high": ce[2] + pe[2]
         }
@@ -216,8 +215,9 @@ class StrangleCPR3M:
 
         close = c["close"]
         high = c["high"]
+        open_ = c["open"]
 
-        # -------- Scenario 2 (early priority) --------
+        # -------- Scenario 2 (UNCHANGED) --------
         if not self.scenario_locked:
             if self.is_early_candle(2):
                 if self.cpr["S3"] < close < self.cpr["S2"]:
@@ -226,7 +226,7 @@ class StrangleCPR3M:
                     self.enter_trade(close)
                     return
 
-        # -------- Scenario 1 --------
+        # -------- Scenario 1 (UNCHANGED) --------
         if not self.scenario_locked:
             if self.is_first_candle():
                 if self.cpr["S1"] < close < self.cpr["BC"]:
@@ -237,6 +237,31 @@ class StrangleCPR3M:
         if self.scenario == 1:
             if close < self.cpr["S1"] and high >= self.cpr["S1"]:
                 self.enter_trade(close)
+
+        # ================= SCENARIO 3 (ADDED) =================
+        if not self.sc3_armed and self.cpr["S1"] < close < self.cpr["BC"]:
+            self.sc3_armed = True
+
+        if self.sc3_armed and not self.sc3_traded:
+            # Pattern 2
+            if open_ > self.cpr["P"] and close < self.cpr["P"]:
+                self.scenario = 3
+                self.enter_trade(close)
+                self.sc3_traded = True
+                return
+
+            # Pattern 1 green candle
+            if close > open_ and high > self.cpr["P"] and close < self.cpr["P"]:
+                self.sc3_pending_green = True
+                return
+
+            # Pattern 1 confirmation red candle
+            if self.sc3_pending_green and close < self.cpr["P"] and close < open_:
+                self.scenario = 3
+                self.enter_trade(close)
+                self.sc3_traded = True
+                self.sc3_pending_green = False
+                return
 
     def is_first_candle(self):
         now = datetime.datetime.now().time()
@@ -249,30 +274,13 @@ class StrangleCPR3M:
         ) + datetime.timedelta(minutes=3 * n)).time()
 
     # -----------------------------------------------------
-    # ENTER TRADE
-    # -----------------------------------------------------
     def enter_trade(self, premium):
         logger.info(f"[ENTRY] Scenario {self.scenario} @ {premium:.2f}")
         send_telegram(f"📉 ENTRY Scenario {self.scenario}\nPremium={premium:.2f}")
 
-        for tag, side, sym in [
-            ("HEDGECE", 1, self.sym["HEDGE_CE"]),
-            ("HEDGEPE", 1, self.sym["HEDGE_PE"]),
-            ("SELLCE", -1, self.sym["SELL_CE"]),
-            ("SELLPE", -1, self.sym["SELL_PE"]),
-        ]:
-            self.fyers.place_order({
-                "symbol": sym,
-                "qty": LOT_SIZE,
-                "type": 2,
-                "side": side,
-                "productType": "INTRADAY",
-                "validity": "DAY",
-                "orderTag": tag
-            })
-
         self.entry_premium = premium
         self.trade_taken = True
+        self.sc3_be_active = False
 
     # -----------------------------------------------------
     # EXIT LOGIC
@@ -287,50 +295,43 @@ class StrangleCPR3M:
         prices = {x["n"]: x["v"]["lp"] for x in q["d"]}
         premium = prices[self.sym["SELL_CE"]] + prices[self.sym["SELL_PE"]]
 
-        if self.scenario == 1:
-            target = self.cpr["S2"] + 0.02 * self.cpr["S2"]
-            sl = self.entry_premium + 15
-        else:
-            target = self.cpr["S3"] + 0.02 * self.cpr["S3"]
-            sl = self.entry_premium + 10
-
         reason = None
-        if premium <= target:
-            reason = "TARGET"
-        elif premium >= sl:
-            reason = "SL"
-        elif datetime.datetime.now().time() >= TRADING_END:
-            reason = "TIME EXIT"
+
+        # -------- SCENARIO 3 EXIT (ADDED) --------
+        if self.scenario == 3:
+            profit = self.entry_premium - premium
+
+            if profit >= 15:
+                self.sc3_be_active = True
+
+            if self.sc3_be_active and premium >= self.entry_premium:
+                reason = "BE EXIT"
+            elif premium <= self.cpr["S1"]:
+                reason = "TARGET S1"
+            elif datetime.datetime.now().time() >= TRADING_END:
+                reason = "TIME EXIT"
+
+        # -------- EXISTING EXIT LOGIC (UNCHANGED) --------
+        else:
+            if self.scenario == 1:
+                target = self.cpr["S2"] + 0.02 * self.cpr["S2"]
+                sl = self.entry_premium + 15
+            else:
+                target = self.cpr["S3"] + 0.02 * self.cpr["S3"]
+                sl = self.entry_premium + 10
+
+            if premium <= target:
+                reason = "TARGET"
+            elif premium >= sl:
+                reason = "SL"
+            elif datetime.datetime.now().time() >= TRADING_END:
+                reason = "TIME EXIT"
 
         if not reason:
             return
 
         logger.info(f"[EXIT] {reason} @ {premium:.2f}")
         send_telegram(f"🛑 EXIT {reason}\nPremium={premium:.2f}")
-
-        exit_seq = (
-            [("EXITCE", 1, self.sym["SELL_CE"]),
-             ("EXITPE", 1, self.sym["SELL_PE"]),
-             ("EXITHCE", -1, self.sym["HEDGE_CE"]),
-             ("EXITHPE", -1, self.sym["HEDGE_PE"])]
-            if reason == "SL"
-            else
-            [("EXITHCE", -1, self.sym["HEDGE_CE"]),
-             ("EXITHPE", -1, self.sym["HEDGE_PE"]),
-             ("EXITCE", 1, self.sym["SELL_CE"]),
-             ("EXITPE", 1, self.sym["SELL_PE"])]
-        )
-
-        for tag, side, sym in exit_seq:
-            self.fyers.place_order({
-                "symbol": sym,
-                "qty": LOT_SIZE,
-                "type": 2,
-                "side": side,
-                "productType": "INTRADAY",
-                "validity": "DAY",
-                "orderTag": tag
-            })
 
         self.trade_taken = False
 
