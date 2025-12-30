@@ -17,7 +17,7 @@ ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE = 150
+LOT_SIZE = 130
 TRADING_END = datetime.time(15, 0)
 
 # =========================================================
