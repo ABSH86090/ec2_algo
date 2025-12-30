@@ -1,11 +1,9 @@
 # =========================================================
-# SENSEX INDEX → CPR + EMA → OPTIONS STRATEGY
-# EXCHANGE-MANAGED STOP LOSS (SL-L)
-# BUY ONLY ON 15-MIN CANDLE CLOSE
+# SENSEX CPR + EMA → OPTIONS BUYING STRATEGY (LIVE)
+# ONE TRADE PER DAY + PARTIAL EXIT + TRAILING SL
 # =========================================================
 
 import datetime
-import time
 import os
 import sys
 import logging
@@ -22,7 +20,6 @@ load_dotenv()
 
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
-
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -32,17 +29,15 @@ TIMEFRAME_MIN = 15
 EMA_FAST = 5
 EMA_SLOW = 20
 
-MAX_INDEX_CANDLE_SIZE = 200
-
 LOT_SIZE = 20
 LOTS = 2
 TOTAL_QTY = LOT_SIZE * LOTS
-PARTIAL_QTY = (TOTAL_QTY // 2 // LOT_SIZE) * LOT_SIZE
+PARTIAL_QTY = TOTAL_QTY // 2
 
 SL_POINTS = 30
 TARGET_POINTS = 60
 
-LOG_FILE = "sensex_exchange_sl_strategy.log"
+LOG_FILE = "sensex_cpr_live.log"
 
 # =========================================================
 # LOGGING
@@ -50,10 +45,7 @@ LOG_FILE = "sensex_exchange_sl_strategy.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ],
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
     force=True
 )
 logger = logging.getLogger(__name__)
@@ -111,8 +103,8 @@ class Fyers:
         return self.client.place_order({
             "symbol": symbol,
             "qty": qty,
-            "type": 4,                 # SL-L
-            "side": -1,                # SELL to exit long
+            "type": 4,   # SL-L
+            "side": -1,
             "productType": "INTRADAY",
             "limitPrice": limit,
             "stopPrice": trigger,
@@ -151,13 +143,13 @@ def compute_cpr(prev):
     h, l, c = prev["high"], prev["low"], prev["close"]
     p = (h + l + c) / 3
     bc = (h + l) / 2
-    tc = p * 2 - bc
+    tc = 2 * p - bc
     r1 = 2 * p - l
     s1 = 2 * p - h
     return {"P": p, "BC": min(bc, tc), "TC": max(bc, tc), "R1": r1, "S1": s1}
 
 # =========================================================
-# ATM SYMBOL (YOUR LOGIC)
+# ATM OPTION SYMBOL LOGIC (COMPLETE)
 # =========================================================
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2025, 10, 2),
@@ -169,19 +161,15 @@ def is_last_thursday(d):
 
 def get_next_expiry():
     today = datetime.date.today()
-    weekday = today.weekday()
-    days_to_thu = (3 - weekday) % 7
-    candidate = today + datetime.timedelta(days=days_to_thu)
-    return candidate - datetime.timedelta(days=1) if candidate in SPECIAL_MARKET_HOLIDAYS else candidate
+    days_to_thu = (3 - today.weekday()) % 7
+    expiry = today + datetime.timedelta(days=days_to_thu)
+    if expiry in SPECIAL_MARKET_HOLIDAYS:
+        expiry -= datetime.timedelta(days=1)
+    return expiry
 
 def format_expiry_for_symbol(expiry_date):
     yy = expiry_date.strftime("%y")
-    treat_as_monthly = (
-        expiry_date.weekday() == 3 and is_last_thursday(expiry_date)
-    ) or (
-        expiry_date.weekday() == 2 and is_last_thursday(expiry_date + datetime.timedelta(days=1))
-    )
-    if treat_as_monthly:
+    if is_last_thursday(expiry_date):
         return f"{yy}{expiry_date.strftime('%b').upper()}"
     m = expiry_date.month
     d = expiry_date.day
@@ -192,8 +180,8 @@ def format_expiry_for_symbol(expiry_date):
     return f"{yy}{m_token}{d:02d}"
 
 def get_atm_symbols(fyers):
-    resp = fyers.client.quotes({"symbols": INDEX_SYMBOL})
-    ltp = float(resp["d"][0]["v"]["lp"])
+    q = fyers.client.quotes({"symbols": INDEX_SYMBOL})
+    ltp = float(q["d"][0]["v"]["lp"])
     atm = round(ltp / 100) * 100
     expiry = get_next_expiry()
     exp = format_expiry_for_symbol(expiry)
@@ -204,15 +192,52 @@ def get_atm_symbols(fyers):
     return ce, pe
 
 # =========================================================
-# TRADE MANAGER (EXCHANGE SL)
+# SCENARIO ENGINE (ALL 5)
+# =========================================================
+class ScenarioEngine:
+    def __init__(self, cpr):
+        self.prev = deque(maxlen=2)
+        self.cpr = cpr
+
+    def evaluate(self, c, ema5, ema20):
+        if not self.prev:
+            return None
+        p = self.prev[-1]
+
+        # PUT scenarios
+        if p["close"] > self.cpr["BC"] and c["close"] < self.cpr["BC"] and c["close"] > self.cpr["S1"] and ema5 < ema20:
+            return "PUT"
+        if p["close"] > self.cpr["S1"] and c["close"] < self.cpr["S1"]:
+            return "PUT"
+        if p["high"] >= self.cpr["R1"] and c["close"] < self.cpr["R1"] and ema5 < ema20:
+            return "PUT"
+
+        # CALL scenarios
+        if p["close"] < self.cpr["BC"] and c["close"] > self.cpr["BC"] and ema5 > ema20:
+            return "CALL"
+        if p["close"] < self.cpr["R1"] and c["close"] > self.cpr["R1"] and ema5 > ema20:
+            return "CALL"
+
+        return None
+
+# =========================================================
+# TRADE MANAGER (ONE TRADE PER DAY)
 # =========================================================
 class TradeManager:
     def __init__(self, fyers):
         self.fyers = fyers
         self.pos = None
+        self.trade_date = None
+        self.trade_taken_today = False
 
     def enter(self, symbol):
-        if self.pos:
+        today = datetime.date.today()
+
+        if self.trade_date != today:
+            self.trade_date = today
+            self.trade_taken_today = False
+
+        if self.trade_taken_today or self.pos:
             return
 
         self.fyers.buy_mkt(symbol, TOTAL_QTY, "ENTRY")
@@ -220,146 +245,82 @@ class TradeManager:
         self.pos = {
             "symbol": symbol,
             "entry": None,
-            "qty_left": TOTAL_QTY,
+            "qty": TOTAL_QTY,
             "sl_id": None,
             "stage": 0,
             "sl_hit": False
         }
 
-        send_telegram(f"🚀 ENTRY\n{symbol}\nQty={TOTAL_QTY}")
+        self.trade_taken_today = True
+        send_telegram(f"🚀 ENTRY TAKEN\n{symbol}")
 
     def on_option_tick(self, ltp):
         if not self.pos:
             return
 
-        # First tick → place SL
         if self.pos["entry"] is None:
             self.pos["entry"] = ltp
             sl = ltp - SL_POINTS
-            resp = self.fyers.place_sl(
-                self.pos["symbol"],
-                self.pos["qty_left"],
-                sl,
-                sl - 0.5,
-                "SL_INIT"
-            )
-            self.pos["sl_id"] = resp["id"]
+            r = self.fyers.place_sl(self.pos["symbol"], self.pos["qty"], sl, sl - 0.5, "SL_INIT")
+            self.pos["sl_id"] = r["id"]
             return
 
         entry = self.pos["entry"]
-        qty = self.pos["qty_left"]
-        pnl_points = ltp - entry
-        mtm = pnl_points * qty
+        qty = self.pos["qty"]
+        mtm = (ltp - entry) * qty
 
-        # Partial exit
         if mtm >= 1200 and self.pos["stage"] == 0:
-            self.fyers.sell_mkt(self.pos["symbol"], PARTIAL_QTY, "BOOK3000")
-            self.pos["qty_left"] -= PARTIAL_QTY
-            self.fyers.modify_sl(
-                self.pos["sl_id"],
-                self.pos["qty_left"],
-                entry,
-                entry - 0.5
-            )
+            self.fyers.sell_mkt(self.pos["symbol"], PARTIAL_QTY, "PARTIAL")
+            self.pos["qty"] -= PARTIAL_QTY
+            self.fyers.modify_sl(self.pos["sl_id"], self.pos["qty"], entry, entry - 0.5)
             self.pos["stage"] = 1
-            send_telegram("✅ PARTIAL EXIT\nSL → COST")
+            send_telegram("✅ PARTIAL EXIT | SL → COST")
 
-        # Trail SL
         if mtm >= 2000 and self.pos["stage"] == 1:
             new_sl = entry + 30
-            self.fyers.modify_sl(
-                self.pos["sl_id"],
-                self.pos["qty_left"],
-                new_sl,
-                new_sl - 0.5
-            )
+            self.fyers.modify_sl(self.pos["sl_id"], self.pos["qty"], new_sl, new_sl - 0.5)
             self.pos["stage"] = 2
-            send_telegram("🔒 SL → ENTRY + 30")
+            send_telegram("🔒 SL TRAILED")
 
-        # Target exit
-        if pnl_points >= TARGET_POINTS and not self.pos["sl_hit"]:
-            self.fyers.sell_mkt(self.pos["symbol"], self.pos["qty_left"], "TARGET")
+        if ltp >= entry + TARGET_POINTS and not self.pos["sl_hit"]:
+            self.fyers.sell_mkt(self.pos["symbol"], self.pos["qty"], "TARGET")
             self.fyers.cancel(self.pos["sl_id"])
-            send_telegram("🎯 TARGET HIT\nSL CANCELLED")
+            send_telegram("🎯 TARGET HIT")
             self.pos = None
 
-    def on_order_update(self, msg):
-        if not self.pos:
-            return
-
-        if msg.get("id") == self.pos["sl_id"] and msg.get("status") == "FILLED":
-            self.pos["sl_hit"] = True
-            send_telegram("🛑 SL HIT BY EXCHANGE")
+    def on_order(self, msg):
+        if self.pos and msg.get("id") == self.pos["sl_id"] and msg.get("status") == "FILLED":
+            send_telegram("🛑 SL HIT")
             self.pos = None
-
-# =========================================================
-# SCENARIO ENGINE (SAMPLE PUT)
-# =========================================================
-class ScenarioEngine:
-    def __init__(self, cpr):
-        self.prev = deque(maxlen=5)
-        self.cpr = cpr
-
-    def evaluate(self, c, ema5, ema20):
-        if c["high"] - c["low"] > MAX_INDEX_CANDLE_SIZE:
-            return None
-
-        if (
-            self.prev
-            and self.prev[0]["close"] > self.cpr["BC"]
-            and c["close"] < self.cpr["BC"]
-            and c["close"] > self.cpr["S1"]
-            and ema5 < ema20
-        ):
-            return "PUT"
-
-        return None
 
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
     logger.info("🚀 STRATEGY STARTED")
-    send_telegram("🚀 SENSEX EXCHANGE-SL STRATEGY STARTED")
+    send_telegram("🚀 SENSEX CPR STRATEGY STARTED")
 
     fyers = Fyers()
     ce, pe = get_atm_symbols(fyers)
 
-    # ---- Fetch CPR ----
-    hist = fyers.client.history({
+    r = fyers.client.history({
         "symbol": INDEX_SYMBOL,
-        "resolution": "15",
+        "resolution": "D",
         "date_format": "1",
-        "range_from": (datetime.date.today() - datetime.timedelta(days=5)).strftime("%Y-%m-%d"),
-        "range_to": datetime.date.today().strftime("%Y-%m-%d"),
+        "range_from": (datetime.date.today() - datetime.timedelta(days=10)).strftime("%Y-%m-%d"),
+        "range_to": (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
         "cont_flag": "1"
-    })["candles"]
+    })
+    last = r["candles"][-1]
+    cpr = compute_cpr({"high": last[2], "low": last[3], "close": last[4]})
 
-    candles_hist = [{
-        "time": datetime.datetime.fromtimestamp(c[0]),
-        "open": c[1],
-        "high": c[2],
-        "low": c[3],
-        "close": c[4]
-    } for c in hist]
-
-    cpr = compute_cpr(candles_hist[-2])
     scenario_engine = ScenarioEngine(cpr)
     trade_mgr = TradeManager(fyers)
-
     candles = deque(maxlen=100)
 
-    # =====================================================
-    # WEBSOCKETS
-    # =====================================================
     def on_tick(msg):
-        if "symbol" not in msg or "ltp" not in msg:
-            return
-
-        now = datetime.datetime.now()
-
-        # INDEX
-        if msg["symbol"] == INDEX_SYMBOL:
+        if msg.get("symbol") == INDEX_SYMBOL:
+            now = datetime.datetime.now()
             ltp = msg["ltp"]
             bucket = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
 
@@ -367,36 +328,28 @@ if __name__ == "__main__":
                 if candles:
                     closed = candles[-1]
                     scenario_engine.prev.append(closed)
-
                     closes = [c["close"] for c in candles]
                     if len(closes) >= EMA_SLOW:
                         ema5 = ema(closes, EMA_FAST)
                         ema20 = ema(closes, EMA_SLOW)
-                        signal = scenario_engine.evaluate(closed, ema5, ema20)
-                        if signal == "PUT":
+                        sig = scenario_engine.evaluate(closed, ema5, ema20)
+                        if sig == "PUT":
                             trade_mgr.enter(pe)
-                        elif signal == "CALL":
+                        elif sig == "CALL":
                             trade_mgr.enter(ce)
 
-                candles.append({
-                    "time": bucket,
-                    "open": ltp,
-                    "high": ltp,
-                    "low": ltp,
-                    "close": ltp
-                })
+                candles.append({"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp})
             else:
                 c = candles[-1]
                 c["high"] = max(c["high"], ltp)
                 c["low"] = min(c["low"], ltp)
                 c["close"] = ltp
 
-        # OPTION
-        if trade_mgr.pos and msg["symbol"] == trade_mgr.pos["symbol"]:
+        if trade_mgr.pos and msg.get("symbol") == trade_mgr.pos["symbol"]:
             trade_mgr.on_option_tick(msg["ltp"])
 
     def on_order(msg):
-        trade_mgr.on_order_update(msg)
+        trade_mgr.on_order(msg)
 
     def on_open():
         ws_data.subscribe(symbols=[INDEX_SYMBOL, ce, pe], data_type="SymbolUpdate")
@@ -411,12 +364,8 @@ if __name__ == "__main__":
 
     ws_order = order_ws.FyersOrderSocket(
         access_token=fyers.auth,
-        write_to_file=False,
-        log_path="",
-        on_connect=on_open,
-        on_close=lambda m: logger.info(f"Order socket closed: {m}"),
-        on_error=lambda m: logger.error(f"Order socket error: {m}"),
-        on_orders=on_order
+        on_orders=on_order,
+        log_path=""
     )
 
     ws_order.connect()
