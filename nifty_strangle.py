@@ -35,21 +35,18 @@ EMA_SLOW = 20
 EMA_GAP_MIN = 5
 
 MIN_BARS_FOR_EMA = 25
-HIST_PREFILL_BARS = 80   # More history → stable EMA
+HIST_PREFILL_BARS = 80
 MAX_SL_POINTS = 200
 
 LOG_FILE = "nifty_strangle_framework.log"
 
 # =========================================================
-# LOGGING + TELEGRAM
+# LOGGING
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ],
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
     force=True
 )
 
@@ -136,11 +133,11 @@ class FyersClient:
         })
 
 # =========================================================
-# HISTORICAL PREFILL
+# HISTORICAL PREFILL (FIXED)
 # =========================================================
 def fetch_historical_premium(fyers, ce, pe):
     to_dt = datetime.datetime.now()
-    from_dt = to_dt - datetime.timedelta(minutes=HIST_PREFILL_BARS * 3)
+    from_dt = to_dt - datetime.timedelta(days=7)
 
     def fetch(symbol):
         r = fyers.client.history({
@@ -159,6 +156,9 @@ def fetch_historical_premium(fyers, ce, pe):
     candles = []
     for c1, c2 in zip(ce_hist, pe_hist):
         ts = datetime.datetime.fromtimestamp(c1[0])
+        if ts.time() < datetime.time(9, 15) or ts.time() > datetime.time(15, 30):
+            continue
+
         candles.append({
             "time": ts,
             "open": c1[1] + c2[1],
@@ -167,6 +167,7 @@ def fetch_historical_premium(fyers, ce, pe):
             "close": c1[4] + c2[4]
         })
 
+    logger.info(f"[PREFILL] Loaded {len(candles)} historical candles")
     return candles
 
 # =========================================================
@@ -182,18 +183,14 @@ class StrategyEngine:
         self.stage = 0
         self.disabled_for_day = False
 
-    # ✅ Correct EMA (SMA seeded)
     def ema(self, values, period):
         if len(values) < period:
             return None
-
         sma = sum(values[:period]) / period
         ema = sma
         k = 2 / (period + 1)
-
         for v in values[period:]:
             ema = v * k + ema * (1 - k)
-
         return ema
 
     def on_candle(self, candle, closed):
@@ -207,7 +204,10 @@ class StrategyEngine:
         ema5 = self.ema(closes, EMA_FAST)
         ema20 = self.ema(closes, EMA_SLOW)
 
-        # ================= ENTRY FSM =================
+        if ema5 is None or ema20 is None:
+            return
+
+        # ENTRY FSM (unchanged)
         if closed and self.stage == 0:
             if candle["close"] < candle["open"] and ema5 < ema20:
                 self.stage = 1
@@ -231,9 +231,7 @@ class StrategyEngine:
                     return
 
                 logger.info(f"[ENTRY] Entry={entry:.2f} SL={sl:.2f}")
-                send_telegram(
-                    f"📉 STRANGLE ENTRY\nEntry={entry:.2f}\nSL={sl:.2f}\nEMA5={ema5:.2f}\nEMA20={ema20:.2f}"
-                )
+                send_telegram(f"📉 STRANGLE ENTRY\nEntry={entry:.2f}\nSL={sl:.2f}")
 
                 self.fyers.sell_market(self.ce, "STRANGLECE")
                 self.fyers.sell_market(self.pe, "STRANGLEPE")
@@ -241,17 +239,15 @@ class StrategyEngine:
                 self.position = {"entry": entry, "sl": sl}
                 self.stage = 3
 
-        # ================= SL / EOD =================
-        if self.position:
-            if candle["high"] >= self.position["sl"]:
-                logger.info("[SL HIT]")
-                send_telegram("🛑 STRANGLE SL HIT")
+        if self.position and candle["high"] >= self.position["sl"]:
+            logger.info("[SL HIT]")
+            send_telegram("🛑 STRANGLE SL HIT")
 
-                self.fyers.buy_market(self.ce, "EXITCE")
-                self.fyers.buy_market(self.pe, "EXITPE")
+            self.fyers.buy_market(self.ce, "EXITCE")
+            self.fyers.buy_market(self.pe, "EXITPE")
 
-                self.disabled_for_day = True
-                self.position = None
+            self.disabled_for_day = True
+            self.position = None
 
 # =========================================================
 # MAIN
@@ -268,23 +264,12 @@ if __name__ == "__main__":
     ce, pe = get_nifty_strangle_symbols(fyers.client)
     engine = StrategyEngine(fyers, ce, pe)
 
-    # ===== PREFILL HISTORY =====
-    hist = fetch_historical_premium(fyers, ce, pe)
-
-    for c in hist:
+    for c in fetch_historical_premium(fyers, ce, pe):
         engine.candles.append(c)
 
-    if len(engine.candles) >= MIN_BARS_FOR_EMA:
-        closes = [c["close"] for c in list(engine.candles)[-HIST_PREFILL_BARS:]]
-        ema5 = engine.ema(closes, EMA_FAST)
-        ema20 = engine.ema(closes, EMA_SLOW)
+    logger.info("[EMA] Prefill completed")
 
-        logger.info(f"[EMA READY] EMA5={ema5:.2f} EMA20={ema20:.2f}")
-        send_telegram(f"📊 EMA READY\nEMA5={ema5:.2f}\nEMA20={ema20:.2f}")
-    else:
-        logger.warning("[EMA PREFILL FAILED] Not enough historical candles")
-
-    # ===== WEBSOCKET =====
+    # ===== WEBSOCKET (UNCHANGED) =====
     last = {}
     candle = None
 
@@ -293,7 +278,7 @@ if __name__ == "__main__":
         return int(ts // 1000) if ts and ts > 10_000_000_000 else int(ts)
 
     def on_tick(msg):
-        global candle
+        nonlocal candle
         if "symbol" not in msg or "ltp" not in msg:
             return
 
