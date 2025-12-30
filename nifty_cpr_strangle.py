@@ -60,13 +60,21 @@ def calculate_cpr(high, low, close):
 # =========================================================
 # SYMBOL HELPERS
 # =========================================================
+def is_last_tuesday(d):
+    return d.weekday() == 1 and (d + datetime.timedelta(days=7)).month != d.month
+
 def get_next_expiry():
     today = datetime.date.today()
-    offset = (1 - today.weekday()) % 7
-    return today + datetime.timedelta(days=offset)
+    return today if today.weekday() == 1 else today + datetime.timedelta(days=(1 - today.weekday()) % 7)
 
 def format_expiry(d):
     yy = d.strftime("%y")
+
+    if is_last_tuesday(d):
+        # Monthly expiry
+        return f"{yy}{d.strftime('%b').upper()}"
+
+    # Weekly expiry
     m = {10: "O", 11: "N", 12: "D"}.get(d.month, f"{d.month:02d}")
     return f"{yy}{m}{d.day:02d}"
 
