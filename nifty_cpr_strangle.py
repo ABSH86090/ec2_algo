@@ -288,10 +288,10 @@ class StrangleCPR3M:
         premium = prices[self.sym["SELL_CE"]] + prices[self.sym["SELL_PE"]]
 
         if self.scenario == 1:
-            target = self.cpr["S2"] - 0.02 * self.cpr["S2"]
+            target = self.cpr["S2"] + 0.02 * self.cpr["S2"]
             sl = self.entry_premium + 15
         else:
-            target = self.cpr["S3"] - 0.02 * self.cpr["S3"]
+            target = self.cpr["S3"] + 0.02 * self.cpr["S3"]
             sl = self.entry_premium + 10
 
         reason = None
