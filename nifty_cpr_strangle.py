@@ -21,7 +21,7 @@ LOT_SIZE = 150
 TRADING_END = datetime.time(15, 0)
 
 # =========================================================
-# LOGGING + TELEGRAM
+# LOGGING
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -30,41 +30,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def send_telegram(msg):
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]},
-                timeout=3
-            )
-        except Exception:
-            pass
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg[:4000]},
+            timeout=3
+        )
+    except Exception:
+        pass
 
 # =========================================================
-# CPR
+# CPR CALCULATION (STANDARD)
 # =========================================================
-def calculate_cpr_levels(high, low, close):
+def calculate_cpr(high, low, close):
     p = (high + low + close) / 3
+    bc = (high + low) / 2
+    tc = 2 * p - bc
     return {
         "P": p,
+        "BC": min(bc, tc),
+        "TC": max(bc, tc),
         "S1": 2 * p - high,
-        "S2": p - (high - low)
+        "S2": p - (high - low),
+        "S3": low - 2 * (high - p)
     }
 
 # =========================================================
-# SYMBOL UTILS
+# SYMBOL HELPERS
 # =========================================================
-def is_last_tuesday(d):
-    return d.weekday() == 1 and (d + datetime.timedelta(days=7)).month != d.month
-
 def get_next_expiry():
     today = datetime.date.today()
-    return today if today.weekday() == 1 else today + datetime.timedelta(days=(1 - today.weekday()) % 7)
+    offset = (1 - today.weekday()) % 7
+    return today + datetime.timedelta(days=offset)
 
 def format_expiry(d):
     yy = d.strftime("%y")
-    if is_last_tuesday(d):
-        return f"{yy}{d.strftime('%b').upper()}"
     m = {10: "O", 11: "N", 12: "D"}.get(d.month, f"{d.month:02d}")
     return f"{yy}{m}{d.day:02d}"
 
@@ -72,7 +74,6 @@ def get_symbols(fyers):
     q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
     spot = float(q["d"][0]["v"]["lp"])
     atm = round(spot / 50) * 50
-
     expiry = format_expiry(get_next_expiry())
 
     ce = atm + 100
@@ -81,48 +82,31 @@ def get_symbols(fyers):
     return {
         "SELL_CE": f"NSE:NIFTY{expiry}{ce}CE",
         "SELL_PE": f"NSE:NIFTY{expiry}{pe}PE",
-        "HEDGE_CE": f"NSE:NIFTY{expiry}{ce+300}CE",
-        "HEDGE_PE": f"NSE:NIFTY{expiry}{pe-300}PE",
+        "HEDGE_CE": f"NSE:NIFTY{expiry}{ce + 300}CE",
+        "HEDGE_PE": f"NSE:NIFTY{expiry}{pe - 300}PE",
         "CE_STRIKE": ce,
         "PE_STRIKE": pe,
         "EXPIRY": expiry
     }
 
 # =========================================================
-# STRATEGY
+# STRATEGY CLASS
 # =========================================================
-class StrangleS1S2Combined15M:
+class StrangleCPR3M:
     def __init__(self, fyers, symbols):
         self.fyers = fyers
         self.sym = symbols
-        self.traded = False
-        self.sl = None
 
-        # 🔹 LOG STRIKES AT START
-        strike_msg = (
-            f"🎯 STRANGLE STRIKES\n"
-            f"Expiry : {self.sym['EXPIRY']}\n"
-            f"CE Sell : {self.sym['CE_STRIKE']} CE\n"
-            f"PE Sell : {self.sym['PE_STRIKE']} PE"
-        )
-        logger.info(strike_msg)
-        send_telegram(strike_msg)
+        self.trade_taken = False
+        self.scenario_locked = False
+        self.scenario = None
+        self.entry_premium = None
 
-        # 🔹 CPR INIT
         self.cpr = self.compute_prevday_cpr()
-        self.s1 = self.cpr["S1"]
-        self.s2 = self.cpr["S2"]
-
-        cpr_msg = (
-            f"📊 STRANGLE CPR INITIALIZED\n"
-            f"S1 = {self.s1:.2f}\n"
-            f"S2 = {self.s2:.2f}"
-        )
-        logger.info(cpr_msg)
-        send_telegram(cpr_msg)
+        self.log_initial_state()
 
     # -----------------------------------------------------
-    # Robust CPR with lookback
+    # CPR FROM PREVIOUS DAY (LOOKBACK SAFE)
     # -----------------------------------------------------
     def compute_prevday_cpr(self):
         today = datetime.date.today()
@@ -140,46 +124,65 @@ class StrangleS1S2Combined15M:
 
         for i in range(1, 8):
             day = today - datetime.timedelta(days=i)
+            ce = hist(self.sym["SELL_CE"], day)
+            pe = hist(self.sym["SELL_PE"], day)
 
-            ce_c = hist(self.sym["SELL_CE"], day)
-            pe_c = hist(self.sym["SELL_PE"], day)
-
-            if ce_c and pe_c:
+            if ce and pe:
                 highs, lows, closes = [], [], []
-
-                for c1, c2 in zip(ce_c, pe_c):
+                for c1, c2 in zip(ce, pe):
                     highs.append(c1[2] + c2[2])
                     lows.append(c1[3] + c2[3])
                     closes.append(c1[4] + c2[4])
 
-                logger.info(f"[CPR] Using data from {day}")
+                return calculate_cpr(max(highs), min(lows), closes[-1])
 
-                return calculate_cpr_levels(
-                    max(highs),
-                    min(lows),
-                    closes[-1]
-                )
-
-        send_telegram("⚠️ CPR ERROR: No historical data found")
-        raise Exception("No historical data found for CPR")
+        raise Exception("No CPR data found")
 
     # -----------------------------------------------------
-    # Latest 15m combined candle
+    # LOG INITIAL STATE
     # -----------------------------------------------------
-    def latest_15m(self):
+    def log_initial_state(self):
+        q = self.fyers.quotes({
+            "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
+        })
+        prices = {x["n"]: x["v"]["lp"] for x in q["d"]}
+        ce_p = prices[self.sym["SELL_CE"]]
+        pe_p = prices[self.sym["SELL_PE"]]
+
+        msg = (
+            f"🚀 STRATEGY STARTED\n\n"
+            f"Expiry: {self.sym['EXPIRY']}\n"
+            f"CE: {self.sym['CE_STRIKE']} ({ce_p:.2f})\n"
+            f"PE: {self.sym['PE_STRIKE']} ({pe_p:.2f})\n"
+            f"Combined: {ce_p + pe_p:.2f}\n\n"
+            f"CPR LEVELS\n"
+            f"P: {self.cpr['P']:.2f}\n"
+            f"BC: {self.cpr['BC']:.2f}\n"
+            f"S1: {self.cpr['S1']:.2f}\n"
+            f"S2: {self.cpr['S2']:.2f}\n"
+            f"S3: {self.cpr['S3']:.2f}"
+        )
+
+        logger.info(msg)
+        send_telegram(msg)
+
+    # -----------------------------------------------------
+    # GET LATEST CLOSED 3M CANDLE (COMBINED)
+    # -----------------------------------------------------
+    def latest_3m(self):
         today = datetime.date.today().strftime("%Y-%m-%d")
 
         def last(symbol):
             r = self.fyers.history({
                 "symbol": symbol,
-                "resolution": "15",
+                "resolution": "3",
                 "date_format": "1",
                 "range_from": today,
                 "range_to": today,
                 "cont_flag": "1"
             })
             c = r.get("candles", [])
-            return c[-1] if c else None
+            return c[-2] if len(c) >= 2 else None
 
         ce = last(self.sym["SELL_CE"])
         pe = last(self.sym["SELL_PE"])
@@ -193,86 +196,62 @@ class StrangleS1S2Combined15M:
         }
 
     # -----------------------------------------------------
-    # ENTRY
+    # ENTRY EVALUATION
     # -----------------------------------------------------
     def evaluate(self):
-        if self.traded:
+        if self.trade_taken:
             return
 
-        c = self.latest_15m()
+        c = self.latest_3m()
         if not c:
             return
 
-        if c["close"] < self.s1:
-            mid = self.s1 - 0.5 * (self.s1 - self.s2)
+        close = c["close"]
+        high = c["high"]
 
-            if c["close"] < mid:
-                logger.info(
-                    f"[SKIP] Close {c['close']:.2f} too close to S2"
-                )
-                return
+        # -------- Scenario 2 (early priority) --------
+        if not self.scenario_locked:
+            if self.is_early_candle(2):
+                if self.cpr["S3"] < close < self.cpr["S2"]:
+                    self.scenario = 2
+                    self.scenario_locked = True
+                    self.enter_trade(close)
+                    return
 
-            logger.info(
-                f"[ENTRY] Close={c['close']:.2f} < S1 | SL={c['high']:.2f}"
-            )
+        # -------- Scenario 1 --------
+        if not self.scenario_locked:
+            if self.is_first_candle():
+                if self.cpr["S1"] < close < self.cpr["BC"]:
+                    self.scenario = 1
+                    self.scenario_locked = True
+                    return
 
-            send_telegram(
-                f"📉 STRANGLE ENTRY\n"
-                f"Close={c['close']:.2f}\n"
-                f"S1={self.s1:.2f}\n"
-                f"S2={self.s2:.2f}\n"
-                f"SL={c['high']:.2f}"
-            )
+        if self.scenario == 1:
+            if close < self.cpr["S1"] and high >= self.cpr["S1"]:
+                self.enter_trade(close)
 
-            for tag, side, sym in [
-                ("HEDGECE", 1, self.sym["HEDGE_CE"]),
-                ("HEDGEPE", 1, self.sym["HEDGE_PE"]),
-                ("SELLCE", -1, self.sym["SELL_CE"]),
-                ("SELLPE", -1, self.sym["SELL_PE"]),
-            ]:
-                self.fyers.place_order({
-                    "symbol": sym,
-                    "qty": LOT_SIZE,
-                    "type": 2,
-                    "side": side,
-                    "productType": "INTRADAY",
-                    "validity": "DAY",
-                    "orderTag": tag
-                })
+    def is_first_candle(self):
+        now = datetime.datetime.now().time()
+        return now <= datetime.time(9, 18)
 
-            self.sl = c["high"]
-            self.traded = True
+    def is_early_candle(self, n):
+        now = datetime.datetime.now().time()
+        return now <= (datetime.datetime.combine(
+            datetime.date.today(), datetime.time(9, 15)
+        ) + datetime.timedelta(minutes=3 * n)).time()
 
     # -----------------------------------------------------
-    # EXIT
+    # ENTER TRADE
     # -----------------------------------------------------
-    def check_exit(self):
-        if not self.traded:
-            return
-
-        q = self.fyers.quotes({
-            "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
-        })
-        prices = {x["n"]: x["v"]["lp"] for x in q.get("d", [])}
-        premium = prices[self.sym["SELL_CE"]] + prices[self.sym["SELL_PE"]]
-
-        if premium >= self.sl:
-            reason = "SL HIT"
-        elif premium <= self.s2:
-            reason = "S2 HIT"
-        elif datetime.datetime.now().time() >= TRADING_END:
-            reason = "TIME EXIT"
-        else:
-            return
-
-        logger.info(f"[EXIT] {reason} | Premium={premium:.2f}")
-        send_telegram(f"🛑 STRANGLE EXIT\n{reason}")
+    def enter_trade(self, premium):
+        logger.info(f"[ENTRY] Scenario {self.scenario} @ {premium:.2f}")
+        send_telegram(f"📉 ENTRY Scenario {self.scenario}\nPremium={premium:.2f}")
 
         for tag, side, sym in [
-            ("EXITCE", 1, self.sym["SELL_CE"]),
-            ("EXITPE", 1, self.sym["SELL_PE"]),
-            ("EXITHCE", -1, self.sym["HEDGE_CE"]),
-            ("EXITHPE", -1, self.sym["HEDGE_PE"]),
+            ("HEDGECE", 1, self.sym["HEDGE_CE"]),
+            ("HEDGEPE", 1, self.sym["HEDGE_PE"]),
+            ("SELLCE", -1, self.sym["SELL_CE"]),
+            ("SELLPE", -1, self.sym["SELL_PE"]),
         ]:
             self.fyers.place_order({
                 "symbol": sym,
@@ -284,10 +263,71 @@ class StrangleS1S2Combined15M:
                 "orderTag": tag
             })
 
-        self.traded = False
+        self.entry_premium = premium
+        self.trade_taken = True
+
+    # -----------------------------------------------------
+    # EXIT LOGIC
+    # -----------------------------------------------------
+    def check_exit(self):
+        if not self.trade_taken:
+            return
+
+        q = self.fyers.quotes({
+            "symbols": f"{self.sym['SELL_CE']},{self.sym['SELL_PE']}"
+        })
+        prices = {x["n"]: x["v"]["lp"] for x in q["d"]}
+        premium = prices[self.sym["SELL_CE"]] + prices[self.sym["SELL_PE"]]
+
+        if self.scenario == 1:
+            target = self.cpr["S2"] - 0.02 * self.cpr["S2"]
+            sl = self.entry_premium + 15
+        else:
+            target = self.cpr["S3"] - 0.02 * self.cpr["S3"]
+            sl = self.entry_premium + 10
+
+        reason = None
+        if premium <= target:
+            reason = "TARGET"
+        elif premium >= sl:
+            reason = "SL"
+        elif datetime.datetime.now().time() >= TRADING_END:
+            reason = "TIME EXIT"
+
+        if not reason:
+            return
+
+        logger.info(f"[EXIT] {reason} @ {premium:.2f}")
+        send_telegram(f"🛑 EXIT {reason}\nPremium={premium:.2f}")
+
+        exit_seq = (
+            [("EXITCE", 1, self.sym["SELL_CE"]),
+             ("EXITPE", 1, self.sym["SELL_PE"]),
+             ("EXITHCE", -1, self.sym["HEDGE_CE"]),
+             ("EXITHPE", -1, self.sym["HEDGE_PE"])]
+            if reason == "SL"
+            else
+            [("EXITHCE", -1, self.sym["HEDGE_CE"]),
+             ("EXITHPE", -1, self.sym["HEDGE_PE"]),
+             ("EXITCE", 1, self.sym["SELL_CE"]),
+             ("EXITPE", 1, self.sym["SELL_PE"])]
+        )
+
+        for tag, side, sym in exit_seq:
+            self.fyers.place_order({
+                "symbol": sym,
+                "qty": LOT_SIZE,
+                "type": 2,
+                "side": side,
+                "productType": "INTRADAY",
+                "validity": "DAY",
+                "orderTag": tag
+            })
+
+        self.trade_taken = False
 
 # =========================================================
-# MAIN
+# MAIN LOOP
 # =========================================================
 if __name__ == "__main__":
     fyers = fyersModel.FyersModel(
@@ -298,7 +338,7 @@ if __name__ == "__main__":
     )
 
     symbols = get_symbols(fyers)
-    strategy = StrangleS1S2Combined15M(fyers, symbols)
+    strategy = StrangleCPR3M(fyers, symbols)
 
     while True:
         strategy.evaluate()
@@ -307,4 +347,4 @@ if __name__ == "__main__":
         if datetime.datetime.now().time() >= TRADING_END:
             break
 
-        time.sleep(60)
+        time.sleep(30)
