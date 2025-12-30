@@ -1,9 +1,7 @@
 import datetime
 import logging
-import csv
 import os
 import time
-import uuid
 import sys
 import requests
 from collections import deque
@@ -27,7 +25,6 @@ LOT_SIZE = 150
 ATM_DECISION_TIME = datetime.time(9, 16)
 TRADING_END = datetime.time(15, 0)
 
-CANDLE_MINUTES = 3
 HISTORY_RESOLUTION = "3"
 
 EMA_FAST = 5
@@ -46,10 +43,12 @@ LOG_FILE = "nifty_strangle_framework.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ],
     force=True
 )
-
 logger = logging.getLogger(__name__)
 
 def send_telegram(msg):
@@ -133,7 +132,7 @@ class FyersClient:
         })
 
 # =========================================================
-# HISTORICAL PREFILL (FIXED)
+# HISTORICAL PREFILL (PREVIOUS SESSIONS)
 # =========================================================
 def fetch_historical_premium(fyers, ce, pe):
     to_dt = datetime.datetime.now()
@@ -167,7 +166,7 @@ def fetch_historical_premium(fyers, ce, pe):
             "close": c1[4] + c2[4]
         })
 
-    logger.info(f"[PREFILL] Loaded {len(candles)} historical candles")
+    logger.info(f"[PREFILL] Loaded {len(candles)} candles")
     return candles
 
 # =========================================================
@@ -182,6 +181,7 @@ class StrategyEngine:
         self.position = None
         self.stage = 0
         self.disabled_for_day = False
+        self.last_logged_ema_time = None
 
     def ema(self, values, period):
         if len(values) < period:
@@ -207,7 +207,15 @@ class StrategyEngine:
         if ema5 is None or ema20 is None:
             return
 
-        # ENTRY FSM (unchanged)
+        # ========= EMA LOGGING =========
+        if closed and candle["time"] != self.last_logged_ema_time:
+            logger.info(
+                f"[EMA] {candle['time']} | "
+                f"EMA5={ema5:.2f} EMA20={ema20:.2f} GAP={ema20 - ema5:.2f}"
+            )
+            self.last_logged_ema_time = candle["time"]
+
+        # ========= ENTRY FSM =========
         if closed and self.stage == 0:
             if candle["close"] < candle["open"] and ema5 < ema20:
                 self.stage = 1
@@ -231,7 +239,11 @@ class StrategyEngine:
                     return
 
                 logger.info(f"[ENTRY] Entry={entry:.2f} SL={sl:.2f}")
-                send_telegram(f"📉 STRANGLE ENTRY\nEntry={entry:.2f}\nSL={sl:.2f}")
+                send_telegram(
+                    f"📉 STRANGLE ENTRY\n"
+                    f"Entry={entry:.2f}\nSL={sl:.2f}\n"
+                    f"EMA5={ema5:.2f}\nEMA20={ema20:.2f}"
+                )
 
                 self.fyers.sell_market(self.ce, "STRANGLECE")
                 self.fyers.sell_market(self.pe, "STRANGLEPE")
@@ -239,6 +251,7 @@ class StrategyEngine:
                 self.position = {"entry": entry, "sl": sl}
                 self.stage = 3
 
+        # ========= SL =========
         if self.position and candle["high"] >= self.position["sl"]:
             logger.info("[SL HIT]")
             send_telegram("🛑 STRANGLE SL HIT")
@@ -267,9 +280,7 @@ if __name__ == "__main__":
     for c in fetch_historical_premium(fyers, ce, pe):
         engine.candles.append(c)
 
-    logger.info("[EMA] Prefill completed")
-
-    # ===== WEBSOCKET (UNCHANGED) =====
+    # ========= WEBSOCKET =========
     last = {}
     candle = None
 
@@ -294,7 +305,13 @@ if __name__ == "__main__":
         if candle is None or candle["time"] != bucket:
             if candle:
                 engine.on_candle(candle, closed=True)
-            candle = {"time": bucket, "open": premium, "high": premium, "low": premium, "close": premium}
+            candle = {
+                "time": bucket,
+                "open": premium,
+                "high": premium,
+                "low": premium,
+                "close": premium
+            }
         else:
             candle["high"] = max(candle["high"], premium)
             candle["low"] = min(candle["low"], premium)
