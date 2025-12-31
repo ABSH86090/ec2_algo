@@ -207,12 +207,6 @@ class ScenarioEngine:
             return "PUT"
 
         # -------- CALL SCENARIOS --------
-        if (
-            p["close"] < self.cpr["BC"] and
-            c["close"] > self.cpr["BC"] and
-            ema5 > ema20
-        ):
-            return "CALL"
 
         if (
             p["close"] < self.cpr["R1"] and
