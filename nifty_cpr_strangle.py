@@ -366,6 +366,21 @@ if __name__ == "__main__":
     )
 
     symbols = get_symbols(fyers)
+    logger.info("========== SYMBOLS SELECTED ==========")
+    logger.info(f"EXPIRY   : {symbols['EXPIRY']}")
+    logger.info(f"SELL CE  : {symbols['SELL_CE']}")
+    logger.info(f"SELL PE  : {symbols['SELL_PE']}")
+    logger.info(f"HEDGE CE : {symbols['HEDGE_CE']}")
+    logger.info(f"HEDGE PE : {symbols['HEDGE_PE']}")
+    logger.info("======================================")
+    
+    print("\n========== SYMBOLS SELECTED ==========")
+    print(f"EXPIRY   : {symbols['EXPIRY']}")
+    print(f"SELL CE  : {symbols['SELL_CE']}")
+    print(f"SELL PE  : {symbols['SELL_PE']}")
+    print(f"HEDGE CE : {symbols['HEDGE_CE']}")
+    print(f"HEDGE PE : {symbols['HEDGE_PE']}")
+    print("======================================\n")
     strategy = StrangleCPR3M(fyers, symbols)
 
     while True:
