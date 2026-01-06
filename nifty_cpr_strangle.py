@@ -69,10 +69,22 @@ def get_next_expiry():
 
 def format_expiry(expiry):
     yy = expiry.strftime("%y")
+
     if is_last_tuesday(expiry):
         return f"{yy}{expiry.strftime('%b').upper()}"
-    m = {10: "O", 11: "N", 12: "D"}
-    return f"{yy}{m.get(expiry.month, expiry.strftime('%m'))}{expiry.day:02d}"
+
+    m = expiry.month
+    d = expiry.day
+    if m == 10:
+        m_token = "O"
+    elif m == 11:
+        m_token = "N"
+    elif m == 12:
+        m_token = "D"
+    else:
+        m_token = str(m)
+
+    return f"{yy}{m_token}{d:02d}"
 
 def get_symbols(fyers):
     q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
