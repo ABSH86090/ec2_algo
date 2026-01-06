@@ -267,7 +267,15 @@ if __name__ == "__main__":
         if msg.get("symbol") != INDEX_SYMBOL:
             return
 
-        ts = datetime.datetime.fromtimestamp(msg["last_traded_time"])
+        # --- SAFE TIMESTAMP EXTRACTION ---
+        if "last_traded_time" in msg:
+            ts = datetime.datetime.fromtimestamp(msg["last_traded_time"])
+        elif "timestamp" in msg:
+            ts = datetime.datetime.fromtimestamp(msg["timestamp"])
+        else:
+            # FYERS index ticks often miss timestamp → fallback
+            ts = datetime.datetime.now()
+
         ltp = msg["ltp"]
 
         tm.on_tick(ltp)
