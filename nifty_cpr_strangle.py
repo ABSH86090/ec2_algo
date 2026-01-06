@@ -67,11 +67,11 @@ def get_next_expiry():
     today = datetime.date.today()
     return today if today.weekday() == 1 else today + datetime.timedelta(days=(1 - today.weekday()) % 7)
 
-def format_expiry(d):
-    yy = d.strftime("%y")
-    if is_last_tuesday(d):
-        return f"{yy}{d.strftime('%b').upper()}"
-    m = {10: "O", 11: "N", 12: "D"}.get(d.month, f"{d.month:02d}")
+def format_expiry(expiry):
+    yy = expiry.strftime("%y")
+    if is_last_tuesday(expiry):
+        return f"{yy}{expiry.strftime('%b').upper()}"
+    m = {10: "O", 11: "N", 12: "D"}
     return f"{yy}{m.get(expiry.month, expiry.strftime('%m'))}{expiry.day:02d}"
 
 def get_symbols(fyers):
