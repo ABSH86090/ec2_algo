@@ -262,7 +262,7 @@ if __name__ == "__main__":
     pending_signal = None
 
     def on_tick(msg):
-        nonlocal pending_signal
+        global pending_signal
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
