@@ -72,7 +72,7 @@ def format_expiry(d):
     if is_last_tuesday(d):
         return f"{yy}{d.strftime('%b').upper()}"
     m = {10: "O", 11: "N", 12: "D"}.get(d.month, f"{d.month:02d}")
-    return f"{yy}{m}{d.day:02d}"
+    return f"{yy}{m.get(expiry.month, expiry.strftime('%m'))}{expiry.day:02d}"
 
 def get_symbols(fyers):
     q = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
