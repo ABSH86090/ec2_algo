@@ -171,7 +171,7 @@ class StrangleCPR3M:
             prev_close = strangle_candles[-1]["close"]
     
             # --- apply 2% reduction on high ---
-            adjusted_high = prev_high - (0.025 * prev_high)
+            adjusted_high = prev_high - (0.03 * prev_high)
     
             logger.info(
                 f"[CPR BASE] "
