@@ -128,6 +128,14 @@ class StrangleCPR3M:
         self.log_initial_state()
 
     # -------------------------------------------------
+    def send_candle_telegram(self, msg):
+        # prevent telegram flooding (1 msg per candle)
+        now = datetime.datetime.now()
+        if hasattr(self, "_last_tg_candle"):
+            if (now - self._last_tg_candle).seconds < 170:
+                return
+        self._last_tg_candle = now
+        send_telegram(msg)
     # -------------------------------------------------
     def compute_prevday_cpr(self):
         today = datetime.date.today()
@@ -245,6 +253,16 @@ class StrangleCPR3M:
             return
 
         open_, high, close = c["open"], c["high"], c["close"]
+
+        log_msg = (
+            f"📊 3M Candle Closed\n"
+            f"O={open_:.2f} H={high:.2f} C={close:.2f}\n"
+            f"S1={self.cpr['S1']:.2f} BC={self.cpr['BC']:.2f} P={self.cpr['P']:.2f}\n"
+            f"Scenario={self.scenario} Locked={self.scenario_locked}"
+        )
+        logger.info(log_msg)
+        self.send_candle_telegram(log_msg)
+
 
         # ---------- Scenario 2 (UNCHANGED) ----------
         if not self.scenario_locked:
