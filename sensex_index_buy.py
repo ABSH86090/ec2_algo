@@ -114,6 +114,53 @@ def compute_cpr(prev):
     s1 = 2 * p - h
     return {"BC": min(bc, tc), "TC": max(bc, tc), "R1": r1, "S1": s1}
 
+# ================= EMA WARMUP =================
+def prefill_intraday_candles(fyers, candles, days=3):
+    """
+    Prefill last N days of 15-min index candles so EMA5/EMA20
+    are available immediately (backtest parity).
+    """
+    start = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    end = datetime.date.today().strftime("%Y-%m-%d")
+
+    resp = fyers.client.history({
+        "symbol": INDEX_SYMBOL,
+        "resolution": "15",
+        "date_format": "1",
+        "range_from": start,
+        "range_to": end,
+        "cont_flag": "1"
+    })
+
+    if not resp.get("candles"):
+        logger.warning("EMA warmup failed: no intraday candles")
+        return
+
+    for c in resp["candles"]:
+        ts = datetime.datetime.fromtimestamp(c[0])
+        candles.append({
+            "time": ts.replace(second=0, microsecond=0),
+            "open": c[1],
+            "high": c[2],
+            "low": c[3],
+            "close": c[4]
+        })
+
+    closes = [x["close"] for x in candles]
+    ema5 = ema(closes, EMA_FAST)
+    ema20 = ema(closes, EMA_SLOW)
+
+    msg = (
+        f"📊 EMA WARMUP DONE\n"
+        f"Candles: {len(candles)}\n"
+        f"EMA5: {round(ema5, 2) if ema5 else None}\n"
+        f"EMA20: {round(ema20, 2) if ema20 else None}"
+    )
+
+    logger.info(msg)
+    send_telegram(msg)
+
+
 # ================= EXPIRY HELPERS =================
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2025, 10, 2),
@@ -258,7 +305,9 @@ if __name__ == "__main__":
 
     engine = ScenarioEngine(cpr)
     tm = TradeManager(fyers)
-    candles = deque(maxlen=200)
+    candles = deque(maxlen=300)
+    prefill_intraday_candles(fyers, candles)
+
     pending_signal = None
 
     def on_tick(msg):
@@ -291,10 +340,13 @@ if __name__ == "__main__":
                 ema5 = ema(closes, EMA_FAST)
                 ema20 = ema(closes, EMA_SLOW)
 
-                sig = engine.evaluate(p, c, ema5, ema20)
-                if sig:
-                    pending_signal = sig
-                    logger.info(f"SIGNAL {sig} at {c['time']}")
+                if ema5 is None or ema20 is None:
+                    logger.debug("EMA not ready yet, skipping signal evaluation")
+                else:
+                    sig = engine.evaluate(p, c, ema5, ema20)
+                    if sig:
+                        pending_signal = sig
+                        logger.info(f"SIGNAL {sig} at {c['time']}")
 
             candles.append({
                 "time": bucket,
