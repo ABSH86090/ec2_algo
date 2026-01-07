@@ -128,32 +128,68 @@ class StrangleCPR3M:
         self.log_initial_state()
 
     # -------------------------------------------------
+    # -------------------------------------------------
     def compute_prevday_cpr(self):
         today = datetime.date.today()
-
-        def hist(symbol, day):
+    
+        def hist_5s(symbol, day):
             r = self.fyers.history({
                 "symbol": symbol,
-                "resolution": "15",
+                "resolution": "5S",
                 "date_format": "1",
                 "range_from": day.strftime("%Y-%m-%d"),
                 "range_to": day.strftime("%Y-%m-%d"),
                 "cont_flag": "1"
             })
             return r.get("candles", [])
-
-        for i in range(1, 8):
+    
+        for i in range(1, 8):  # look back max 7 days
             day = today - datetime.timedelta(days=i)
-            ce = hist(self.sym["SELL_CE"], day)
-            pe = hist(self.sym["SELL_PE"], day)
-            if ce and pe:
-                highs, lows, closes = [], [], []
-                for c1, c2 in zip(ce, pe):
-                    highs.append(c1[2] + c2[2])
-                    lows.append(c1[3] + c2[3])
-                    closes.append(c1[4] + c2[4])
-                return calculate_cpr(max(highs), min(lows), closes[-1])
-        raise Exception("No CPR data found")
+    
+            ce = hist_5s(self.sym["SELL_CE"], day)
+            pe = hist_5s(self.sym["SELL_PE"], day)
+    
+            if not ce or not pe:
+                continue
+    
+            # --- build strangle candles correctly ---
+            strangle_candles = []
+            for c1, c2 in zip(ce, pe):
+                strangle_candles.append({
+                    "open": c1[1] + c2[1],
+                    "high": c1[2] + c2[2],
+                    "low":  c1[3] + c2[3],
+                    "close": c1[4] + c2[4]
+                })
+    
+            if not strangle_candles:
+                continue
+    
+            prev_open = strangle_candles[0]["open"]
+            prev_high = max(c["high"] for c in strangle_candles)
+            prev_low  = min(c["low"] for c in strangle_candles)
+            prev_close = strangle_candles[-1]["close"]
+    
+            # --- apply 2% reduction on high ---
+            adjusted_high = prev_high - (0.02 * prev_high)
+    
+            logger.info(
+                f"[CPR BASE] "
+                f"O={prev_open:.2f} "
+                f"H={prev_high:.2f} "
+                f"H_adj={adjusted_high:.2f} "
+                f"L={prev_low:.2f} "
+                f"C={prev_close:.2f}"
+            )
+    
+            return calculate_cpr(
+                high=adjusted_high,
+                low=prev_low,
+                close=prev_close
+            )
+    
+        raise Exception("No CPR data found using 5S resolution")
+
 
     # -------------------------------------------------
     def log_initial_state(self):
