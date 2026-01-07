@@ -115,13 +115,18 @@ def compute_cpr(prev):
     return {"BC": min(bc, tc), "TC": max(bc, tc), "R1": r1, "S1": s1}
 
 # ================= EMA WARMUP =================
-def prefill_intraday_candles(fyers, candles, days=3):
+def prefill_intraday_candles(fyers, candles, days=5):
     """
-    Prefill last N days of 15-min index candles so EMA5/EMA20
-    are available immediately (backtest parity).
+    Reliable EMA warmup for INDEX:
+    - Fetch multiple past days
+    - Always log result
     """
     start = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
     end = datetime.date.today().strftime("%Y-%m-%d")
+
+    logger.info(
+        f"EMA warmup fetch: {INDEX_SYMBOL} | {start} → {end}"
+    )
 
     resp = fyers.client.history({
         "symbol": INDEX_SYMBOL,
@@ -132,29 +137,30 @@ def prefill_intraday_candles(fyers, candles, days=3):
         "cont_flag": "1"
     })
 
-    if not resp.get("candles"):
-        logger.warning("EMA warmup failed: no intraday candles")
-        return
+    candles_loaded = 0
 
-    for c in resp["candles"]:
-        ts = datetime.datetime.fromtimestamp(c[0])
-        candles.append({
-            "time": ts.replace(second=0, microsecond=0),
-            "open": c[1],
-            "high": c[2],
-            "low": c[3],
-            "close": c[4]
-        })
+    if resp.get("candles"):
+        for c in resp["candles"]:
+            ts = datetime.datetime.fromtimestamp(c[0])
+            candles.append({
+                "time": ts.replace(second=0, microsecond=0),
+                "open": c[1],
+                "high": c[2],
+                "low": c[3],
+                "close": c[4]
+            })
+            candles_loaded += 1
 
     closes = [x["close"] for x in candles]
     ema5 = ema(closes, EMA_FAST)
     ema20 = ema(closes, EMA_SLOW)
 
+    # 🔥 ALWAYS LOG — even if None
     msg = (
-        f"📊 EMA WARMUP DONE\n"
-        f"Candles: {len(candles)}\n"
-        f"EMA5: {round(ema5, 2) if ema5 else None}\n"
-        f"EMA20: {round(ema20, 2) if ema20 else None}"
+        f"📊 EMA WARMUP STATUS\n"
+        f"Candles Loaded: {candles_loaded}\n"
+        f"EMA5 : {round(ema5,2) if ema5 else 'NOT READY'}\n"
+        f"EMA20: {round(ema20,2) if ema20 else 'NOT READY'}"
     )
 
     logger.info(msg)
