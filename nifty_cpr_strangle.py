@@ -117,6 +117,8 @@ class StrangleCPR3M:
         self.scenario_locked = False
         self.scenario = None
         self.entry_premium = None
+        self.candle_count = 0
+        self._last_candle_close = None
 
         # -------- Scenario 3 state (ADDED ONLY) --------
         self.sc3_armed = False
@@ -254,6 +256,20 @@ class StrangleCPR3M:
 
         open_, high, close = c["open"], c["high"], c["close"]
 
+        # ===== Candle change detection (ADD THIS BLOCK) =====
+        if self._last_candle_close is None:
+            self._last_candle_close = close
+            self.candle_count = 1
+        else:
+            if close != self._last_candle_close:
+                self.candle_count += 1
+                self._last_candle_close = close
+                
+        logger.info(
+            f"[CANDLE INDEX] #{self.candle_count} "
+            f"O={open_:.2f} H={high:.2f} C={close:.2f}"
+        )
+
         log_msg = (
             f"📊 3M Candle Closed\n"
             f"O={open_:.2f} H={high:.2f} C={close:.2f}\n"
@@ -275,10 +291,11 @@ class StrangleCPR3M:
 
         # ---------- Scenario 1 (UNCHANGED) ----------
         if not self.scenario_locked:
-            if self.is_first_candle():
+            if self.candle_count <= 2:
                 if self.cpr["S1"] < close < self.cpr["BC"]:
                     self.scenario = 1
                     self.scenario_locked = True
+                    logger.info("[SC1 LOCKED] Close between S1 & BC")
                     return
 
         if self.scenario == 1:
