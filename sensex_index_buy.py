@@ -259,17 +259,17 @@ class TradeManager:
         self.pos = None
         self.trade_day = None
 
-    def enter(self, symbol, index_entry):
+    def enter(self, symbol, index_entry_price):
         day = index_entry.date()
         if self.trade_day == day:
             return
         self.trade_day = day
 
         self.fyers.buy_mkt(symbol, TOTAL_QTY, "ENTRY")
-        self.pos = {"symbol": symbol, "entry": index_entry}
+        self.pos = {"symbol": symbol, "entry": index_entry_price}
 
-        logger.info(f"ENTRY {symbol} @ Index {index_entry}")
-        send_telegram(f"🚀 ENTRY\n{symbol}\nIndex Entry: {index_entry}")
+        logger.info(f"ENTRY {symbol} @ Index {index_entry_price}")
+        send_telegram(f"🚀 ENTRY\n{symbol}\nIndex Entry: {index_entry_price}")
 
     def on_tick(self, ltp):
         if not self.pos:
@@ -363,7 +363,7 @@ if __name__ == "__main__":
             })
 
             if pending_signal:
-                tm.enter(ce if pending_signal == "CALL" else pe, ts)
+                tm.enter(ce if pending_signal == "CALL" else pe, ltp)
                 pending_signal = None
 
         else:
