@@ -260,7 +260,7 @@ class TradeManager:
         self.trade_day = None
 
     def enter(self, symbol, index_entry_price):
-        day = index_entry.date()
+        day = datetime.date.today()
         if self.trade_day == day:
             return
         self.trade_day = day
