@@ -120,11 +120,6 @@ class StrangleCPR3M:
         self.candle_count = 0
         self._last_candle_close = None
 
-        # -------- Scenario 3 state (ADDED ONLY) --------
-        self.sc3_armed = False
-        self.sc3_traded = False
-        self.sc3_pending_green = False
-        self.sc3_be_active = False
 
         self.cpr = self.compute_prevday_cpr()
         self.log_initial_state()
@@ -303,30 +298,6 @@ class StrangleCPR3M:
                 self.enter_trade(close)
                 return
 
-        # ================= Scenario 3 (ADDED) =================
-        if not self.sc3_armed and self.cpr["S1"] < close < self.cpr["BC"]:
-            self.sc3_armed = True
-
-        if self.sc3_armed and not self.sc3_traded:
-            # Pattern 2
-            if open_ > self.cpr["P"] and close < self.cpr["P"]:
-                self.scenario = 3
-                self.enter_trade(close)
-                self.sc3_traded = True
-                return
-
-            # Pattern 1 (green)
-            if close > open_ and high > self.cpr["P"] and close < self.cpr["P"]:
-                self.sc3_pending_green = True
-                return
-
-            # Pattern 1 confirmation (red)
-            if self.sc3_pending_green and close < self.cpr["P"] and close < open_:
-                self.scenario = 3
-                self.enter_trade(close)
-                self.sc3_traded = True
-                self.sc3_pending_green = False
-                return
 
     def is_first_candle(self):
         return datetime.datetime.now().time() <= datetime.time(9, 18)
@@ -375,19 +346,6 @@ class StrangleCPR3M:
 
         reason = None
 
-        # ---------- Scenario 3 exit (ADDED) ----------
-        if self.scenario == 3:
-            profit = self.entry_premium - premium
-
-            if profit >= 15:
-                self.sc3_be_active = True
-
-            if self.sc3_be_active and premium >= self.entry_premium:
-                reason = "SL"
-            elif premium <= self.cpr["S1"]:
-                reason = "TARGET"
-            elif datetime.datetime.now().time() >= TRADING_END:
-                reason = "TIME EXIT"
 
         # ---------- Original exit logic (UNCHANGED) ----------
         else:
