@@ -331,7 +331,6 @@ class StrangleCPR3M:
 
         self.entry_premium = premium
         self.trade_taken = True
-        self.sc3_be_active = False
 
     # -------------------------------------------------
     def check_exit(self):
@@ -348,20 +347,20 @@ class StrangleCPR3M:
 
 
         # ---------- Original exit logic (UNCHANGED) ----------
-        else:
-            if self.scenario == 1:
-                target = self.cpr["S2"] + 0.02 * self.cpr["S2"]
-                sl = self.entry_premium + 15
-            else:
-                target = self.cpr["S3"] + 0.02 * self.cpr["S3"]
-                sl = self.entry_premium + 10
 
-            if premium <= target:
-                reason = "TARGET"
-            elif premium >= sl:
-                reason = "SL"
-            elif datetime.datetime.now().time() >= TRADING_END:
-                reason = "TIME EXIT"
+        if self.scenario == 1:
+            target = self.cpr["S2"] + 0.02 * self.cpr["S2"]
+            sl = self.entry_premium + 15
+        else:
+            target = self.cpr["S3"] + 0.02 * self.cpr["S3"]
+            sl = self.entry_premium + 10
+
+        if premium <= target:
+            reason = "TARGET"
+        elif premium >= sl:
+            reason = "SL"
+        elif datetime.datetime.now().time() >= TRADING_END:
+            reason = "TIME EXIT"
 
         if not reason:
             return
