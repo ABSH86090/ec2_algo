@@ -24,10 +24,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
 
-TIMEFRAME_MIN = 15
 EMA_FAST = 5
 EMA_SLOW = 20
-
 ATR_PERIOD = 10
 MULTIPLIER = 3.5
 
@@ -38,6 +36,7 @@ QTY = LOT_SIZE * LOTS
 INDEX_SL = 50
 INDEX_TARGET = 100
 HARD_EXIT_TIME = datetime.time(14, 45)
+ACCEPTANCE_CUTOFF = datetime.time(11, 30)
 
 LOG_FILE = "nifty_option_selling.log"
 
@@ -45,10 +44,7 @@ LOG_FILE = "nifty_option_selling.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ],
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
     force=True
 )
 logger = logging.getLogger(__name__)
@@ -77,27 +73,15 @@ class Fyers:
         self.auth = f"{CLIENT_ID}:{ACCESS_TOKEN}"
 
     def buy(self, symbol, qty, tag):
-        logger.info(f"BUY {symbol}")
         return self.client.place_order({
-            "symbol": symbol,
-            "qty": qty,
-            "type": 2,
-            "side": 1,
-            "productType": "INTRADAY",
-            "validity": "DAY",
-            "orderTag": tag
+            "symbol": symbol, "qty": qty, "type": 2, "side": 1,
+            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag
         })
 
     def sell(self, symbol, qty, tag):
-        logger.info(f"SELL {symbol}")
         return self.client.place_order({
-            "symbol": symbol,
-            "qty": qty,
-            "type": 2,
-            "side": -1,
-            "productType": "INTRADAY",
-            "validity": "DAY",
-            "orderTag": tag
+            "symbol": symbol, "qty": qty, "type": 2, "side": -1,
+            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag
         })
 
 # ================= INDICATORS =================
@@ -110,66 +94,49 @@ def ema(values, period):
         e = v * k + e * (1 - k)
     return e
 
-
 def atr(candles, period):
     tr = []
     for i in range(1, len(candles)):
         h, l = candles[i]["high"], candles[i]["low"]
         pc = candles[i - 1]["close"]
         tr.append(max(h - l, abs(h - pc), abs(l - pc)))
-
-    atr_vals = [None] * period
     atr_val = sum(tr[:period]) / period
-    atr_vals.append(atr_val)
-
+    atrs = [None] * period + [atr_val]
     for t in tr[period:]:
         atr_val = (atr_val * (period - 1) + t) / period
-        atr_vals.append(atr_val)
-
-    return atr_vals
-
+        atrs.append(atr_val)
+    return atrs
 
 def supertrend(candles, period, multiplier):
-    atr_vals = atr(candles, period)
+    atrs = atr(candles, period)
     st = [None] * len(candles)
-    final_ub = [None] * len(candles)
-    final_lb = [None] * len(candles)
-    trend = [None] * len(candles)
+    ub, lb, trend = [None]*len(candles), [None]*len(candles), [None]*len(candles)
 
     for i in range(len(candles)):
-        if atr_vals[i] is None:
+        if atrs[i] is None:
             continue
+        h, l, c = candles[i]["high"], candles[i]["low"], candles[i]["close"]
+        hl2 = (h + l) / 2
+        b_ub = hl2 + multiplier * atrs[i]
+        b_lb = hl2 - multiplier * atrs[i]
 
-        high, low, close = candles[i]["high"], candles[i]["low"], candles[i]["close"]
-        hl2 = (high + low) / 2
-
-        basic_ub = hl2 + multiplier * atr_vals[i]
-        basic_lb = hl2 - multiplier * atr_vals[i]
-
-        if i == 0 or final_ub[i - 1] is None:
-            final_ub[i] = basic_ub
-            final_lb[i] = basic_lb
-            trend[i] = "BULLISH" if close > basic_ub else "BEARISH"
+        if i == 0 or ub[i-1] is None:
+            ub[i], lb[i] = b_ub, b_lb
+            trend[i] = "BULLISH" if c > b_ub else "BEARISH"
         else:
-            final_ub[i] = basic_ub if (basic_ub < final_ub[i - 1] or close > final_ub[i - 1]) else final_ub[i - 1]
-            final_lb[i] = basic_lb if (basic_lb > final_lb[i - 1] or close < final_lb[i - 1]) else final_lb[i - 1]
-
-            if trend[i - 1] == "BULLISH" and close < final_lb[i - 1]:
-                trend[i] = "BEARISH"
-            elif trend[i - 1] == "BEARISH" and close > final_ub[i - 1]:
-                trend[i] = "BULLISH"
-            else:
-                trend[i] = trend[i - 1]
-
-        st[i] = final_lb[i] if trend[i] == "BULLISH" else final_ub[i]
-
+            ub[i] = b_ub if (b_ub < ub[i-1] or c > ub[i-1]) else ub[i-1]
+            lb[i] = b_lb if (b_lb > lb[i-1] or c < lb[i-1]) else lb[i-1]
+            trend[i] = (
+                "BEARISH" if trend[i-1]=="BULLISH" and c < lb[i-1]
+                else "BULLISH" if trend[i-1]=="BEARISH" and c > ub[i-1]
+                else trend[i-1]
+            )
+        st[i] = lb[i] if trend[i]=="BULLISH" else ub[i]
     return st
 
-
-def compute_cpr(prev_day):
-    h = max(c["high"] for c in prev_day)
-    l = min(c["low"] for c in prev_day)
-    c = prev_day[-1]["close"]
+# ================= CPR =================
+def compute_cpr(prev):
+    h, l, c = prev["high"], prev["low"], prev["close"]
     pivot = (h + l + c) / 3
     bc = (h + l) / 2
     tc = 2 * pivot - bc
@@ -177,8 +144,10 @@ def compute_cpr(prev_day):
 
 # ================= EXPIRY HELPERS (TUESDAY) =================
 SPECIAL_MARKET_HOLIDAYS = {
-    datetime.date(2025, 10, 2),
-    datetime.date(2025, 12, 25),
+    datetime.date(2026, 1, 26),
+    datetime.date(2026, 3, 3),
+    datetime.date(2026, 3, 26),
+    datetime.date(2026, 3, 31)
 }
 
 def is_last_tuesday(d):
@@ -219,12 +188,13 @@ def format_nifty_expiry(expiry):
 
     return f"{yy}{m_token}{d:02d}"
 
+
 # ================= SYMBOL SELECTION =================
 def get_nifty_option_symbols(fyers):
     q = fyers.client.quotes({"symbols": INDEX_SYMBOL})
     ltp = float(q["d"][0]["v"]["lp"])
-    atm = round(ltp / 50) * 50
 
+    atm = round(ltp / 50) * 50
     expiry = get_next_tuesday_expiry()
     exp = format_nifty_expiry(expiry)
 
@@ -233,8 +203,32 @@ def get_nifty_option_symbols(fyers):
     hedge_ce = f"NSE:NIFTY{exp}{atm + 200}CE"
     hedge_pe = f"NSE:NIFTY{exp}{atm - 200}PE"
 
-    logger.info(f"[NIFTY SYMBOLS] ATM={atm} EXP={expiry}")
-    return atm_ce, atm_pe, hedge_ce, hedge_pe, atm
+    logger.info(
+        f"[SYMBOLS] EXPIRY={expiry} ATM={atm} "
+        f"CE={atm_ce} PE={atm_pe}"
+    )
+
+    return atm_ce, atm_pe, hedge_ce, hedge_pe
+
+
+# ================= WARMUP =================
+def prefill_intraday_candles(fyers, candles, days=5):
+    start = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+    end = datetime.date.today().strftime("%Y-%m-%d")
+    r = fyers.client.history({
+        "symbol": INDEX_SYMBOL,
+        "resolution": "15",
+        "date_format": "1",
+        "range_from": start,
+        "range_to": end,
+        "cont_flag": "1"
+    })
+    for c in r.get("candles", []):
+        ts = datetime.datetime.fromtimestamp(c[0])
+        candles.append({
+            "time": ts.replace(second=0, microsecond=0),
+            "open": c[1], "high": c[2], "low": c[3], "close": c[4]
+        })
 
 # ================= TRADE MANAGER =================
 class TradeManager:
@@ -243,37 +237,30 @@ class TradeManager:
         self.pos = None
         self.trade_day = None
 
-    def enter(self, bias, index_price):
+    def enter(self, bias, ltp):
         if self.trade_day == datetime.date.today():
             return
-
-        atm_ce, atm_pe, hedge_ce, hedge_pe, atm = get_nifty_option_symbols(self.fyers)
-
+        atm_ce, atm_pe, hedge_ce, hedge_pe = get_nifty_option_symbols(self.fyers)
         if bias == "BEARISH":
-            self.fyers.buy(hedge_ce, QTY, "HEDGE_BUY")
-            self.fyers.sell(atm_ce, QTY, "SELL_CALL")
-            self.pos = {"main": atm_ce, "hedge": hedge_ce, "entry": index_price}
+            self.fyers.buy(hedge_ce, QTY, "HEDGE")
+            self.fyers.sell(atm_ce, QTY, "SELL_CE")
+            self.pos = {"main": atm_ce, "hedge": hedge_ce, "entry": ltp}
         else:
-            self.fyers.buy(hedge_pe, QTY, "HEDGE_BUY")
-            self.fyers.sell(atm_pe, QTY, "SELL_PUT")
-            self.pos = {"main": atm_pe, "hedge": hedge_pe, "entry": index_price}
-
+            self.fyers.buy(hedge_pe, QTY, "HEDGE")
+            self.fyers.sell(atm_pe, QTY, "SELL_PE")
+            self.pos = {"main": atm_pe, "hedge": hedge_pe, "entry": ltp}
         self.trade_day = datetime.date.today()
-        send_telegram(f"🚀 ENTRY {bias} @ {index_price}")
+        send_telegram(f"🚀 ENTRY {bias} @ {ltp}")
 
     def on_tick(self, ltp, now):
         if not self.pos:
             return
-
-        entry = self.pos["entry"]
-
+        e = self.pos["entry"]
         if now.time() >= HARD_EXIT_TIME:
-            self.exit("TIME EXIT")
-            return
-
-        if ltp >= entry + INDEX_SL:
+            self.exit("TIME")
+        elif ltp >= e + INDEX_SL:
             self.exit("SL")
-        elif ltp <= entry - INDEX_TARGET:
+        elif ltp <= e - INDEX_TARGET:
             self.exit("TARGET")
 
     def exit(self, reason):
@@ -282,87 +269,56 @@ class TradeManager:
         send_telegram(f"🏁 EXIT {reason}")
         self.pos = None
 
-# ================= WARMUP =================
-def prefill_intraday_candles(fyers, candles, days=5):
-    start = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
-    end = datetime.date.today().strftime("%Y-%m-%d")
-
-    resp = fyers.client.history({
-        "symbol": INDEX_SYMBOL,
-        "resolution": "15",
-        "date_format": "1",
-        "range_from": start,
-        "range_to": end,
-        "cont_flag": "1"
-    })
-
-    for c in resp.get("candles", []):
-        ts = datetime.datetime.fromtimestamp(c[0])
-        candles.append({
-            "time": ts.replace(second=0, microsecond=0),
-            "open": c[1],
-            "high": c[2],
-            "low": c[3],
-            "close": c[4]
-        })
-
 # ================= MAIN =================
 if __name__ == "__main__":
-    logger.info("🚀 NIFTY OPTION SELLING STRATEGY STARTED")
-    send_telegram("🚀 NIFTY OPTION SELLING STRATEGY STARTED")
+    send_telegram("🚀 NIFTY STRATEGY STARTED")
 
     fyers = Fyers()
     tm = TradeManager(fyers)
 
-    # ---- CPR from previous day ----
     hist = fyers.client.history({
         "symbol": INDEX_SYMBOL,
         "resolution": "D",
         "date_format": "1",
-        "range_from": (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-        "range_to": (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
+        "range_from": (datetime.date.today()-datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
+        "range_to": (datetime.date.today()-datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
         "cont_flag": "1"
     })
 
     last = hist["candles"][-1]
-    prev_day = [{"high": last[2], "low": last[3], "close": last[4]}]
-    BC, TC = compute_cpr(prev_day)
+    BC, TC = compute_cpr({"high":last[2], "low":last[3], "close":last[4]})
 
     candles = deque(maxlen=300)
-
-    # 🔥 WARMUP
     prefill_intraday_candles(fyers, candles)
 
-    # 🔍 WARMUP CHECK (AS REQUESTED)
     warmup_msg = (
-        f"WARMUP CHECK | "
+        f"📊 WARMUP CHECK | "
         f"Candles={len(candles)} | "
-        f"EMA5={ema([c['close'] for c in candles], EMA_FAST)} | "
-        f"EMA20={ema([c['close'] for c in candles], EMA_SLOW)} | "
+        f"EMA5={ema5_val:.2f if ema5_val else None} | "
+        f"EMA20={ema20_val:.2f if ema20_val else None} | "
         f"BC={BC:.2f} | "
         f"TC={TC:.2f} | "
-        f"ST={supertrend(list(candles), ATR_PERIOD, MULTIPLIER)[-1]}"
+        f"ST={st_val:.2f if st_val else None}"
     )
 
     logger.info(warmup_msg)
-    send_telegram(f"📊 {warmup_msg}")
+    send_telegram(warmup_msg)
 
-    pending_signal = None
+    bearish_acceptance = False
+    bullish_acceptance = False
+    current_day = None
 
     def on_tick(msg):
-        global pending_signal
+        nonlocal bearish_acceptance, bullish_acceptance, current_day
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
 
-        ts = datetime.datetime.fromtimestamp(
-            msg.get("last_traded_time", datetime.datetime.now().timestamp())
-        )
+        ts = datetime.datetime.fromtimestamp(msg["last_traded_time"])
         ltp = msg["ltp"]
-
         tm.on_tick(ltp, ts)
 
-        bucket = ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0)
+        bucket = ts.replace(minute=(ts.minute//15)*15, second=0, microsecond=0)
 
         if candles and candles[-1]["time"] == bucket:
             c = candles[-1]
@@ -371,41 +327,44 @@ if __name__ == "__main__":
             c["close"] = ltp
             return
 
-        candles.append({
-            "time": bucket,
-            "open": ltp,
-            "high": ltp,
-            "low": ltp,
-            "close": ltp
-        })
+        candles.append({"time":bucket,"open":ltp,"high":ltp,"low":ltp,"close":ltp})
 
         if len(candles) < 30:
             return
 
-        closes = [x["close"] for x in candles]
-        ema5 = ema(closes, EMA_FAST)
-        ema20 = ema(closes, EMA_SLOW)
+        candle = candles[-1]
+        if current_day != candle["time"].date():
+            bearish_acceptance = bullish_acceptance = False
+            current_day = candle["time"].date()
+
+        closes = [c["close"] for c in candles]
+        ema5, ema20 = ema(closes,5), ema(closes,20)
         st = supertrend(list(candles), ATR_PERIOD, MULTIPLIER)
 
-        trend = "BULLISH" if candles[-1]["close"] > st[-1] else "BEARISH"
+        is_green = candle["close"] > candle["open"]
+        is_red = candle["close"] < candle["open"]
 
-        if trend == "BEARISH" and ema5 < ema20 and candles[-1]["close"] < BC:
-            pending_signal = "BEARISH"
+        if not bearish_acceptance and candle["time"].time() <= ACCEPTANCE_CUTOFF and is_green and candle["close"] < BC:
+            bearish_acceptance = True
+            send_telegram(f"🔴 Bearish acceptance seen @ {candle['close']}")
 
-        if trend == "BULLISH" and ema5 > ema20 and candles[-1]["close"] > TC:
-            pending_signal = "BULLISH"
+        if bearish_acceptance and is_red and candle["close"] < BC and candle["close"] < st[-1] and ema5 < ema20:
+            send_telegram(f"🔥 Bearish trigger confirmed @ {ltp}")
+            tm.enter("BEARISH", ltp)
+            bearish_acceptance = False
 
-        if pending_signal:
-            tm.enter(pending_signal, ltp)
-            pending_signal = None
+        if not bullish_acceptance and candle["time"].time() <= ACCEPTANCE_CUTOFF and is_red and candle["close"] > TC:
+            bullish_acceptance = True
+            send_telegram(f"🟢 Bullish acceptance seen @ {candle['close']}")
 
-    def on_open():
-        ws.subscribe(symbols=[INDEX_SYMBOL], data_type="SymbolUpdate")
-        ws.keep_running()
+        if bullish_acceptance and is_green and candle["close"] > TC and candle["close"] > st[-1] and ema5 > ema20:
+            send_telegram(f"🚀 Bullish trigger confirmed @ {ltp}")
+            tm.enter("BULLISH", ltp)
+            bullish_acceptance = False
 
     ws = data_ws.FyersDataSocket(
         access_token=fyers.auth,
-        on_connect=on_open,
+        on_connect=lambda: ws.subscribe(symbols=[INDEX_SYMBOL], data_type="SymbolUpdate"),
         on_message=on_tick,
         log_path=""
     )
