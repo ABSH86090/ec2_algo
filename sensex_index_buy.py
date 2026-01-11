@@ -33,6 +33,7 @@ TOTAL_QTY = LOT_SIZE * LOTS
 
 INDEX_TARGET = 350
 INDEX_SL = 75
+HARD_EXIT_TIME = datetime.time(14, 45)
 
 LOG_FILE = "sensex_index_sl_tp.log"
 
@@ -271,8 +272,12 @@ class TradeManager:
         logger.info(f"ENTRY {symbol} @ Index {index_entry_price}")
         send_telegram(f"🚀 ENTRY\n{symbol}\nIndex Entry: {index_entry_price}")
 
-    def on_tick(self, ltp):
+    def on_tick(self, ltp, now):
         if not self.pos:
+            return
+        
+        if now.time() >= HARD_EXIT_TIME:
+            self.exit("TIME EXIT 14:45")
             return
 
         entry = self.pos["entry"]
@@ -333,7 +338,7 @@ if __name__ == "__main__":
 
         ltp = msg["ltp"]
 
-        tm.on_tick(ltp)
+        tm.on_tick(ltp,ts)
 
         bucket = ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0)
 
