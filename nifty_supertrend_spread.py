@@ -309,7 +309,7 @@ if __name__ == "__main__":
     current_day = None
 
     def on_tick(msg):
-        nonlocal bearish_acceptance, bullish_acceptance, current_day
+        global bearish_acceptance, bullish_acceptance, current_day
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
