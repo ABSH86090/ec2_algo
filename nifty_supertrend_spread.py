@@ -334,13 +334,18 @@ if __name__ == "__main__":
     prefill_intraday_candles(fyers, candles)
 
     # 🔍 WARMUP CHECK (AS REQUESTED)
-    logger.info(
+    warmup_msg = (
         f"WARMUP CHECK | "
         f"Candles={len(candles)} | "
         f"EMA5={ema([c['close'] for c in candles], EMA_FAST)} | "
         f"EMA20={ema([c['close'] for c in candles], EMA_SLOW)} | "
+        f"BC={BC:.2f} | "
+        f"TC={TC:.2f} | "
         f"ST={supertrend(list(candles), ATR_PERIOD, MULTIPLIER)[-1]}"
     )
+
+    logger.info(warmup_msg)
+    send_telegram(f"📊 {warmup_msg}")
 
     pending_signal = None
 
