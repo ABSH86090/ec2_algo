@@ -291,14 +291,13 @@ if __name__ == "__main__":
     candles = deque(maxlen=300)
     prefill_intraday_candles(fyers, candles)
 
-    warmup_msg = (
-        f"📊 WARMUP CHECK | "
-        f"Candles={len(candles)} | "
-        f"EMA5={ema5_val:.2f if ema5_val else None} | "
-        f"EMA20={ema20_val:.2f if ema20_val else None} | "
-        f"BC={BC:.2f} | "
-        f"TC={TC:.2f} | "
-        f"ST={st_val:.2f if st_val else None}"
+    warmup_msg = ( 
+        f"WARMUP CHECK | " 
+        f"Candles={len(candles)} | " 
+        f"EMA5={ema([c['close'] for c in candles], EMA_FAST)} | " 
+        f"EMA20={ema([c['close'] for c in candles], EMA_SLOW)} | " 
+        f"BC={BC:.2f} | " f"TC={TC:.2f} | " 
+        f"ST={supertrend(list(candles), ATR_PERIOD, MULTIPLIER)[-1]}" 
     )
 
     logger.info(warmup_msg)
