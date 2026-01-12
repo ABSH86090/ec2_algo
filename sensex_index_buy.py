@@ -313,7 +313,7 @@ if __name__ == "__main__":
     signal_candle_time = None
 
     def on_tick(msg):
-        nonlocal pending_signal, signal_candle_time
+        global pending_signal, signal_candle_time
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
