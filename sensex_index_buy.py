@@ -318,7 +318,9 @@ if __name__ == "__main__":
         if msg.get("symbol") != INDEX_SYMBOL:
             return
 
-        ts = datetime.datetime.now()
+        ts = datetime.datetime.fromtimestamp(
+            msg.get("last_traded_time", msg.get("timestamp", datetime.datetime.now().timestamp()))
+        )
         index_ltp = msg["ltp"]
 
         tm.on_tick(index_ltp, ts)
