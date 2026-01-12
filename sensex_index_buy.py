@@ -1,6 +1,6 @@
 # =========================================================
 # SENSEX CPR + EMA → ITM OPTIONS BUYING (INDEX SL / TARGET)
-# BACKTEST-ALIGNED | READY TO RUN
+# LIVE = BACKTEST ALIGNED (FIXED)
 # =========================================================
 
 import datetime
@@ -117,17 +117,8 @@ def compute_cpr(prev):
 
 # ================= EMA WARMUP =================
 def prefill_intraday_candles(fyers, candles, days=5):
-    """
-    Reliable EMA warmup for INDEX:
-    - Fetch multiple past days
-    - Always log result
-    """
     start = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
     end = datetime.date.today().strftime("%Y-%m-%d")
-
-    logger.info(
-        f"EMA warmup fetch: {INDEX_SYMBOL} | {start} → {end}"
-    )
 
     resp = fyers.client.history({
         "symbol": INDEX_SYMBOL,
@@ -138,73 +129,22 @@ def prefill_intraday_candles(fyers, candles, days=5):
         "cont_flag": "1"
     })
 
-    candles_loaded = 0
-
     if resp.get("candles"):
         for c in resp["candles"]:
-            ts = datetime.datetime.fromtimestamp(c[0])
+            ts = datetime.datetime.fromtimestamp(c[0]).replace(second=0, microsecond=0)
             candles.append({
-                "time": ts.replace(second=0, microsecond=0),
+                "time": ts,
                 "open": c[1],
                 "high": c[2],
                 "low": c[3],
                 "close": c[4]
             })
-            candles_loaded += 1
 
     closes = [x["close"] for x in candles]
-    ema5 = ema(closes, EMA_FAST)
-    ema20 = ema(closes, EMA_SLOW)
-
-    # 🔥 ALWAYS LOG — even if None
-    msg = (
-        f"📊 EMA WARMUP STATUS\n"
-        f"Candles Loaded: {candles_loaded}\n"
-        f"EMA5 : {round(ema5,2) if ema5 else 'NOT READY'}\n"
-        f"EMA20: {round(ema20,2) if ema20 else 'NOT READY'}"
+    send_telegram(
+        f"📊 EMA WARMUP\nCandles={len(candles)}\n"
+        f"EMA5={ema(closes, EMA_FAST)}\nEMA20={ema(closes, EMA_SLOW)}"
     )
-
-    logger.info(msg)
-    send_telegram(msg)
-
-
-# ================= EXPIRY HELPERS =================
-SPECIAL_MARKET_HOLIDAYS = {
-    datetime.date(2025, 10, 2),
-    datetime.date(2025, 12, 25),
-}
-
-def is_last_thursday(d):
-    return d.weekday() == 3 and (d + datetime.timedelta(days=7)).month != d.month
-
-def get_next_expiry():
-    today = datetime.date.today()
-    days_to_thu = (3 - today.weekday()) % 7
-    expiry = today + datetime.timedelta(days=days_to_thu)
-
-    if expiry in SPECIAL_MARKET_HOLIDAYS:
-        expiry -= datetime.timedelta(days=1)
-
-    return expiry
-
-def format_expiry(expiry):
-    yy = expiry.strftime("%y")
-
-    if is_last_thursday(expiry):
-        return f"{yy}{expiry.strftime('%b').upper()}"
-
-    m = expiry.month
-    d = expiry.day
-    if m == 10:
-        m_token = "O"
-    elif m == 11:
-        m_token = "N"
-    elif m == 12:
-        m_token = "D"
-    else:
-        m_token = str(m)
-
-    return f"{yy}{m_token}{d:02d}"
 
 # ================= SYMBOL SELECTION =================
 def get_itm_symbols(fyers):
@@ -212,15 +152,13 @@ def get_itm_symbols(fyers):
     ltp = float(q["d"][0]["v"]["lp"])
     atm = round(ltp / 100) * 100
 
-    expiry = get_next_expiry()
-    exp = format_expiry(expiry)
+    expiry = datetime.date.today()
+    exp = expiry.strftime("%y%m%d")
 
     ce = f"BSE:SENSEX{exp}{atm - 500}CE"
     pe = f"BSE:SENSEX{exp}{atm + 500}PE"
 
-    logger.info(f"[SYMBOLS] ATM={atm} EXPIRY={expiry} CE={ce} PE={pe}")
-    send_telegram(f"📌 ITM SYMBOLS\nATM={atm}\nCE={ce}\nPE={pe}")
-
+    send_telegram(f"📌 SYMBOLS\nCE={ce}\nPE={pe}")
     return ce, pe
 
 # ================= SCENARIO ENGINE =================
@@ -260,43 +198,40 @@ class TradeManager:
         self.pos = None
         self.trade_day = None
 
-    def enter(self, symbol, index_entry_price):
-        day = datetime.date.today()
-        if self.trade_day == day:
+    def enter(self, symbol, index_price):
+        today = datetime.date.today()
+        if self.trade_day == today:
             return
-        self.trade_day = day
+        self.trade_day = today
 
         self.fyers.buy_mkt(symbol, TOTAL_QTY, "ENTRY")
-        self.pos = {"symbol": symbol, "entry": index_entry_price}
+        self.pos = {"symbol": symbol, "entry": index_price}
 
-        logger.info(f"ENTRY {symbol} @ Index {index_entry_price}")
-        send_telegram(f"🚀 ENTRY\n{symbol}\nIndex Entry: {index_entry_price}")
+        send_telegram(f"🚀 ENTRY\n{symbol}\nIndex={index_price}")
 
-    def on_tick(self, ltp, now):
+    def on_tick(self, index_ltp, now):
         if not self.pos:
             return
-        
+
         if now.time() >= HARD_EXIT_TIME:
-            self.exit("TIME EXIT 14:45")
+            self.exit("TIME EXIT")
             return
 
         entry = self.pos["entry"]
 
-        if ltp >= entry + INDEX_TARGET:
+        if index_ltp >= entry + INDEX_TARGET:
             self.exit("TARGET")
-        elif ltp <= entry - INDEX_SL:
+        elif index_ltp <= entry - INDEX_SL:
             self.exit("SL")
 
     def exit(self, reason):
         self.fyers.sell_mkt(self.pos["symbol"], TOTAL_QTY, reason)
-        logger.info(f"EXIT {self.pos['symbol']} | {reason}")
         send_telegram(f"🏁 EXIT [{reason}]")
         self.pos = None
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    logger.info("🚀 STRATEGY STARTED")
-    send_telegram("🚀 SENSEX CPR INDEX SL/TP STRATEGY STARTED")
+    send_telegram("🚀 STRATEGY STARTED")
 
     fyers = Fyers()
     ce, pe = get_itm_symbols(fyers)
@@ -312,70 +247,62 @@ if __name__ == "__main__":
 
     last = hist["candles"][-1]
     cpr = compute_cpr({"high": last[2], "low": last[3], "close": last[4]})
-    logger.info(f"CPR Levels: {cpr}")
 
     engine = ScenarioEngine(cpr)
     tm = TradeManager(fyers)
+
     candles = deque(maxlen=300)
     prefill_intraday_candles(fyers, candles)
 
     pending_signal = None
+    signal_candle_time = None
 
     def on_tick(msg):
-        global pending_signal
+        nonlocal pending_signal, signal_candle_time
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
 
-        # --- SAFE TIMESTAMP EXTRACTION ---
-        if "last_traded_time" in msg:
-            ts = datetime.datetime.fromtimestamp(msg["last_traded_time"])
-        elif "timestamp" in msg:
-            ts = datetime.datetime.fromtimestamp(msg["timestamp"])
-        else:
-            # FYERS index ticks often miss timestamp → fallback
-            ts = datetime.datetime.now()
+        ts = datetime.datetime.now()
+        index_ltp = msg["ltp"]
 
-        ltp = msg["ltp"]
-
-        tm.on_tick(ltp,ts)
+        tm.on_tick(index_ltp, ts)
 
         bucket = ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0)
 
         if not candles or candles[-1]["time"] != bucket:
             if len(candles) >= 2:
-                p = candles[-2]
-                c = candles[-1]
+                p, c = candles[-2], candles[-1]
 
-                closes = [x["close"] for x in list(candles)[:-1]]
-                ema5 = ema(closes, EMA_FAST)
-                ema20 = ema(closes, EMA_SLOW)
+                if p["time"].date() == c["time"].date():
+                    closes = [x["close"] for x in candles[:-1]]
+                    ema5 = ema(closes, EMA_FAST)
+                    ema20 = ema(closes, EMA_SLOW)
 
-                if ema5 is None or ema20 is None:
-                    logger.debug("EMA not ready yet, skipping signal evaluation")
-                else:
-                    sig = engine.evaluate(p, c, ema5, ema20)
-                    if sig:
-                        pending_signal = sig
-                        logger.info(f"SIGNAL {sig} at {c['time']}")
+                    if ema5 and ema20:
+                        sig = engine.evaluate(p, c, ema5, ema20)
+                        if sig:
+                            pending_signal = sig
+                            signal_candle_time = c["time"]
 
             candles.append({
                 "time": bucket,
-                "open": ltp,
-                "high": ltp,
-                "low": ltp,
-                "close": ltp
+                "open": index_ltp,
+                "high": index_ltp,
+                "low": index_ltp,
+                "close": index_ltp
             })
 
-            if pending_signal:
-                tm.enter(ce if pending_signal == "CALL" else pe, ltp)
+            if pending_signal and bucket > signal_candle_time:
+                tm.enter(ce if pending_signal == "CALL" else pe, index_ltp)
                 pending_signal = None
+                signal_candle_time = None
 
         else:
             c = candles[-1]
-            c["high"] = max(c["high"], ltp)
-            c["low"] = min(c["low"], ltp)
-            c["close"] = ltp
+            c["high"] = max(c["high"], index_ltp)
+            c["low"] = min(c["low"], index_ltp)
+            c["close"] = index_ltp
 
     def on_open():
         ws.subscribe(symbols=[INDEX_SYMBOL], data_type="SymbolUpdate")
