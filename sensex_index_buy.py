@@ -273,11 +273,21 @@ class TradeManager:
             return
 
         entry = self.pos["entry"]
+        symbol = self.pos["symbol"]
 
-        if index_ltp >= entry + INDEX_TARGET:
-            self.exit("TARGET")
-        elif index_ltp <= entry - INDEX_SL:
-            self.exit("SL")
+        # Determine direction from symbol (CE = bullish, PE = bearish)
+        is_call = "CE" in symbol
+
+        if is_call:
+            if index_ltp >= entry + INDEX_TARGET:
+                self.exit("TARGET")
+            elif index_ltp <= entry - INDEX_SL:
+                self.exit("SL")
+        else:  # Bearish (PUT) - SL on upside, Target on downside
+            if index_ltp <= entry - INDEX_TARGET:
+                self.exit("TARGET")
+            elif index_ltp >= entry + INDEX_SL:
+                self.exit("SL")
 
     def exit(self, reason):
         self.fyers.sell_mkt(self.pos["symbol"], TOTAL_QTY, reason)
