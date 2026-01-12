@@ -1,7 +1,7 @@
 # =========================================================
 # NIFTY CPR + SUPERTREND + EMA
 # OPTION SELLING WITH HEDGE (INDEX SL / TARGET)
-# ALIGNED WITH BACKTEST (first trend + seen_opposite + price < both EMAs)
+# BACKTEST-ALIGNED: day-isolated first_trend + seen_opposite + price < EMAs
 # =========================================================
 
 import datetime
@@ -31,8 +31,8 @@ LOT_SIZE = 65
 LOTS = 1
 QTY = LOT_SIZE * LOTS
 
-INDEX_SL = 30          # Aligned with backtest
-INDEX_TARGET = 140     # Aligned with backtest
+INDEX_SL = 30
+INDEX_TARGET = 140
 ENTRY_CUTOFF = datetime.time(14, 0)
 HARD_EXIT_TIME = datetime.time(14, 45)
 
@@ -270,7 +270,7 @@ class TradeManager:
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    send_telegram("🚀 NIFTY STRATEGY STARTED - backtest-aligned (seen_opposite + price < EMAs)")
+    send_telegram("🚀 NIFTY STRATEGY STARTED - day-isolated first_trend")
 
     fyers = Fyers()
     tm = TradeManager(fyers)
@@ -303,9 +303,10 @@ if __name__ == "__main__":
     first_trend = None
     seen_opposite = False
     current_day = None
+    day_start_index = 0  # will track where current trading day begins in candles deque
 
     def on_tick(msg):
-        nonlocal first_trend, seen_opposite, current_day
+        global first_trend, seen_opposite, current_day, day_start_index
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
@@ -328,29 +329,27 @@ if __name__ == "__main__":
             prev = candles[-1] if candles else None
             candles.append({"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp})
 
-            # Set first_trend when second candle starts
-            if len(candles) >= 2 and first_trend is None:
-                first_candle = candles[-2]
-                closes_for_st = [c["close"] for c in candles[:-1]]
-                st_vals = supertrend(list(candles[:-1]), ATR_PERIOD, MULTIPLIER)
-                st_first = st_vals[-1]
+            # Reset on new day + track start index
+            if current_day != prev["time"].date():
+                first_trend = None
+                seen_opposite = False
+                day_start_index = len(candles) - 1  # index of first candle of new day
+                current_day = prev["time"].date()
+                send_telegram("🔄 New trading day reset - first candle tracking started")
 
-                if first_candle["close"] > st_first:
-                    first_trend = "BULLISH"
-                else:
-                    first_trend = "BEARISH"
+            # Set first_trend using ONLY candles from start of today
+            if first_trend is None and len(candles) > day_start_index:
+                today_candles = list(candles)[day_start_index:]
+                if len(today_candles) >= 1:
+                    st_today = supertrend(today_candles, ATR_PERIOD, MULTIPLIER)
+                    first_close = today_candles[0]["close"]
+                    first_st = st_today[0]  # ST of the very first candle today
 
-                send_telegram(f"📌 First candle trend set: {first_trend}")
+                    first_trend = "BULLISH" if first_close > first_st else "BEARISH"
+                    send_telegram(f"📌 First candle trend set (day-isolated): {first_trend}")
 
         if not prev or len(candles) < 30:
             return
-
-        # Reset on new day
-        if current_day != prev["time"].date():
-            first_trend = None
-            seen_opposite = False
-            current_day = prev["time"].date()
-            send_telegram("🔄 New trading day reset")
 
         # Skip if past entry cutoff
         if ts.time() >= ENTRY_CUTOFF:
@@ -392,7 +391,7 @@ if __name__ == "__main__":
         is_green = current_close > current_open
         is_red = current_close < current_open
 
-        # Bearish trigger - backtest style
+        # Bearish trigger
         if first_trend == "BEARISH" and is_red and \
            current_close < BC and \
            current_close < st_val and \
@@ -400,7 +399,7 @@ if __name__ == "__main__":
             send_telegram("🔥 BEARISH TRIGGER")
             tm.enter("BEARISH", ltp)
 
-        # Bullish trigger - symmetric
+        # Bullish trigger
         elif first_trend == "BULLISH" and is_green and \
              current_close > TC and \
              current_close > st_val and \
