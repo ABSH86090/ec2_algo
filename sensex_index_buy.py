@@ -146,20 +146,75 @@ def prefill_intraday_candles(fyers, candles, days=5):
         f"EMA5={ema(closes, EMA_FAST)}\nEMA20={ema(closes, EMA_SLOW)}"
     )
 
-# ================= SYMBOL SELECTION =================
+SPECIAL_MARKET_HOLIDAYS = {
+    datetime.date(2026, 1, 26),
+    datetime.date(2026, 3, 3),
+}
+
+def is_last_thursday(d):
+    return d.weekday() == 3 and (d + datetime.timedelta(days=7)).month != d.month
+
+def get_next_expiry():
+    today = datetime.date.today()
+    days_ahead = (3 - today.weekday()) % 7
+    expiry = today + datetime.timedelta(days=days_ahead)
+
+    if expiry in SPECIAL_MARKET_HOLIDAYS:
+        expiry -= datetime.timedelta(days=1)
+
+    return expiry
+
+def format_expiry(expiry):
+    yy = expiry.strftime("%y")
+
+    # Monthly expiry
+    if is_last_thursday(expiry):
+        return f"{yy}{expiry.strftime('%b').upper()}"
+
+    # Weekly expiry
+    m = expiry.month
+    d = expiry.day
+
+    if m == 10:
+        m_token = "O"
+    elif m == 11:
+        m_token = "N"
+    elif m == 12:
+        m_token = "D"
+    else:
+        m_token = str(m)
+
+    return f"{yy}{m_token}{d:02d}"
+
 def get_itm_symbols(fyers):
     q = fyers.client.quotes({"symbols": INDEX_SYMBOL})
-    ltp = float(q["d"][0]["v"]["lp"])
-    atm = round(ltp / 100) * 100
+    index_ltp = float(q["d"][0]["v"]["lp"])
 
-    expiry = datetime.date.today()
-    exp = expiry.strftime("%y%m%d")
+    atm = round(index_ltp / 100) * 100
 
-    ce = f"BSE:SENSEX{exp}{atm - 500}CE"
-    pe = f"BSE:SENSEX{exp}{atm + 500}PE"
+    expiry = get_next_expiry()
+    exp_token = format_expiry(expiry)
 
-    send_telegram(f"📌 SYMBOLS\nCE={ce}\nPE={pe}")
+    ce_strike = atm - 500
+    pe_strike = atm + 500
+
+    ce = f"BSE:SENSEX{exp_token}{ce_strike}CE"
+    pe = f"BSE:SENSEX{exp_token}{pe_strike}PE"
+
+    msg = (
+        f"📌 SENSEX OPTION SELECTION\n"
+        f"Index LTP : {index_ltp}\n"
+        f"ATM       : {atm}\n"
+        f"Expiry    : {expiry} ({exp_token})\n"
+        f"CALL ITM  : {ce}\n"
+        f"PUT  ITM  : {pe}"
+    )
+
+    logger.info(msg)
+    send_telegram(msg)
+
     return ce, pe
+
 
 # ================= SCENARIO ENGINE =================
 class ScenarioEngine:
