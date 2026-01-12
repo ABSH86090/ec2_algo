@@ -282,13 +282,21 @@ class TradeManager:
             return
 
         e = self.pos["entry"]
+        bias = "BEARISH" if "CE" in self.pos["main"] else "BULLISH"  # or store bias in self.pos
 
         if ts.time() >= HARD_EXIT_TIME:
             self.exit("TIME", ltp)
-        elif ltp >= e + INDEX_SL:
-            self.exit("SL", ltp)
-        elif ltp <= e - INDEX_TARGET:
-            self.exit("TARGET", ltp)
+            return
+        if bias == "BEARISH":
+            if ltp >= e + INDEX_SL:
+                self.exit("SL", ltp)
+            elif ltp <= e - INDEX_TARGET:
+                self.exit("TARGET", ltp)
+        else:
+            if ltp <= e - INDEX_SL:
+                self.exit("SL", ltp)
+            elif ltp >= e + INDEX_TARGET:
+                self.exit("TARGET", ltp)
 
     def exit(self, reason, ltp):
         if not self.pos:
