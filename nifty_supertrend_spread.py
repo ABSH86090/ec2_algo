@@ -345,7 +345,7 @@ if __name__ == "__main__":
     current_day = None
 
     def on_tick(msg):
-        nonlocal bearish_acceptance, bullish_acceptance, current_day
+        global bearish_acceptance, bullish_acceptance, current_day
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
@@ -390,11 +390,11 @@ if __name__ == "__main__":
         )
 
         # ---- ACCEPTANCE ----
-        if not bearish_acceptance and prev["time"].time() <= ACCEPTANCE_CUTOFF and prev["high"] > BC and prev["close"] < BC:
+        if not bearish_acceptance and prev["time"].time() <= ACCEPTANCE_CUTOFF and prev["close"] > prev["open"] and prev["close"] < BC:
             bearish_acceptance = True
             send_telegram("🔴 BEARISH ACCEPTANCE")
 
-        elif not bullish_acceptance and prev["time"].time() <= ACCEPTANCE_CUTOFF and prev["low"] < TC and prev["close"] > TC:
+        elif not bullish_acceptance and prev["time"].time() <= ACCEPTANCE_CUTOFF and prev["close"] < prev["open"] and prev["close"] > TC:
             bullish_acceptance = True
             send_telegram("🟢 BULLISH ACCEPTANCE")
 
