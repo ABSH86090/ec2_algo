@@ -1,7 +1,7 @@
 # =========================================================
 # NIFTY CPR + SUPERTREND + EMA
 # OPTION SELLING WITH HEDGE (INDEX SL / TARGET)
-# LIVE | BACKTEST-ALIGNED | FULL TELEGRAM LOGGING
+# ALIGNED WITH BACKTEST (first trend + seen_opposite + price < both EMAs)
 # =========================================================
 
 import datetime
@@ -23,20 +23,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
-
 EMA_FAST = 5
 EMA_SLOW = 20
 ATR_PERIOD = 10
 MULTIPLIER = 3.5
-
 LOT_SIZE = 65
 LOTS = 1
 QTY = LOT_SIZE * LOTS
 
-INDEX_SL = 30
-INDEX_TARGET = 140
+INDEX_SL = 30          # Aligned with backtest
+INDEX_TARGET = 140     # Aligned with backtest
+ENTRY_CUTOFF = datetime.time(14, 0)
 HARD_EXIT_TIME = datetime.time(14, 45)
-ACCEPTANCE_CUTOFF = datetime.time(11, 30)
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -55,7 +53,7 @@ def send_telegram(msg):
             timeout=3
         )
     except Exception:
-        pass  # silent fail - we don't want telegram errors to crash the script
+        pass
 
 # ================= FYERS =================
 class Fyers:
@@ -69,7 +67,6 @@ class Fyers:
         self.auth = f"{CLIENT_ID}:{ACCESS_TOKEN}"
 
     def safe_place_order(self, order_data, description):
-        """Place order and alert on failure"""
         try:
             resp = self.client.place_order(order_data)
             if resp.get("s") != "ok":
@@ -79,42 +76,25 @@ class Fyers:
                     f"Symbol: {order_data['symbol']}\n"
                     f"Side: {'BUY' if order_data['side']==1 else 'SELL'}\n"
                     f"Qty: {order_data['qty']}\n"
-                    f"Error: {error_msg}\n"
-                    f"Full response: {resp}"
+                    f"Error: {error_msg}"
                 )
-                logging.error(f"Order failed: {resp}")
                 return None
             return resp
         except Exception as e:
-            send_telegram(
-                f"❌ EXCEPTION during {description}\n"
-                f"Error: {str(e)}\n"
-                f"Order data: {order_data}"
-            )
-            logging.exception("Order placement exception")
+            send_telegram(f"❌ EXCEPTION during {description}\nError: {str(e)}")
             return None
 
     def buy(self, symbol, qty, tag):
         order_data = {
-            "symbol": symbol,
-            "qty": qty,
-            "type": 2,
-            "side": 1,
-            "productType": "INTRADAY",
-            "validity": "DAY",
-            "orderTag": tag
+            "symbol": symbol, "qty": qty, "type": 2, "side": 1,
+            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag
         }
         return self.safe_place_order(order_data, f"BUY {tag} {symbol}")
 
     def sell(self, symbol, qty, tag):
         order_data = {
-            "symbol": symbol,
-            "qty": qty,
-            "type": 2,
-            "side": -1,
-            "productType": "INTRADAY",
-            "validity": "DAY",
-            "orderTag": tag
+            "symbol": symbol, "qty": qty, "type": 2, "side": -1,
+            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag
         }
         return self.safe_place_order(order_data, f"SELL {tag} {symbol}")
 
@@ -144,7 +124,6 @@ def atr(candles, period):
 def supertrend(candles, period, multiplier):
     atrs = atr(candles, period)
     st, ub, lb, trend = [None]*len(candles), [None]*len(candles), [None]*len(candles), [None]*len(candles)
-
     for i in range(len(candles)):
         if atrs[i] is None:
             continue
@@ -152,7 +131,6 @@ def supertrend(candles, period, multiplier):
         hl2 = (h + l) / 2
         b_ub = hl2 + multiplier * atrs[i]
         b_lb = hl2 - multiplier * atrs[i]
-
         if i == 0 or ub[i-1] is None:
             ub[i], lb[i] = b_ub, b_lb
             trend[i] = "BULLISH" if c > b_ub else "BEARISH"
@@ -175,7 +153,7 @@ def compute_cpr(prev):
     tc = 2 * pivot - bc
     return min(bc, tc), max(bc, tc)
 
-# ================= EXPIRY HELPERS =================
+# ================= EXPIRY & SYMBOL HELPERS =================
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 1, 26),
     datetime.date(2026, 3, 3),
@@ -190,30 +168,24 @@ def get_next_tuesday_expiry():
     today = datetime.date.today()
     days = (1 - today.weekday()) % 7
     expiry = today + datetime.timedelta(days=days)
-
     if today.weekday() == 1 and datetime.datetime.now().time() >= datetime.time(15, 30):
         expiry += datetime.timedelta(days=7)
-
     if expiry in SPECIAL_MARKET_HOLIDAYS:
         expiry -= datetime.timedelta(days=1)
-
     return expiry
 
 def format_nifty_expiry(expiry):
     yy = expiry.strftime("%y")
     if is_last_tuesday(expiry):
         return f"{yy}{expiry.strftime('%b').upper()}"
-
     m, d = expiry.month, expiry.day
     m_token = {10: "O", 11: "N", 12: "D"}.get(m, str(m))
     return f"{yy}{m_token}{d:02d}"
 
-# ================= SYMBOL SELECTION =================
 def get_nifty_option_symbols(fyers):
     ltp = float(fyers.client.quotes({"symbols": INDEX_SYMBOL})["d"][0]["v"]["lp"])
     atm = round(ltp / 50) * 50
     exp = format_nifty_expiry(get_next_tuesday_expiry())
-
     return (
         f"NSE:NIFTY{exp}{atm}CE",
         f"NSE:NIFTY{exp}{atm}PE",
@@ -231,7 +203,6 @@ def prefill_intraday_candles(fyers, candles, days=5):
         "range_to": datetime.date.today().strftime("%Y-%m-%d"),
         "cont_flag": "1"
     })
-
     for c in r.get("candles", []):
         ts = datetime.datetime.fromtimestamp(c[0]).replace(second=0, microsecond=0)
         candles.append({"time": ts, "open": c[1], "high": c[2], "low": c[3], "close": c[4]})
@@ -246,44 +217,33 @@ class TradeManager:
     def enter(self, bias, ltp):
         if self.trade_day == datetime.date.today():
             return
-
         atm_ce, atm_pe, hedge_ce, hedge_pe = get_nifty_option_symbols(self.fyers)
-
         if bias == "BEARISH":
-            # Hedge first (buy), then main (sell)
             hedge_resp = self.fyers.buy(hedge_ce, QTY, "HEDGE")
             if hedge_resp is None:
                 send_telegram("⚠️ ENTRY ABORTED: Hedge buy failed")
                 return
-
             main_resp = self.fyers.sell(atm_ce, QTY, "SELL_CE")
             if main_resp is None:
                 send_telegram("⚠️ PARTIAL ENTRY: Hedge bought but SELL_CE failed!")
-                # You may want to square off hedge here in production
-
-            self.pos = {"main": atm_ce, "hedge": hedge_ce, "entry": ltp}
+            self.pos = {"main": atm_ce, "hedge": hedge_ce, "entry": ltp, "bias": "BEARISH"}
         else:
             hedge_resp = self.fyers.buy(hedge_pe, QTY, "HEDGE")
             if hedge_resp is None:
                 send_telegram("⚠️ ENTRY ABORTED: Hedge buy failed")
                 return
-
             main_resp = self.fyers.sell(atm_pe, QTY, "SELL_PE")
             if main_resp is None:
                 send_telegram("⚠️ PARTIAL ENTRY: Hedge bought but SELL_PE failed!")
-
-            self.pos = {"main": atm_pe, "hedge": hedge_pe, "entry": ltp}
-
+            self.pos = {"main": atm_pe, "hedge": hedge_pe, "entry": ltp, "bias": "BULLISH"}
         self.trade_day = datetime.date.today()
         send_telegram(f"🚀 ENTRY {bias} @ {ltp}")
 
     def on_tick(self, ltp, ts):
         if not self.pos:
             return
-
         e = self.pos["entry"]
-        bias = "BEARISH" if "CE" in self.pos["main"] else "BULLISH"  # or store bias in self.pos
-
+        bias = self.pos["bias"]
         if ts.time() >= HARD_EXIT_TIME:
             self.exit("TIME", ltp)
             return
@@ -301,24 +261,16 @@ class TradeManager:
     def exit(self, reason, ltp):
         if not self.pos:
             return
-
         main_resp = self.fyers.buy(self.pos["main"], QTY, f"EXIT_{reason}_MAIN")
         hedge_resp = self.fyers.sell(self.pos["hedge"], QTY, f"EXIT_{reason}_HEDGE")
-
         send_telegram(f"🏁 EXIT {reason} @ {ltp}")
-
         if main_resp is None or hedge_resp is None:
-            send_telegram(
-                f"⚠️ EXIT WARNING: Some orders may have failed!\n"
-                f"Reason: {reason} | LTP: {ltp}\n"
-                f"Check Fyers dashboard immediately!"
-            )
-
+            send_telegram(f"⚠️ EXIT WARNING: Some orders may have failed! Reason: {reason}")
         self.pos = None
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    send_telegram("🚀 NIFTY STRATEGY STARTED - with order failure alerts")
+    send_telegram("🚀 NIFTY STRATEGY STARTED - backtest-aligned (seen_opposite + price < EMAs)")
 
     fyers = Fyers()
     tm = TradeManager(fyers)
@@ -348,12 +300,12 @@ if __name__ == "__main__":
         f"ST={st[-1]:.2f} | BC={BC:.2f} TC={TC:.2f}"
     )
 
-    bearish_acceptance = False
-    bullish_acceptance = False
+    first_trend = None
+    seen_opposite = False
     current_day = None
 
     def on_tick(msg):
-        global bearish_acceptance, bullish_acceptance, current_day
+        nonlocal first_trend, seen_opposite, current_day
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
@@ -372,21 +324,40 @@ if __name__ == "__main__":
             c["high"] = max(c["high"], ltp)
             c["low"] = min(c["low"], ltp)
             c["close"] = ltp
-            return
         else:
             prev = candles[-1] if candles else None
             candles.append({"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp})
 
+            # Set first_trend when second candle starts
+            if len(candles) >= 2 and first_trend is None:
+                first_candle = candles[-2]
+                closes_for_st = [c["close"] for c in candles[:-1]]
+                st_vals = supertrend(list(candles[:-1]), ATR_PERIOD, MULTIPLIER)
+                st_first = st_vals[-1]
+
+                if first_candle["close"] > st_first:
+                    first_trend = "BULLISH"
+                else:
+                    first_trend = "BEARISH"
+
+                send_telegram(f"📌 First candle trend set: {first_trend}")
+
         if not prev or len(candles) < 30:
             return
 
+        # Reset on new day
         if current_day != prev["time"].date():
-            bearish_acceptance = bullish_acceptance = False
+            first_trend = None
+            seen_opposite = False
             current_day = prev["time"].date()
             send_telegram("🔄 New trading day reset")
 
+        # Skip if past entry cutoff
+        if ts.time() >= ENTRY_CUTOFF:
+            return
+
         closes = [c["close"] for c in candles]
-        ema5, ema20 = ema(closes, 5), ema(closes, 20)
+        ema5, ema20 = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
         st = supertrend(list(candles), ATR_PERIOD, MULTIPLIER)
 
         send_telegram(
@@ -394,28 +365,48 @@ if __name__ == "__main__":
             f"O={prev['open']} H={prev['high']} L={prev['low']} C={prev['close']} | "
             f"BC={BC:.2f} TC={TC:.2f} | "
             f"EMA5={ema5:.1f} EMA20={ema20:.1f} ST={st[-2]:.1f} | "
-            f"BA={bearish_acceptance} BU={bullish_acceptance}"
+            f"FT={first_trend} SO={seen_opposite}"
         )
 
-        # ---- ACCEPTANCE ----
-        if not bearish_acceptance and prev["time"].time() <= ACCEPTANCE_CUTOFF and prev["close"] > prev["open"] and prev["close"] < BC:
-            bearish_acceptance = True
-            send_telegram("🔴 BEARISH ACCEPTANCE")
+        # Update seen_opposite
+        if first_trend is not None:
+            current_close = prev["close"]
+            current_open = prev["open"]
+            st_val = st[-2]
 
-        elif not bullish_acceptance and prev["time"].time() <= ACCEPTANCE_CUTOFF and prev["close"] < prev["open"] and prev["close"] > TC:
-            bullish_acceptance = True
-            send_telegram("🟢 BULLISH ACCEPTANCE")
+            is_green = current_close > current_open
+            is_red = current_close < current_open
+
+            if first_trend == "BULLISH" and is_red and current_close > st_val:
+                seen_opposite = True
+            elif first_trend == "BEARISH" and is_green and current_close < st_val:
+                seen_opposite = True
 
         # ---- TRIGGERS ----
-        elif bearish_acceptance and prev["close"] < BC and prev["close"] < st[-2] and ema5 < ema20:
+        if first_trend is None or not seen_opposite:
+            return
+
+        current_close = prev["close"]
+        current_open = prev["open"]
+        st_val = st[-2]
+        is_green = current_close > current_open
+        is_red = current_close < current_open
+
+        # Bearish trigger - backtest style
+        if first_trend == "BEARISH" and is_red and \
+           current_close < BC and \
+           current_close < st_val and \
+           current_close < ema5 and current_close < ema20:
             send_telegram("🔥 BEARISH TRIGGER")
             tm.enter("BEARISH", ltp)
-            bearish_acceptance = False
 
-        elif bullish_acceptance and prev["close"] > TC and prev["close"] > st[-2] and ema5 > ema20:
+        # Bullish trigger - symmetric
+        elif first_trend == "BULLISH" and is_green and \
+             current_close > TC and \
+             current_close > st_val and \
+             current_close > ema5 and current_close > ema20:
             send_telegram("🚀 BULLISH TRIGGER")
             tm.enter("BULLISH", ltp)
-            bullish_acceptance = False
 
     ws = data_ws.FyersDataSocket(
         access_token=fyers.auth,
