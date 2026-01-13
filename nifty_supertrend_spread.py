@@ -301,7 +301,8 @@ if __name__ == "__main__":
     send_telegram(
         f"WARMUP DONE | Candles={len(full_candles)} | "
         f"EMA5={ema(closes,5):.2f} EMA20={ema(closes,20):.2f} "
-        f"ST={warmup_st:.2f if warmup_st else 'N/A'} | BC={BC:.2f} TC={TC:.2f}"
+        f"ST={warmup_st:.2f if warmup_st is not None else 'N/A'} | "
+        f"BC={BC:.2f} TC={TC:.2f}"
     )
 
     first_trend = None
