@@ -3,7 +3,6 @@
 # OPTION SELLING WITH HEDGE (INDEX SL / TARGET)
 # BACKTEST-ALIGNED: day-isolated first_trend + seen_opposite + price < EMAs
 # =========================================================
-
 import datetime
 import os
 import sys
@@ -16,7 +15,6 @@ from fyers_apiv3.FyersWebsocket import data_ws
 
 # ================= CONFIG =================
 load_dotenv()
-
 CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
 ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -33,6 +31,7 @@ QTY = LOT_SIZE * LOTS
 
 INDEX_SL = 30
 INDEX_TARGET = 140
+
 ENTRY_CUTOFF = datetime.time(14, 0)
 HARD_EXIT_TIME = datetime.time(14, 45)
 
@@ -270,12 +269,11 @@ class TradeManager:
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    send_telegram("🚀 NIFTY STRATEGY STARTED - day-isolated first_trend")
-
+    send_telegram("🚀 NIFTY STRATEGY STARTED - continuous Supertrend + day-isolated logic")
     fyers = Fyers()
     tm = TradeManager(fyers)
 
-    # ---- CPR ----
+    # ---- CPR (previous day) ----
     hist = fyers.client.history({
         "symbol": INDEX_SYMBOL,
         "resolution": "D",
@@ -287,26 +285,32 @@ if __name__ == "__main__":
     last = hist["candles"][-1]
     BC, TC = compute_cpr({"high": last[2], "low": last[3], "close": last[4]})
 
-    # ---- Warmup ----
-    candles = deque(maxlen=300)
-    prefill_intraday_candles(fyers, candles)
+    # ---- Continuous data structures ----
+    full_candles = deque(maxlen=600)           # Enough for several days of 15-min candles
+    full_st = []                               # Will hold Supertrend values (latest is most important)
 
-    closes = [c["close"] for c in candles]
-    st = supertrend(list(candles), ATR_PERIOD, MULTIPLIER)
+    # Warmup historical data
+    prefill_intraday_candles(fyers, full_candles, days=5)
+    if len(full_candles) >= ATR_PERIOD + 10:
+        full_st = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
+        warmup_st = full_st[-1] if full_st else None
+    else:
+        warmup_st = None
 
+    closes = [c["close"] for c in full_candles]
     send_telegram(
-        f"WARMUP DONE | Candles={len(candles)} | "
+        f"WARMUP DONE | Candles={len(full_candles)} | "
         f"EMA5={ema(closes,5):.2f} EMA20={ema(closes,20):.2f} "
-        f"ST={st[-1]:.2f} | BC={BC:.2f} TC={TC:.2f}"
+        f"ST={warmup_st:.2f if warmup_st else 'N/A'} | BC={BC:.2f} TC={TC:.2f}"
     )
 
     first_trend = None
     seen_opposite = False
     current_day = None
-    day_start_index = 0  # will track where current trading day begins in candles deque
+    day_start_time = None
 
     def on_tick(msg):
-        global first_trend, seen_opposite, current_day, day_start_index
+        global first_trend, seen_opposite, current_day, day_start_time
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
@@ -315,95 +319,99 @@ if __name__ == "__main__":
             msg.get("last_traded_time", msg.get("timestamp", datetime.datetime.now().timestamp()))
         )
         ltp = msg["ltp"]
+
         tm.on_tick(ltp, ts)
 
         bucket = ts.replace(minute=(ts.minute//15)*15, second=0, microsecond=0)
-        prev = None
 
-        if candles and candles[-1]["time"] == bucket:
-            c = candles[-1]
+        # Update or append candle
+        if full_candles and full_candles[-1]["time"] == bucket:
+            c = full_candles[-1]
             c["high"] = max(c["high"], ltp)
             c["low"] = min(c["low"], ltp)
             c["close"] = ltp
         else:
-            prev = candles[-1] if candles else None
-            candles.append({"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp})
+            new_candle = {"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
+            full_candles.append(new_candle)
 
-            # Reset on new day + track start index
-            if current_day != prev["time"].date():
-                first_trend = None
-                seen_opposite = False
-                day_start_index = len(candles) - 1  # index of first candle of new day
-                current_day = prev["time"].date()
-                send_telegram("🔄 New trading day reset - first candle tracking started")
+            # Detect new trading day
+            if current_day != bucket.date():
+                current_day = bucket.date()
+                day_start_time = bucket
+                send_telegram("🔄 New trading day detected - continuous ST continues")
 
-            # Set first_trend using ONLY candles from start of today
-            if first_trend is None and len(candles) > day_start_index:
-                today_candles = list(candles)[day_start_index:]
-                if len(today_candles) >= 1:
-                    st_today = supertrend(today_candles, ATR_PERIOD, MULTIPLIER)
-                    first_close = today_candles[0]["close"]
-                    first_st = st_today[0]  # ST of the very first candle today
+        # Recalculate Supertrend on full history (efficient enough for 15-min)
+        if len(full_candles) >= ATR_PERIOD + 5:
+            full_st_values = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
+            current_st = full_st_values[-1] if full_st_values else None
 
-                    first_trend = "BULLISH" if first_close > first_st else "BEARISH"
-                    send_telegram(f"📌 First candle trend set (day-isolated): {first_trend}")
+            # Set first_trend using continuous Supertrend (once per day)
+            if first_trend is None and current_st is not None and day_start_time is not None:
+                # We can use the close of the first candle of today, or current
+                first_candle_idx = next((i for i, c in enumerate(full_candles) if c["time"] >= day_start_time), -1)
+                if first_candle_idx >= 0:
+                    first_close = full_candles[first_candle_idx]["close"]
+                    first_trend = "BULLISH" if first_close > current_st else "BEARISH"
+                    send_telegram(
+                        f"📌 First trend set (continuous ST) @ {day_start_time.time()}: {first_trend} "
+                        f"(ST={current_st:.1f}, Close={first_close:.1f})"
+                    )
 
-        if not prev or len(candles) < 30:
+        if len(full_candles) < 30:
             return
 
-        # Skip if past entry cutoff
         if ts.time() >= ENTRY_CUTOFF:
             return
 
-        closes = [c["close"] for c in candles]
-        ema5, ema20 = ema(closes, EMA_FAST), ema(closes, EMA_SLOW)
-        st = supertrend(list(candles), ATR_PERIOD, MULTIPLIER)
+        prev = full_candles[-2] if len(full_candles) >= 2 else full_candles[-1]
+        current = full_candles[-1]
+
+        closes = [c["close"] for c in full_candles]
+        ema5 = ema(closes, EMA_FAST)
+        ema20 = ema(closes, EMA_SLOW)
+
+        current_st = full_st_values[-2] if 'full_st_values' in locals() and full_st_values else None
+
+        if current_st is None:
+            return
 
         send_telegram(
             f"CANDLE {prev['time'].time()} | "
-            f"O={prev['open']} H={prev['high']} L={prev['low']} C={prev['close']} | "
-            f"BC={BC:.2f} TC={TC:.2f} | "
-            f"EMA5={ema5:.1f} EMA20={ema20:.1f} ST={st[-2]:.1f} | "
+            f"O={prev['open']:.0f} H={prev['high']:.0f} L={prev['low']:.0f} C={prev['close']:.0f} | "
+            f"BC={BC:.0f} TC={TC:.0f} | "
+            f"EMA5={ema5:.0f} EMA20={ema20:.0f} ST={current_st:.0f} | "
             f"FT={first_trend} SO={seen_opposite}"
         )
 
         # Update seen_opposite
         if first_trend is not None:
-            current_close = prev["close"]
-            current_open = prev["open"]
-            st_val = st[-2]
-
-            is_green = current_close > current_open
-            is_red = current_close < current_open
-
-            if first_trend == "BULLISH" and is_red and current_close > st_val:
+            is_green = current["close"] > current["open"]
+            is_red = current["close"] < current["open"]
+            if first_trend == "BULLISH" and is_red and current["close"] > current_st:
                 seen_opposite = True
-            elif first_trend == "BEARISH" and is_green and current_close < st_val:
+            elif first_trend == "BEARISH" and is_green and current["close"] < current_st:
                 seen_opposite = True
 
         # ---- TRIGGERS ----
         if first_trend is None or not seen_opposite:
             return
 
-        current_close = prev["close"]
-        current_open = prev["open"]
-        st_val = st[-2]
-        is_green = current_close > current_open
-        is_red = current_close < current_open
+        is_green = current["close"] > current["open"]
+        is_red = current["close"] < current["open"]
 
         # Bearish trigger
-        if first_trend == "BEARISH" and is_red and \
-           current_close < BC and \
-           current_close < st_val and \
-           current_close < ema5 and current_close < ema20:
+        if (first_trend == "BEARISH" and is_red and
+            current["close"] < BC and
+            current["close"] < current_st and
+            current["close"] < ema5 and current["close"] < ema20):
             send_telegram("🔥 BEARISH TRIGGER")
             tm.enter("BEARISH", ltp)
 
         # Bullish trigger
-        elif first_trend == "BULLISH" and is_green and \
-             current_close > TC and \
-             current_close > st_val and \
-             current_close > ema5 and current_close > ema20:
+        elif (first_trend == "BULLISH" and is_green and
+              current["close"] > TC and
+              current["close"] > current_st and
+              current["close"] > ema5 and current["close"] > ema20):
             send_telegram("🚀 BULLISH TRIGGER")
             tm.enter("BULLISH", ltp)
 
