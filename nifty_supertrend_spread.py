@@ -298,10 +298,12 @@ if __name__ == "__main__":
         warmup_st = None
 
     closes = [c["close"] for c in full_candles]
+    st_text = f"{warmup_st:.2f}" if warmup_st is not None else "N/A"
+
     send_telegram(
         f"WARMUP DONE | Candles={len(full_candles)} | "
         f"EMA5={ema(closes,5):.2f} EMA20={ema(closes,20):.2f} "
-        f"ST={warmup_st:.2f if warmup_st is not None else 'N/A'} | "
+        f"ST={st_text} | "
         f"BC={BC:.2f} TC={TC:.2f}"
     )
 
