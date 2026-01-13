@@ -1,7 +1,6 @@
 # =========================================================
 # NIFTY CPR + SUPERTREND + EMA
 # OPTION SELLING WITH HEDGE (INDEX SL / TARGET)
-# BACKTEST-ALIGNED: day-isolated first_trend + seen_opposite + price < EMAs
 # =========================================================
 import datetime
 import os
@@ -269,7 +268,7 @@ class TradeManager:
 
 # ================= MAIN =================
 if __name__ == "__main__":
-    send_telegram("🚀 NIFTY STRATEGY STARTED - continuous Supertrend + day-isolated logic")
+    send_telegram("🚀 NIFTY STRATEGY STARTED - continuous ST | updates on candle close only")
     fyers = Fyers()
     tm = TradeManager(fyers)
 
@@ -286,25 +285,27 @@ if __name__ == "__main__":
     BC, TC = compute_cpr({"high": last[2], "low": last[3], "close": last[4]})
 
     # ---- Continuous data structures ----
-    full_candles = deque(maxlen=600)           # Enough for several days of 15-min candles
-    full_st = []                               # Will hold Supertrend values (latest is most important)
-
-    # Warmup historical data
+    full_candles = deque(maxlen=600)
     prefill_intraday_candles(fyers, full_candles, days=5)
+
+    # Initial Supertrend after warmup
+    warmup_st = None
     if len(full_candles) >= ATR_PERIOD + 10:
-        full_st = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
-        warmup_st = full_st[-1] if full_st else None
-    else:
-        warmup_st = None
+        st_values = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
+        warmup_st = st_values[-1] if st_values else None
 
     closes = [c["close"] for c in full_candles]
-    st_text = f"{warmup_st:.2f}" if warmup_st is not None else "N/A"
+    ema5_val = ema(closes, EMA_FAST)
+    ema20_val = ema(closes, EMA_SLOW)
+
+    ema5_str = f"{ema5_val:.2f}" if ema5_val is not None else "N/A"
+    ema20_str = f"{ema20_val:.2f}" if ema20_val is not None else "N/A"
+    st_str = f"{warmup_st:.2f}" if warmup_st is not None else "N/A"
 
     send_telegram(
         f"WARMUP DONE | Candles={len(full_candles)} | "
-        f"EMA5={ema(closes,5):.2f} EMA20={ema(closes,20):.2f} "
-        f"ST={st_text} | "
-        f"BC={BC:.2f} TC={TC:.2f}"
+        f"EMA5={ema5_str} EMA20={ema20_str} "
+        f"ST={st_str} | BC={BC:.2f} TC={TC:.2f}"
     )
 
     first_trend = None
@@ -327,6 +328,9 @@ if __name__ == "__main__":
 
         bucket = ts.replace(minute=(ts.minute//15)*15, second=0, microsecond=0)
 
+        candle_closed = False
+        prev_candle = None
+
         # Update or append candle
         if full_candles and full_candles[-1]["time"] == bucket:
             c = full_candles[-1]
@@ -334,90 +338,85 @@ if __name__ == "__main__":
             c["low"] = min(c["low"], ltp)
             c["close"] = ltp
         else:
+            if full_candles:
+                prev_candle = full_candles[-1]
+                candle_closed = True
+
             new_candle = {"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
             full_candles.append(new_candle)
 
-            # Detect new trading day
             if current_day != bucket.date():
                 current_day = bucket.date()
                 day_start_time = bucket
                 send_telegram("🔄 New trading day detected - continuous ST continues")
 
-        # Recalculate Supertrend on full history (efficient enough for 15-min)
+        # Supertrend (continuous)
+        current_st = None
         if len(full_candles) >= ATR_PERIOD + 5:
-            full_st_values = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
-            current_st = full_st_values[-1] if full_st_values else None
+            st_values = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
+            current_st = st_values[-1] if st_values else None
 
-            # Set first_trend using continuous Supertrend (once per day)
+            # Set first trend once per day
             if first_trend is None and current_st is not None and day_start_time is not None:
-                # We can use the close of the first candle of today, or current
                 first_candle_idx = next((i for i, c in enumerate(full_candles) if c["time"] >= day_start_time), -1)
                 if first_candle_idx >= 0:
                     first_close = full_candles[first_candle_idx]["close"]
                     first_trend = "BULLISH" if first_close > current_st else "BEARISH"
                     send_telegram(
-                        f"📌 First trend set (continuous ST) @ {day_start_time.time()}: {first_trend} "
+                        f"📌 First trend set (continuous ST): {first_trend} "
                         f"(ST={current_st:.1f}, Close={first_close:.1f})"
                     )
 
-        if len(full_candles) < 30:
-            return
+        # Process only on candle close
+        if candle_closed and prev_candle is not None and ts.time() < ENTRY_CUTOFF:
+            closes = [c["close"] for c in full_candles]
+            ema5_val = ema(closes, EMA_FAST)
+            ema20_val = ema(closes, EMA_SLOW)
 
-        if ts.time() >= ENTRY_CUTOFF:
-            return
+            ema5_str = f"{ema5_val:.0f}" if ema5_val is not None else "N/A"
+            ema20_str = f"{ema20_val:.0f}" if ema20_val is not None else "N/A"
+            st_str = f"{current_st:.0f}" if current_st is not None else "N/A"
 
-        prev = full_candles[-2] if len(full_candles) >= 2 else full_candles[-1]
-        current = full_candles[-1]
+            send_telegram(
+                f"CANDLE {prev_candle['time'].time()} | "
+                f"O={prev_candle['open']:.0f} H={prev_candle['high']:.0f} "
+                f"L={prev_candle['low']:.0f} C={prev_candle['close']:.0f} | "
+                f"BC={BC:.0f} TC={TC:.0f} | "
+                f"EMA5={ema5_str} EMA20={ema20_str} ST={st_str} | "
+                f"FT={first_trend} SO={seen_opposite}"
+            )
 
-        closes = [c["close"] for c in full_candles]
-        ema5 = ema(closes, EMA_FAST)
-        ema20 = ema(closes, EMA_SLOW)
+            # Update seen_opposite
+            if first_trend is not None and current_st is not None:
+                is_green = prev_candle["close"] > prev_candle["open"]
+                is_red = prev_candle["close"] < prev_candle["open"]
+                if first_trend == "BULLISH" and is_red and prev_candle["close"] > current_st:
+                    seen_opposite = True
+                elif first_trend == "BEARISH" and is_green and prev_candle["close"] < current_st:
+                    seen_opposite = True
 
-        current_st = full_st_values[-2] if 'full_st_values' in locals() and full_st_values else None
+            # Triggers
+            if first_trend is not None and seen_opposite and current_st is not None:
+                is_green = prev_candle["close"] > prev_candle["open"]
+                is_red = prev_candle["close"] < prev_candle["open"]
 
-        if current_st is None:
-            return
+                if (first_trend == "BEARISH" and is_red and
+                    prev_candle["close"] < BC and
+                    prev_candle["close"] < current_st and
+                    (ema5_val is None or prev_candle["close"] < ema5_val) and
+                    (ema20_val is None or prev_candle["close"] < ema20_val)):
+                    send_telegram("🔥 BEARISH TRIGGER")
+                    tm.enter("BEARISH", ltp)
 
-        send_telegram(
-            f"CANDLE {prev['time'].time()} | "
-            f"O={prev['open']:.0f} H={prev['high']:.0f} L={prev['low']:.0f} C={prev['close']:.0f} | "
-            f"BC={BC:.0f} TC={TC:.0f} | "
-            f"EMA5={ema5:.0f} EMA20={ema20:.0f} ST={current_st:.0f} | "
-            f"FT={first_trend} SO={seen_opposite}"
-        )
+                elif (first_trend == "BULLISH" and is_green and
+                      prev_candle["close"] > TC and
+                      prev_candle["close"] > current_st and
+                      (ema5_val is None or prev_candle["close"] > ema5_val) and
+                      (ema20_val is None or prev_candle["close"] > ema20_val)):
+                    send_telegram("🚀 BULLISH TRIGGER")
+                    tm.enter("BULLISH", ltp)
 
-        # Update seen_opposite
-        if first_trend is not None:
-            is_green = current["close"] > current["open"]
-            is_red = current["close"] < current["open"]
-            if first_trend == "BULLISH" and is_red and current["close"] > current_st:
-                seen_opposite = True
-            elif first_trend == "BEARISH" and is_green and current["close"] < current_st:
-                seen_opposite = True
-
-        # ---- TRIGGERS ----
-        if first_trend is None or not seen_opposite:
-            return
-
-        is_green = current["close"] > current["open"]
-        is_red = current["close"] < current["open"]
-
-        # Bearish trigger
-        if (first_trend == "BEARISH" and is_red and
-            current["close"] < BC and
-            current["close"] < current_st and
-            current["close"] < ema5 and current["close"] < ema20):
-            send_telegram("🔥 BEARISH TRIGGER")
-            tm.enter("BEARISH", ltp)
-
-        # Bullish trigger
-        elif (first_trend == "BULLISH" and is_green and
-              current["close"] > TC and
-              current["close"] > current_st and
-              current["close"] > ema5 and current["close"] > ema20):
-            send_telegram("🚀 BULLISH TRIGGER")
-            tm.enter("BULLISH", ltp)
-
+    # ================= WEBSOCKET =================
     ws = data_ws.FyersDataSocket(
         access_token=fyers.auth,
         on_connect=lambda: ws.subscribe(symbols=[INDEX_SYMBOL], data_type="SymbolUpdate"),
