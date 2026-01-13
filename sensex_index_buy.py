@@ -342,7 +342,7 @@ if __name__ == "__main__":
                 p, c = candles[-2], candles[-1]
 
                 if p["time"].date() == c["time"].date():
-                    closes = [x["close"] for x in candles[:-1]]
+                    closes = [x["close"] for x in list(candles)[:-1]]
                     ema5 = ema(closes, EMA_FAST)
                     ema20 = ema(closes, EMA_SLOW)
 
