@@ -148,7 +148,7 @@ def prefill_intraday_candles(fyers, candles, days=5):
 
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 1, 26),
-    datetime.date(2026, 3, 3),
+    datetime.date(2026, 1, 15),
 }
 
 def is_last_thursday(d):
