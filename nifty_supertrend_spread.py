@@ -221,18 +221,18 @@ class TradeManager:
             if hedge_resp is None:
                 send_telegram("⚠️ ENTRY ABORTED: Hedge buy failed")
                 return
-            main_resp = self.fyers.sell(atm_ce, QTY, "SELL_CE")
+            main_resp = self.fyers.sell(atm_ce, QTY, "SELLCE")
             if main_resp is None:
-                send_telegram("⚠️ PARTIAL ENTRY: Hedge bought but SELL_CE failed!")
+                send_telegram("⚠️ PARTIAL ENTRY: Hedge bought but SELLCE failed!")
             self.pos = {"main": atm_ce, "hedge": hedge_ce, "entry": ltp, "bias": "BEARISH"}
         else:
             hedge_resp = self.fyers.buy(hedge_pe, QTY, "HEDGE")
             if hedge_resp is None:
                 send_telegram("⚠️ ENTRY ABORTED: Hedge buy failed")
                 return
-            main_resp = self.fyers.sell(atm_pe, QTY, "SELL_PE")
+            main_resp = self.fyers.sell(atm_pe, QTY, "SELLPE")
             if main_resp is None:
-                send_telegram("⚠️ PARTIAL ENTRY: Hedge bought but SELL_PE failed!")
+                send_telegram("⚠️ PARTIAL ENTRY: Hedge bought but SELLPE failed!")
             self.pos = {"main": atm_pe, "hedge": hedge_pe, "entry": ltp, "bias": "BULLISH"}
         self.trade_day = datetime.date.today()
         send_telegram(f"🚀 ENTRY {bias} @ {ltp}")
@@ -259,8 +259,8 @@ class TradeManager:
     def exit(self, reason, ltp):
         if not self.pos:
             return
-        main_resp = self.fyers.buy(self.pos["main"], QTY, f"EXIT_{reason}_MAIN")
-        hedge_resp = self.fyers.sell(self.pos["hedge"], QTY, f"EXIT_{reason}_HEDGE")
+        main_resp = self.fyers.buy(self.pos["main"], QTY, f"EXIT{reason}MAIN")
+        hedge_resp = self.fyers.sell(self.pos["hedge"], QTY, f"EXIT{reason}HEDGE")
         send_telegram(f"🏁 EXIT {reason} @ {ltp}")
         if main_resp is None or hedge_resp is None:
             send_telegram(f"⚠️ EXIT WARNING: Some orders may have failed! Reason: {reason}")
