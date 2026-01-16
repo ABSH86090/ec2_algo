@@ -195,8 +195,8 @@ def get_itm_symbols(fyers):
     expiry = get_next_expiry()
     exp_token = format_expiry(expiry)
 
-    ce_strike = atm - 500
-    pe_strike = atm + 500
+    ce_strike = atm - 100
+    pe_strike = atm + 100
 
     ce = f"BSE:SENSEX{exp_token}{ce_strike}CE"
     pe = f"BSE:SENSEX{exp_token}{pe_strike}PE"
