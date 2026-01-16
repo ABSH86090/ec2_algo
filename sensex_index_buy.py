@@ -253,10 +253,14 @@ class TradeManager:
         self.pos = None
         self.trade_day = None
 
-    def enter(self, symbol, index_price):
+    def enter(self, direction, index_price):
         today = datetime.date.today()
         if self.trade_day == today:
             return
+        
+        ce, pe = get_itm_symbols(self.fyers)
+        symbol = ce if direction == "CALL" else pe
+        
         self.trade_day = today
 
         self.fyers.buy_mkt(symbol, TOTAL_QTY, "ENTRY")
@@ -361,7 +365,7 @@ if __name__ == "__main__":
             })
 
             if pending_signal and bucket > signal_candle_time:
-                tm.enter(ce if pending_signal == "CALL" else pe, index_ltp)
+                tm.enter(pending_signal, index_ltp)
                 pending_signal = None
                 signal_candle_time = None
 
