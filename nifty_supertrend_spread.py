@@ -32,7 +32,7 @@ INDEX_SL = 30
 INDEX_TARGET = 140
 
 ENTRY_CUTOFF = datetime.time(14, 0)
-HARD_EXIT_TIME = datetime.time(14, 45)
+HARD_EXIT_TIME = datetime.time(14, 59)
 
 # ================= LOGGING =================
 logging.basicConfig(
