@@ -303,7 +303,6 @@ if __name__ == "__main__":
     send_telegram("🚀 STRATEGY STARTED")
 
     fyers = Fyers()
-    ce, pe = get_itm_symbols(fyers)
 
     hist = fyers.client.history({
         "symbol": INDEX_SYMBOL,
