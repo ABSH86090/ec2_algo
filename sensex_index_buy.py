@@ -94,6 +94,22 @@ class Fyers:
             "orderTag": tag
         })
 
+    def place_sl_sell(self, symbol, qty, trigger_price, tag):
+        return self.client.place_order({
+            "symbol": symbol,
+            "qty": qty,
+            "type": 4,                  # SL-M
+            "side": -1,                 # SELL
+            "productType": "INTRADAY",
+            "validity": "DAY",
+            "stopPrice": trigger_price,
+            "orderTag": tag
+        })
+
+    def cancel_order(self, order_id):
+        return self.client.cancel_order({"id": order_id})
+
+
 # ================= EMA =================
 def ema(values, period):
     if len(values) < period:
@@ -257,16 +273,44 @@ class TradeManager:
         today = datetime.date.today()
         if self.trade_day == today:
             return
-        
+
         ce, pe = get_itm_symbols(self.fyers)
         symbol = ce if direction == "CALL" else pe
-        
+
         self.trade_day = today
 
+        # 1. MARKET ENTRY
         self.fyers.buy_mkt(symbol, TOTAL_QTY, "ENTRY")
-        self.pos = {"symbol": symbol, "entry": index_price}
 
-        send_telegram(f"🚀 ENTRY\n{symbol}\nIndex={index_price}")
+        # Fetch option LTP after entry
+        q = self.fyers.client.quotes({"symbols": symbol})
+        option_ltp = float(q["d"][0]["v"]["lp"])
+
+        # 2. PLACE OPTION SL (Entry Premium - 50)
+        sl_price = round(option_ltp - 50, 1)
+
+        sl_resp = self.fyers.place_sl_sell(
+            symbol,
+            TOTAL_QTY,
+            sl_price,
+            "OPT_SL"
+        )
+
+        sl_order_id = sl_resp.get("id")
+
+        self.pos = {
+            "symbol": symbol,
+            "entry": index_price,
+            "sl_order_id": sl_order_id
+        }
+
+        send_telegram(
+            f"ENTRY\n"
+            f"Symbol {symbol}\n"
+            f"Index {index_price}\n"
+            f"Option Entry {option_ltp}\n"
+            f"Option SL {sl_price}"
+        )
 
     def on_tick(self, index_ltp, now):
         if not self.pos:
@@ -279,7 +323,6 @@ class TradeManager:
         entry = self.pos["entry"]
         symbol = self.pos["symbol"]
 
-        # Determine direction from symbol (CE = bullish, PE = bearish)
         is_call = "CE" in symbol
 
         if is_call:
@@ -287,16 +330,41 @@ class TradeManager:
                 self.exit("TARGET")
             elif index_ltp <= entry - INDEX_SL:
                 self.exit("SL")
-        else:  # Bearish (PUT) - SL on upside, Target on downside
+        else:
             if index_ltp <= entry - INDEX_TARGET:
                 self.exit("TARGET")
             elif index_ltp >= entry + INDEX_SL:
                 self.exit("SL")
 
     def exit(self, reason):
-        self.fyers.sell_mkt(self.pos["symbol"], TOTAL_QTY, reason)
-        send_telegram(f"🏁 EXIT [{reason}]")
+        # 1. CANCEL OPTION SL FIRST
+        sl_id = self.pos.get("sl_order_id")
+        if sl_id:
+            try:
+                self.fyers.cancel_order(sl_id)
+                logger.info(f"SL order cancelled {sl_id}")
+            except Exception as e:
+                logger.warning(f"SL cancel failed {e}")
+
+        # 2. MAP CLEAN ORDER TAG
+        tag_map = {
+            "TARGET": "TARGET",
+            "SL": "SL",
+            "TIME EXIT": "TIME_EXIT"
+        }
+
+        order_tag = tag_map.get(reason, "EXIT")
+
+        # 3. MARKET EXIT
+        self.fyers.sell_mkt(
+            self.pos["symbol"],
+            TOTAL_QTY,
+            order_tag
+        )
+
+        send_telegram(f"EXIT {reason}")
         self.pos = None
+
 
 # ================= MAIN =================
 if __name__ == "__main__":
