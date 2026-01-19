@@ -191,11 +191,13 @@ def get_nifty_option_symbols(fyers):
         f"NSE:NIFTY{exp}{atm - 200}PE",
     )
 
+def is_today_nifty_expiry():
+    return datetime.date.today() == get_next_tuesday_expiry()
+
 LOTS = 2 if datetime.date.today() == get_next_tuesday_expiry() else 3
 QTY = LOT_SIZE * LOTS
 send_telegram(
     f"📦 LOT CONFIG | "
-    f"{'EXPIRY DAY' if is_today_nifty_expiry() else 'NORMAL DAY'} | "
     f"LOTS={LOTS} QTY={QTY}"
 )
 
