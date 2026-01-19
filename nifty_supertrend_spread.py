@@ -25,8 +25,8 @@ EMA_SLOW = 20
 ATR_PERIOD = 10
 MULTIPLIER = 3.5
 LOT_SIZE = 65
-LOTS = 1
-QTY = LOT_SIZE * LOTS
+
+# Decide lots once at startup
 
 INDEX_SL = 30
 INDEX_TARGET = 140
@@ -190,6 +190,14 @@ def get_nifty_option_symbols(fyers):
         f"NSE:NIFTY{exp}{atm + 200}CE",
         f"NSE:NIFTY{exp}{atm - 200}PE",
     )
+
+LOTS = 2 if datetime.date.today() == get_next_tuesday_expiry() else 3
+QTY = LOT_SIZE * LOTS
+send_telegram(
+    f"📦 LOT CONFIG | "
+    f"{'EXPIRY DAY' if is_today_nifty_expiry() else 'NORMAL DAY'} | "
+    f"LOTS={LOTS} QTY={QTY}"
+)
 
 # ================= WARMUP =================
 def prefill_intraday_candles(fyers, candles, days=5):
