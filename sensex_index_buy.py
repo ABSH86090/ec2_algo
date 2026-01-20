@@ -132,6 +132,53 @@ def compute_cpr(prev):
     s1 = 2 * p - h
     return {"BC": min(bc, tc), "TC": max(bc, tc), "R1": r1, "S1": s1}
 
+def get_resampled_cpr(fyers):
+    today = datetime.date.today()
+    start = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    end = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    resp = fyers.client.history({
+        "symbol": INDEX_SYMBOL,
+        "resolution": "15",
+        "date_format": "1",
+        "range_from": start,
+        "range_to": end,
+        "cont_flag": "1"
+    })
+
+    if not resp.get("candles"):
+        raise Exception("No intraday candles for CPR")
+
+    df = pd.DataFrame(
+        resp["candles"],
+        columns=["ts", "open", "high", "low", "close", "volume"]
+    )
+
+    df["time"] = (
+        pd.to_datetime(df["ts"], unit="s", utc=True)
+          .dt.tz_convert("Asia/Kolkata")
+          .dt.tz_localize(None)
+    )
+
+    df.set_index("time", inplace=True)
+    df = df.between_time("09:15", "15:30")
+
+    # Last completed trading day
+    daily = df.resample("1D").agg({
+        "high": "max",
+        "low": "min",
+        "close": "last"
+    }).dropna()
+
+    prev_day = daily.iloc[-1]
+
+    return compute_cpr({
+        "high": prev_day["high"],
+        "low": prev_day["low"],
+        "close": prev_day["close"]
+    })
+
+
 # ================= EMA WARMUP =================
 def prefill_intraday_candles(fyers, candles, days=5):
     start = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
@@ -385,7 +432,15 @@ if __name__ == "__main__":
     })
 
     last = hist["candles"][-1]
-    cpr = compute_cpr({"high": last[2], "low": last[3], "close": last[4]})
+    cpr = get_resampled_cpr(fyers)
+
+    send_telegram(
+        f"CPR (Intraday Derived)\n"
+        f"BC={round(cpr['BC'],2)}\n"
+        f"TC={round(cpr['TC'],2)}\n"
+        f"S1={round(cpr['S1'],2)}\n"
+        f"R1={round(cpr['R1'],2)}"
+    )
 
     engine = ScenarioEngine(cpr)
     tm = TradeManager(fyers)
