@@ -94,15 +94,16 @@ class Fyers:
             "orderTag": tag
         })
 
-    def place_sl_sell(self, symbol, qty, trigger_price, tag):
+    def place_sl_sell(self, symbol, qty, trigger_price, limit, tag):
         return self.client.place_order({
             "symbol": symbol,
             "qty": qty,
-            "type": 4,                  # SL-M
+            "type": 3,                  # SL-L
             "side": -1,                 # SELL
             "productType": "INTRADAY",
             "validity": "DAY",
             "stopPrice": trigger_price,
+            "limitPrice": limit,
             "orderTag": tag
         })
 
@@ -288,12 +289,14 @@ class TradeManager:
 
         # 2. PLACE OPTION SL (Entry Premium - 50)
         sl_price = round(option_ltp - 50, 1)
+        sl_limit   = sl_price - 1
 
         sl_resp = self.fyers.place_sl_sell(
             symbol,
             TOTAL_QTY,
             sl_price,
-            "OPT_SL"
+            sl_limit,
+            "OPTSL"
         )
 
         sl_order_id = sl_resp.get("id")
@@ -350,7 +353,7 @@ class TradeManager:
         tag_map = {
             "TARGET": "TARGET",
             "SL": "SL",
-            "TIME EXIT": "TIME_EXIT"
+            "TIME EXIT": "TIMEEXIT"
         }
 
         order_tag = tag_map.get(reason, "EXIT")
