@@ -8,6 +8,7 @@ import os
 import sys
 import logging
 import requests
+import pandas as pd
 from collections import deque
 from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
