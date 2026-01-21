@@ -380,8 +380,9 @@ if __name__ == "__main__":
         # Process only on candle close
         if candle_closed and prev_candle is not None and ts.time() <= ENTRY_CUTOFF:
             closes = [c["close"] for c in full_candles]
-            ema5_val = ema(closes, EMA_FAST)
-            ema20_val = ema(closes, EMA_SLOW)
+            closed_closes = [c["close"] for c in full_candles[:-1]]
+            ema5_val = ema(closed_closes, EMA_FAST)
+            ema20_val = ema(closed_closes, EMA_SLOW)
 
             ema5_str = f"{ema5_val:.0f}" if ema5_val is not None else "N/A"
             ema20_str = f"{ema20_val:.0f}" if ema20_val is not None else "N/A"
