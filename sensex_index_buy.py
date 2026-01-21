@@ -99,7 +99,7 @@ class Fyers:
         return self.client.place_order({
             "symbol": symbol,
             "qty": qty,
-            "type": 3,                  # SL-L
+            "type": 4,                  # SL-L
             "side": -1,                 # SELL
             "productType": "INTRADAY",
             "validity": "DAY",
