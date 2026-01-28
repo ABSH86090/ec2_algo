@@ -271,8 +271,8 @@ def get_sensex_option_symbols(fyers):
     atm_ce = f"BSE:SENSEX{exp_token}{atm}CE"
     atm_pe = f"BSE:SENSEX{exp_token}{atm}PE"
 
-    hedge_ce = f"BSE:SENSEX{exp_token}{atm + 500}CE"
-    hedge_pe = f"BSE:SENSEX{exp_token}{atm - 500}PE"
+    hedge_ce = f"BSE:SENSEX{exp_token}{atm + 1000}CE"
+    hedge_pe = f"BSE:SENSEX{exp_token}{atm - 1000}PE"
 
     msg = (
         f"📌 SENSEX OPTION SELECTION\n"
