@@ -151,7 +151,7 @@ def get_atm_and_hedge(fyers, direction):
         hedge = f"BSE:SENSEX{exp_str}{atm - 400}PE"
     else:  # PUT - Bearish - short ATM CE + hedge higher CE
         sold = f"BSE:SENSEX{exp_str}{atm}CE"
-        hedge = f"BSE:SENSEX{exp_str}{atm + 400}CE"
+        hedge = f"BSE:SENSEX{exp_str}{atm + 500}CE"
 
     msg = f"OPTIONS ({direction})\nLTP: {ltp:.0f} | ATM: {atm}\nExpiry: {exp} ({exp_str})\nSell: {sold}\nHedge: {hedge}"
     logger.info(msg)
