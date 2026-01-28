@@ -1,5 +1,5 @@
 # =========================================================
-# SENSEX CPR + EMA → ITM OPTIONS BUYING (INDEX SL / TARGET)
+# SENSEX CPR + EMA → SELL ATM + BUY HEDGE (INDEX SL / TARGET)
 # LIVE = BACKTEST ALIGNED (FIXED)
 # =========================================================
 
@@ -31,6 +31,7 @@ EMA_SLOW = 20
 LOT_SIZE = 20
 LOTS = 5
 TOTAL_QTY = LOT_SIZE * LOTS
+QTY = TOTAL_QTY
 
 INDEX_TARGET = 340
 INDEX_SL = 75
