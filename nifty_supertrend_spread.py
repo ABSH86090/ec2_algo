@@ -85,14 +85,14 @@ class Fyers:
     def buy(self, symbol, qty, tag):
         order_data = {
             "symbol": symbol, "qty": qty, "type": 2, "side": 1,
-            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag, "IsSliceOrder": true
+            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag, "IsSliceOrder": True
         }
         return self.safe_place_order(order_data, f"BUY {tag} {symbol}")
 
     def sell(self, symbol, qty, tag):
         order_data = {
             "symbol": symbol, "qty": qty, "type": 2, "side": -1,
-            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag, "IsSliceOrder": true
+            "productType": "INTRADAY", "validity": "DAY", "orderTag": tag, "IsSliceOrder": True
         }
         return self.safe_place_order(order_data, f"SELL {tag} {symbol}")
 
