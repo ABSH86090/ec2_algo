@@ -311,6 +311,14 @@ class ScenarioEngine:
             and ema5 < ema20
         ):
             return "PUT"
+        
+        if (
+            c["high"] >= self.cpr["TC"]
+            and c["close"] < self.cpr["TC"]
+            and c["close"] < self.cpr["open"]
+            and ema5 < ema20
+        ):
+            return "PUT"
 
         if (
             p["close"] < self.cpr["R1"]
