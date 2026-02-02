@@ -301,6 +301,8 @@ class ScenarioEngine:
             p["close"] > self.cpr["BC"]
             and c["close"] < self.cpr["BC"]
             and c["close"] > self.cpr["S1"]
+            and (self.cpr["BC"] - c["close"]) >= 10
+            and (self.cpr["BC"] - c["close"]) <= 50
             and ema5 < ema20
         ):
             return "PUT"
@@ -322,7 +324,9 @@ class ScenarioEngine:
 
         if (
             p["close"] < self.cpr["R1"]
-            and c["close"] > self.cpr["R1"]
+            and p["close"] > self.cpr["TC"]
+            and (c["close"] - self.cpr["R1"]) >= 30
+            and (c["close"] - self.cpr["R1"]) <= 70
             and ema5 > ema20
         ):
             return "CALL"
