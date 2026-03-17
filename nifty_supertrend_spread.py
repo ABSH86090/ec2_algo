@@ -28,8 +28,8 @@ LOT_SIZE = 65
 
 # Decide lots once at startup
 
-INDEX_SL = 45
-INDEX_TARGET = 160
+INDEX_SL = 60
+INDEX_TARGET = 200
 
 ENTRY_CUTOFF = datetime.time(14, 0)
 HARD_EXIT_TIME = datetime.time(14, 59)
@@ -194,7 +194,7 @@ def get_nifty_option_symbols(fyers):
 def is_today_nifty_expiry():
     return datetime.date.today() == get_next_tuesday_expiry()
 
-LOTS = 16 if datetime.date.today() == get_next_tuesday_expiry() else 24
+LOTS = 12 if datetime.date.today() == get_next_tuesday_expiry() else 18
 QTY = LOT_SIZE * LOTS
 send_telegram(
     f"📦 LOT CONFIG | "
