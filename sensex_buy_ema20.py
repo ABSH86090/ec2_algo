@@ -448,7 +448,7 @@ class NiftyBuyStrategy:
             logger.info(f"Daily trade tracking reset for new day: {today}")
 
     # --- history prefill ---
-    def prefill_history(self, symbols, days_back=1):
+    def prefill_history(self, symbols, days_back=3):
         for symbol in symbols:
             try:
                 to_date = datetime.datetime.now().strftime("%Y-%m-%d")
