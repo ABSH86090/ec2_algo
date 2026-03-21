@@ -994,7 +994,8 @@ class NiftyBuyStrategy:
                     except Exception as e:
                         logger.debug(f"trade cooldown check failed: {e}")
 
-                    sl_price = round_to_tick(candle["low"] - 5.0)
+                    low1_idx, low2_idx = st["w_span"]
+                    sl_price = round_to_tick(candles[low2_idx]["low"] - 5.0)
                     risk_points = round(entry - sl_price, 2)
 
                     if risk_points <= 0:
