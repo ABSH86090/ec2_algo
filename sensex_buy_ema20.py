@@ -650,6 +650,10 @@ class NiftyBuyStrategy:
                         break
                 if not ok:
                     continue
+                if ema20_arr[i1] is None or lows[i1] >= ema20_arr[i1]:
+                    continue
+                if ema20_arr[i2] is None or lows[i2] >= ema20_arr[i2]:
+                    continue
 
                 # CHANGE 4: Find the highest candle (by high) between i1 and i2 (inclusive).
                 # That peak's high must touch (>=) EMA20 at that candle's index.
