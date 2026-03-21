@@ -659,7 +659,7 @@ class NiftyBuyStrategy:
                 # That peak's high must touch (>=) EMA20 at that candle's index.
                 peak_idx = i1
                 for k in range(i1, i2 + 1):
-                    if candles[k]["high"] > candles[peak_idx]["high"]:
+                    if candles_day[k]["close"] > candles_day[peak_idx]["close"]:
                         peak_idx = k
 
                 peak_high = candles[peak_idx]["high"]
