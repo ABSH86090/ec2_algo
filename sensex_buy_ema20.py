@@ -25,8 +25,8 @@ TRADING_END = datetime.time(15, 0)
 
 # --- W-pattern config ---
 PIVOT_K = 2
-# CHANGE 1: Minimum 10 candles between two lows (was 5)
-MIN_BARS_BETWEEN_LOWS = 10
+# CHANGE 1: Minimum 8 candles between two lows (was 5)
+MIN_BARS_BETWEEN_LOWS = 8
 # CHANGE 3: Only EMA20 (removed VWMA20, replaced EMA5 with EMA20)
 EMA_PERIOD = 20
 
@@ -35,7 +35,7 @@ CANDLE_RESOLUTION_MINUTES = 5
 
 # ADX filter
 ADX_PERIOD = 14
-ADX_MIN = 15  # only take trade if ADX > 15
+ADX_MIN = 10  # only take trade if ADX > 15
 
 # Exit throttle (milliseconds) to avoid spamming cancel/market orders on rapid ticks
 EXIT_THROTTLE_MS = int(os.getenv("EXIT_THROTTLE_MS", "500"))
@@ -638,8 +638,8 @@ class NiftyBuyStrategy:
                 if not self.is_pivot_low(lows, i1, PIVOT_K):
                     continue
                 # second low should not be lower than first low
-                if lows[i2] + 1e-9 < lows[i1]:
-                    continue
+                # if lows[i2] + 1e-9 < lows[i1]:
+                #     continue
 
                 # CHANGE 3: Between i1..i2, EMA20 values must exist;
                 # no longer check EMA < VWMA; instead check EMA20 exists and lows are below it.
@@ -662,13 +662,13 @@ class NiftyBuyStrategy:
                 peak_close = candles[peak_idx]["close"]
                 ema20_at_peak = ema20_arr[peak_idx]
 
-                if ema20_at_peak is None or peak_high < ema20_at_peak:
-                    # Peak high doesn't touch EMA20 -> not a valid W
-                    logger.debug(
-                        f"W candidate rejected: peak_high={peak_high} < EMA20={ema20_at_peak} "
-                        f"at peak_idx={peak_idx} (i1={i1}, i2={i2})"
-                    )
-                    continue
+                # if ema20_at_peak is None or peak_high < ema20_at_peak:
+                #     # Peak high doesn't touch EMA20 -> not a valid W
+                #     logger.debug(
+                #         f"W candidate rejected: peak_high={peak_high} < EMA20={ema20_at_peak} "
+                #         f"at peak_idx={peak_idx} (i1={i1}, i2={i2})"
+                #     )
+                #     continue
 
                 # Valid W found: return span and peak close for breakout comparison
                 return (i1, i2, peak_close)
