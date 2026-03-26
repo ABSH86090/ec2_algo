@@ -159,8 +159,22 @@ SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 3, 31)
 }
 
-def is_last_tuesday(d):
-    return d.weekday() == 1 and (d + datetime.timedelta(days=7)).month != d.month
+def is_last_tuesday(d, holidays=SPECIAL_MARKET_HOLIDAYS):
+    # Check if 'd' is the last Tuesday of the month
+    is_tuesday = d.weekday() == 1
+    is_last_week = (d + datetime.timedelta(days=7)).month != d.month
+
+    if is_tuesday and is_last_week:
+        return not (d in holidays)  # Return False if Tuesday itself is a holiday
+
+    # If 'd' is Monday, check if tomorrow (Tuesday) is a holiday and would've been last Tuesday
+    if d.weekday() == 0:
+        next_day = d + datetime.timedelta(days=1)
+        is_last_week_tuesday = (next_day + datetime.timedelta(days=7)).month != next_day.month
+        if next_day in holidays and is_last_week_tuesday:
+            return True
+
+    return False
 
 def get_next_tuesday_expiry():
     today = datetime.date.today()
