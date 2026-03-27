@@ -164,7 +164,7 @@ def format_expiry_for_symbol(expiry_date: datetime.date) -> str:
     elif m == 12:
         m_token = "D"
     else:
-        m_token = f"{m:02d}"
+        m_token = str(m)
     return f"{yy}{m_token}{d:02d}"
 
 def get_atm_symbols(fyers_client):
