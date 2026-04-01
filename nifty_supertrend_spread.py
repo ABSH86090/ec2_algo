@@ -305,6 +305,7 @@ if __name__ == "__main__":
         "range_to": (datetime.date.today()-datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
         "cont_flag": "1"
     })
+    print(hist)
     last = hist["candles"][-1]
     BC, TC = compute_cpr({"high": last[2], "low": last[3], "close": last[4]})
 
