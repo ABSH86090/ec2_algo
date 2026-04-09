@@ -1166,12 +1166,12 @@ class NiftyBuyStrategy:
             # --- Robust trailing SL ---
             if pos.get("entry") is not None and ltp > pos["entry"]:
                 move_up = pos["max_ltp"] - pos["entry"]
-                trail_step = int(move_up // 10)
+                trail_step = int(move_up // 20)
 
                 if trail_step <= pos.get("last_trail_step", -1):
                     pass
                 else:
-                    desired_sl = round_to_tick(orig_sl + trail_step * 10)
+                    desired_sl = round_to_tick(orig_sl + trail_step * 20)
 
                     max_allowed_sl = round_to_tick(ltp - MIN_SL_BUFFER)
                     if desired_sl >= max_allowed_sl:
