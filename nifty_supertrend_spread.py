@@ -156,7 +156,15 @@ SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 1, 26),
     datetime.date(2026, 3, 3),
     datetime.date(2026, 3, 26),
-    datetime.date(2026, 3, 31)
+    datetime.date(2026, 3, 31),
+    datetime.date(2026, 4, 14),
+    datetime.date(2026, 5, 1),
+    datetime.date(2026, 5, 28),
+    datetime.date(2026, 6, 26),
+    datetime.date(2026, 9, 14),
+    datetime.date(2026, 10, 2),
+    datetime.date(2026, 11, 24),
+    datetime.date(2026, 12, 25)
 }
 
 def is_last_tuesday(d, holidays=SPECIAL_MARKET_HOLIDAYS):
@@ -208,7 +216,7 @@ def get_nifty_option_symbols(fyers):
 def is_today_nifty_expiry():
     return datetime.date.today() == get_next_tuesday_expiry()
 
-LOTS = 5 if datetime.date.today() == get_next_tuesday_expiry() else 10
+LOTS = 10 if datetime.date.today() == get_next_tuesday_expiry() else 20
 QTY = LOT_SIZE * LOTS
 send_telegram(
     f"📦 LOT CONFIG | "
