@@ -20,7 +20,7 @@ LOT_SIZE = int(os.getenv("LOT_SIZE", "20"))  # tweak via env or edit constant
 TICK_SIZE = 0.05  # NSE options tick size
 
 # CHANGE 5: Trading starts at 10:30 AM
-TRADING_START = datetime.time(10, 30)
+TRADING_START = datetime.time(10, 00)
 TRADING_END = datetime.time(15, 0)
 
 # --- W-pattern config ---
