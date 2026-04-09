@@ -1171,7 +1171,7 @@ class NiftyBuyStrategy:
                 if trail_step <= pos.get("last_trail_step", -1):
                     pass
                 else:
-                    desired_sl = round_to_tick(orig_sl + trail_step * 5)
+                    desired_sl = round_to_tick(orig_sl + trail_step * 10)
 
                     max_allowed_sl = round_to_tick(ltp - MIN_SL_BUFFER)
                     if desired_sl >= max_allowed_sl:
