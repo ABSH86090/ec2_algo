@@ -770,9 +770,9 @@ class NiftyBuyStrategy:
             atm = int(round(ltp / 100.0) * 100)
 
             if opt_type == "CE":
-                new_strike = int(atm - 200)
+                new_strike = int(atm + 100)
             else:
-                new_strike = int(atm + 200)
+                new_strike = int(atm - 100)
 
             new_symbol = f"{prefix}{expiry_token}{new_strike}{opt_type}"
             logger.info(f"Adjusted symbol from {symbol} -> {new_symbol} (atm={atm})")
