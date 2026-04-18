@@ -20,7 +20,7 @@ ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE = 150
+LOT_SIZE = 130
 HEDGE_OFFSET = 1000          # Points away from ATM for hedges
 
 ATM_DECISION_TIME = datetime.time(9, 20)
@@ -34,7 +34,7 @@ EMA_GAP_MIN = 5              # Minimum gap between EMA20 and EMA5 (not used for 
 
 MIN_BARS_FOR_EMA = 25
 HIST_PREFILL_BARS = 80
-MAX_SL_POINTS = 200
+MAX_SL_POINTS = 50
 
 LOG_FILE = "nifty_strangle_revised.log"
 
@@ -96,9 +96,9 @@ def get_nifty_strangle_symbols(fyers, spot=None):
 
     atm = round(spot / 50) * 50
 
-    # Main strangle strikes (sell)
-    ce_strike = atm + 100
-    pe_strike = atm - 100
+    # Main straddle strikes (sell)
+    ce_strike = atm
+    pe_strike = atm
 
     # Hedge strikes (buy) — 1000 points away from ATM
     ce_hedge_strike = atm + 1000
