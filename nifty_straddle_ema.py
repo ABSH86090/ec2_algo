@@ -68,21 +68,58 @@ def send_telegram(msg):
 # =========================================================
 # SYMBOL UTILS
 # =========================================================
-def is_last_tuesday(d):
-    return d.weekday() == 1 and (d + datetime.timedelta(days=7)).month != d.month
+
+SPECIAL_MARKET_HOLIDAYS = {
+    datetime.date(2026, 1, 26),
+    datetime.date(2026, 3, 3),
+    datetime.date(2026, 3, 26),
+    datetime.date(2026, 3, 31),
+    datetime.date(2026, 4, 14),
+    datetime.date(2026, 5, 1),
+    datetime.date(2026, 5, 28),
+    datetime.date(2026, 6, 26),
+    datetime.date(2026, 9, 14),
+    datetime.date(2026, 10, 2),
+    datetime.date(2026, 11, 24),
+    datetime.date(2026, 12, 25)
+}
+
+def is_last_tuesday(d, holidays=SPECIAL_MARKET_HOLIDAYS):
+    # Check if 'd' is the last Tuesday of the month
+    is_tuesday = d.weekday() == 1
+    is_last_week = (d + datetime.timedelta(days=7)).month != d.month
+
+    if is_tuesday and is_last_week:
+        return not (d in holidays)  # Return False if Tuesday itself is a holiday
+
+    # If 'd' is Monday, check if tomorrow (Tuesday) is a holiday and would've been last Tuesday
+    if d.weekday() == 0:
+        next_day = d + datetime.timedelta(days=1)
+        is_last_week_tuesday = (next_day + datetime.timedelta(days=7)).month != next_day.month
+        if next_day in holidays and is_last_week_tuesday:
+            return True
+
+    return False
 
 
 def get_next_expiry():
     today = datetime.date.today()
-    return today if today.weekday() == 1 else today + datetime.timedelta(days=(1 - today.weekday()) % 7)
+    days = (1 - today.weekday()) % 7
+    expiry = today + datetime.timedelta(days=days)
+    if today.weekday() == 1 and datetime.datetime.now().time() >= datetime.time(15, 30):
+        expiry += datetime.timedelta(days=7)
+    if expiry in SPECIAL_MARKET_HOLIDAYS:
+        expiry -= datetime.timedelta(days=1)
+    return expiry
 
 
-def format_expiry(d):
-    yy = d.strftime("%y")
-    if is_last_tuesday(d):
-        return f"{yy}{d.strftime('%b').upper()}"
-    m = {10: "O", 11: "N", 12: "D"}.get(d.month, f"{d.month:02d}")
-    return f"{yy}{m}{d.day:02d}"
+def format_expiry(expiry):
+    yy = expiry.strftime("%y")
+    if is_last_tuesday(expiry):
+        return f"{yy}{expiry.strftime('%b').upper()}"
+    m, d = expiry.month, expiry.day
+    m_token = {10: "O", 11: "N", 12: "D"}.get(m, str(m))
+    return f"{yy}{m_token}{d:02d}"
 
 
 def get_nifty_strangle_symbols(fyers, spot=None):
