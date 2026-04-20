@@ -330,10 +330,10 @@ class StrategyEngine:
 
         # ---- ORDER SEQUENCE: Hedges first, then sell main ----
         logger.info("[ORDER] Buying CE hedge")
-        self.fyers.buy_market(self.ce_hedge, "CE_HEDGE_BUY")
+        self.fyers.buy_market(self.ce_hedge, "CEHEDGEBUY")
 
         logger.info("[ORDER] Buying PE hedge")
-        self.fyers.buy_market(self.pe_hedge, "PE_HEDGE_BUY")
+        self.fyers.buy_market(self.pe_hedge, "PEHEDGEBUY")
 
         logger.info("[ORDER] Selling CE main")
         self.fyers.sell_market(self.ce, "STRANGLECE")
@@ -359,10 +359,10 @@ class StrategyEngine:
         self.fyers.buy_market(self.pe, "EXITPE")
 
         logger.info("[ORDER] Selling CE hedge (exit)")
-        self.fyers.sell_market(self.ce_hedge, "CE_HEDGE_SELL")
+        self.fyers.sell_market(self.ce_hedge, "CEHEDGESELL")
 
         logger.info("[ORDER] Selling PE hedge (exit)")
-        self.fyers.sell_market(self.pe_hedge, "PE_HEDGE_SELL")
+        self.fyers.sell_market(self.pe_hedge, "PEHEDGESELL")
 
         self.disabled_for_day = True
         self.position = None
