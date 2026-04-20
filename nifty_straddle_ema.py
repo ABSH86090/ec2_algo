@@ -277,20 +277,24 @@ class StrategyEngine:
         self.consecutive_green_above_ema = 0   # counter for exit condition 2
 
     # ----------------------------------------------------------
-    def ema(self, values, period):
-        if len(values) < period:
+    def compute_ema_series(self, period):
+        """
+        Computes full EMA series over ALL candles in history, matching backtest logic exactly.
+        Seeds with SMA of first `period` closes, then applies EMA forward.
+        Returns (ema5_current, ema20_current) — the latest value only.
+        """
+        closes = [c["close"] for c in self.candles]
+        if len(closes) < period:
             return None
-        sma = sum(values[:period]) / period
-        ema = sma
         k = 2 / (period + 1)
-        for v in values[period:]:
-            ema = v * k + ema * (1 - k)
+        ema = sum(closes[:period]) / period          # seed: SMA of first `period` bars
+        for close in closes[period:]:
+            ema = round(close * k + ema * (1 - k), 2)
         return ema
-
+ 
     def get_emas(self):
-        closes = [c["close"] for c in list(self.candles)[-HIST_PREFILL_BARS:]]
-        ema5  = self.ema(closes, EMA_FAST)
-        ema20 = self.ema(closes, EMA_SLOW)
+        ema5  = self.compute_ema_series(EMA_FAST)
+        ema20 = self.compute_ema_series(EMA_SLOW)
         return ema5, ema20
 
     # ----------------------------------------------------------
