@@ -216,7 +216,7 @@ def get_nifty_option_symbols(fyers):
 def is_today_nifty_expiry():
     return datetime.date.today() == get_next_tuesday_expiry()
 
-LOTS = 7 if datetime.date.today() == get_next_tuesday_expiry() else 12
+LOTS = 5 if datetime.date.today() == get_next_tuesday_expiry() else 10
 QTY = LOT_SIZE * LOTS
 send_telegram(
     f"📦 LOT CONFIG | "
