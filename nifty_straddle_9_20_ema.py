@@ -19,7 +19,7 @@ ACCESS_TOKEN     = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE         = 130
+LOT_SIZE         = 65
 HEDGE_OFFSET     = 1000          # Points away from ATM for hedges
 
 ATM_DECISION_TIME = datetime.time(9, 20)
