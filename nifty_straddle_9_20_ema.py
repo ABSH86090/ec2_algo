@@ -23,7 +23,7 @@ LOT_SIZE         = 65
 HEDGE_OFFSET     = 1000          # Points away from ATM for hedges
 
 ATM_DECISION_TIME = datetime.time(9, 20)
-ENTRY_CUTOFF      = datetime.time(10, 0)   # No new entries at or after 10:00 AM
+ENTRY_CUTOFF      = datetime.time(11, 0)   # No new entries at or after 10:00 AM
 TRADING_END       = datetime.time(15, 0)   # Force-exit at 3:00 PM
 
 HISTORY_RESOLUTION = "5"
@@ -473,7 +473,7 @@ class StrategyEngine:
             # 5-min buckets: 09:15, 09:20, 09:25 ...
             # 09:20 bucket spans 09:20:00 to 09:24:59 → this is "the 9:20 candle"
             is_920_candle = (
-                c_time.hour == 9 and c_time.minute == 20
+                c_time.hour == 9 and c_time.minute == 15
             )
             if is_920_candle:
                 self._check_920_gate(candle, ema20)
@@ -481,7 +481,7 @@ class StrategyEngine:
 
             # If we've somehow passed 09:21 without seeing the 09:18 candle,
             # mark gate as failed to be safe.
-            if c_time.hour > 9 or (c_time.hour == 9 and c_time.minute > 20):
+            if c_time.hour > 9 or (c_time.hour == 9 and c_time.minute > 15):
                 logger.warning("[9:20 GATE] 9:20 candle never seen — disabling for day.")
                 send_telegram("⚠️ 9:20 candle not observed — no trades today.")
                 self.gate_checked     = True
