@@ -237,17 +237,17 @@ class StrategyEngine:
     Strategy Rules
     ==============
 
-    PRE-CONDITION (day-level gate, checked on 9:20 candle close):
-    ---------------------------------------------------------------
-    The 9:20 AM candle (first 3-min candle of the session) must be:
-      - RED  (close < open)
-      - Close below EMA20
+    PRE-CONDITION (day-level gate, checked at 9:20 on the 9:15 candle):
+    --------------------------------------------------------------------
+    At 9:20 AM, evaluate the 9:15–9:20 combined CE+PE premium candle:
+      - Must be RED  (close < open)
+      - Close must be below EMA20
     If this condition fails → disabled_for_day = True, no trades today.
 
-    ENTRY (after 9:20 gate passes):
-    --------------------------------
+    ENTRY (after gate passes):
+    --------------------------
     Wait for a RED candle (on close) that:
-      - Closes BELOW the low of the 9:20 candle's combined premium
+      - Closes BELOW the low of the 9:15 candle's combined premium
       - Candle closes before 10:00 AM (entry_cutoff)
     Entry = candle close premium.
     SL    = entry_premium + MAX_SL_POINTS (25 points combined)
@@ -284,13 +284,13 @@ class StrategyEngine:
         self.position  = None       # dict with entry/sl details when in trade
 
         # --- Day-level state ---
-        self.disabled_for_day          = False   # True after any exit or failed gate
-        self.gate_checked              = False   # True once 9:20 candle has been evaluated
-        self.gate_passed               = False   # True if 9:20 candle passed the pre-condition
-        self.straddle_920_low          = None    # Low of the 9:20 combined premium candle
-        self.consecutive_green_above_ema = 0     # Counter for exit condition 2
+        self.disabled_for_day            = False
+        self.gate_checked                = False
+        self.gate_passed                 = False
+        self.straddle_920_low            = None  # Low of the 9:15 candle (gate candle)
+        self.consecutive_green_above_ema = 0
 
-        self.last_logged_ema_time      = None
+        self.last_logged_ema_time        = None
 
     # ----------------------------------------------------------
     def compute_ema_series(self, period):
@@ -368,33 +368,33 @@ class StrategyEngine:
         self.consecutive_green_above_ema = 0
 
     # ----------------------------------------------------------
-    def _check_920_gate(self, candle, ema20):
+    def _check_915_gate(self, candle, ema20):
         """
-        Called exactly once, when the 9:20 candle closes.
+        Called once with the 9:15 candle (9:15–9:20 bar) as a closed candle.
         Gate passes if candle is RED and closes below EMA20.
-        Stores straddle_920_low for use in entry condition.
+        Stores straddle_920_low (low of 9:15 candle) for entry condition.
         """
         self.gate_checked = True
 
-        is_red           = candle["close"] < candle["open"]
-        below_ema20      = candle["close"] < ema20
+        is_red      = candle["close"] < candle["open"]
+        below_ema20 = candle["close"] < ema20
 
         if is_red and below_ema20:
-            self.gate_passed     = True
+            self.gate_passed      = True
             self.straddle_920_low = candle["low"]
             logger.info(
-                f"[9:20 GATE] PASSED — red candle closes below EMA20. "
-                f"920_low={self.straddle_920_low:.2f} EMA20={ema20:.2f}"
+                f"[9:15 GATE] PASSED — red candle closes below EMA20. "
+                f"915_low={self.straddle_920_low:.2f} EMA20={ema20:.2f}"
             )
             send_telegram(
-                f"✅ 9:20 GATE PASSED\n"
+                f"✅ 9:15 GATE PASSED\n"
                 f"Candle: O={candle['open']:.2f} H={candle['high']:.2f} "
                 f"L={candle['low']:.2f} C={candle['close']:.2f}\n"
                 f"EMA20={ema20:.2f}\n"
-                f"920 Low (trigger level) = {self.straddle_920_low:.2f}"
+                f"915 Low (trigger level) = {self.straddle_920_low:.2f}"
             )
         else:
-            self.gate_passed    = False
+            self.gate_passed      = False
             self.disabled_for_day = True
             reason = []
             if not is_red:
@@ -402,10 +402,10 @@ class StrategyEngine:
             if not below_ema20:
                 reason.append("close NOT below EMA20")
             logger.info(
-                f"[9:20 GATE] FAILED ({', '.join(reason)}) — skipping today."
+                f"[9:15 GATE] FAILED ({', '.join(reason)}) — skipping today."
             )
             send_telegram(
-                f"❌ 9:20 GATE FAILED ({', '.join(reason)})\n"
+                f"❌ 9:15 GATE FAILED ({', '.join(reason)})\n"
                 f"No trades today."
             )
 
@@ -457,37 +457,24 @@ class StrategyEngine:
             )
             self.last_logged_ema_time = candle["time"]
 
-        # ---- 9:20 GATE CHECK (run exactly once on 9:20 candle close) ----
-        # The 9:20 candle bucket is 09:18 (since 3-min buckets: 09:15, 09:18, 09:21…)
-        # Actually for 3-min bars starting at 09:15:
-        #   09:15 candle closes at 09:18, 09:18 closes at 09:21 — so the bar whose
-        #   bucket time == 09:18 is the one that covers 09:15-09:18 (first bar).
-        #   The bar that STARTS at 09:18 covers 09:18-09:21 and is the "9:20 candle".
-        # We identify the 9:20 candle as the bar with bucket time 09:18
-        # (its tick range is 09:18:00–09:20:59, closing at 09:21).
-        # More simply: we mark the gate when we see the first candle whose
-        # time.minute is 18 (bucket 09:18) — this is the bar active at 9:20.
+        # ---- 9:15 GATE CHECK ----
+        # The 9:15 candle (9:15–9:20 bar) is fed explicitly from history
+        # at 9:20 AM before the websocket starts. So gate is always checked
+        # on the correct candle before any live ticks arrive.
         if not self.gate_checked:
             c_time = candle["time"]
-            # The candle bucket that contains 9:20 AM:
-            # 5-min buckets: 09:15, 09:20, 09:25 ...
-            # 09:20 bucket spans 09:20:00 to 09:24:59 → this is "the 9:20 candle"
-            is_920_candle = (
-                c_time.hour == 9 and c_time.minute == 15
-            )
-            if is_920_candle:
-                self._check_920_gate(candle, ema20)
+            if c_time.hour == 9 and c_time.minute == 15:
+                self._check_915_gate(candle, ema20)
                 return   # Don't attempt entry on the gate candle itself
 
-            # If we've somehow passed 09:21 without seeing the 09:18 candle,
-            # mark gate as failed to be safe.
-            if c_time.hour > 9 or (c_time.hour == 9 and c_time.minute > 15):
-                logger.warning("[9:20 GATE] 9:20 candle never seen — disabling for day.")
-                send_telegram("⚠️ 9:20 candle not observed — no trades today.")
+            # Safety net: if we see a candle after 9:20 and gate was never checked
+            if c_time.hour > 9 or (c_time.hour == 9 and c_time.minute > 20):
+                logger.warning("[GATE] 9:15 candle never fed — disabling for day.")
+                send_telegram("⚠️ 9:15 candle not observed — no trades today.")
                 self.gate_checked     = True
                 self.gate_passed      = False
                 self.disabled_for_day = True
-            return   # Never enter on or before the gate candle
+            return
 
         if not self.gate_passed:
             return   # Gate failed earlier; already disabled
@@ -525,19 +512,19 @@ class StrategyEngine:
         if not is_red:
             return
 
-        # Entry candle must close BELOW the low of the 9:20 candle
+        # Entry candle must close BELOW the low of the 9:15 candle
         if candle["close"] >= self.straddle_920_low:
             logger.info(
                 f"[ENTRY SCAN] Red candle at {candle['time']} but "
-                f"close={candle['close']:.2f} >= 920_low={self.straddle_920_low:.2f} "
-                f"— not below 9:20 low, skipping."
+                f"close={candle['close']:.2f} >= 915_low={self.straddle_920_low:.2f} "
+                f"— not below 9:15 low, skipping."
             )
             return
 
         # All conditions met → enter
         logger.info(
             f"[ENTRY SIGNAL] Red candle close {candle['close']:.2f} "
-            f"< 9:20 low {self.straddle_920_low:.2f} at {candle['time']}"
+            f"< 9:15 low {self.straddle_920_low:.2f} at {candle['time']}"
         )
         self._enter_trade(candle, ema5, ema20)
 
@@ -546,8 +533,8 @@ class StrategyEngine:
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("[BOOT] NIFTY STRANGLE EMA STRATEGY STARTED (REVISED v2)")
-    send_telegram("🚀 NIFTY STRANGLE EMA STRATEGY STARTED (REVISED v2)")
+    logger.info("[BOOT] NIFTY STRANGLE EMA STRATEGY STARTED (REVISED v3)")
+    send_telegram("🚀 NIFTY STRANGLE EMA STRATEGY STARTED (REVISED v3)")
 
     fyers = FyersClient()
 
@@ -555,14 +542,15 @@ if __name__ == "__main__":
     while datetime.datetime.now().time() < ATM_DECISION_TIME:
         time.sleep(1)
 
-    # Get symbols — spot price fetched inside
+    # Step 1: Get symbols — spot price fetched at 9:20 AM
     ce, pe, ce_hedge, pe_hedge, atm = get_nifty_strangle_symbols(fyers.client)
     engine = StrategyEngine(fyers, ce, pe, ce_hedge, pe_hedge)
 
-    # Prefill historical candles for EMA warm-up (previous sessions only)
+    # Step 2: Prefill historical candles for EMA warm-up
     hist = fetch_historical_premium(fyers, ce, pe)
-    # Only load candles from BEFORE today so today's gate candle is seen live
     today = datetime.date.today()
+
+    # Load only previous days' candles for EMA seed
     for c in hist:
         if c["time"].date() < today:
             engine.candles.append(c)
@@ -580,6 +568,31 @@ if __name__ == "__main__":
                 f"EMA20={ema20:.2f}\n"
                 f"GAP={ema20 - ema5:.2f}"
             )
+
+    # Step 3: Find today's 9:15 candle from history and feed as gate candle
+    candle_915 = None
+    for c in hist:
+        if (c["time"].date() == today and
+                c["time"].hour == 9 and c["time"].minute == 15):
+            candle_915 = c
+            break
+
+    if candle_915:
+        logger.info(
+            f"[9:15 CANDLE] O={candle_915['open']:.2f} H={candle_915['high']:.2f} "
+            f"L={candle_915['low']:.2f} C={candle_915['close']:.2f}"
+        )
+        send_telegram(
+            f"📊 9:15 CANDLE (CE+PE combined)\n"
+            f"O={candle_915['open']:.2f} H={candle_915['high']:.2f} "
+            f"L={candle_915['low']:.2f} C={candle_915['close']:.2f}"
+        )
+        # Feed as closed candle — this triggers the gate check
+        engine.on_candle(candle_915, closed=True)
+    else:
+        logger.warning("[9:15 CANDLE] Not found in history — disabling for day.")
+        send_telegram("⚠️ 9:15 candle not found in history — no trades today.")
+        engine.disabled_for_day = True
 
     # ========= WEBSOCKET =========
     last   = {}      # latest LTP per symbol
