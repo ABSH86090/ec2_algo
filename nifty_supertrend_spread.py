@@ -309,9 +309,9 @@ if __name__ == "__main__":
         "symbol": INDEX_SYMBOL,
         "resolution": "D",
         "date_format": "1",
-        "range_from": (datetime.date.today()-datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
-        "range_to": (datetime.date.today()-datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
-        "cont_flag": "1"
+        "range_from": (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y-%m-%d"),
+        "range_to":   (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
+        "cont_flag":  "1"
     })
     print(hist)
     last = hist["candles"][-1]
@@ -327,13 +327,13 @@ if __name__ == "__main__":
         st_values = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
         warmup_st = st_values[-1] if st_values else None
 
-    closes = [c["close"] for c in full_candles]
-    ema5_val = ema(closes, EMA_FAST)
+    closes    = [c["close"] for c in full_candles]
+    ema5_val  = ema(closes, EMA_FAST)
     ema20_val = ema(closes, EMA_SLOW)
 
-    ema5_str = f"{ema5_val:.2f}" if ema5_val is not None else "N/A"
+    ema5_str  = f"{ema5_val:.2f}"  if ema5_val  is not None else "N/A"
     ema20_str = f"{ema20_val:.2f}" if ema20_val is not None else "N/A"
-    st_str = f"{warmup_st:.2f}" if warmup_st is not None else "N/A"
+    st_str    = f"{warmup_st:.2f}" if warmup_st  is not None else "N/A"
 
     send_telegram(
         f"WARMUP DONE | Candles={len(full_candles)} | "
@@ -341,118 +341,150 @@ if __name__ == "__main__":
         f"ST={st_str} | BC={BC:.2f} TC={TC:.2f}"
     )
 
-    first_trend = None
-    seen_opposite = False
-    current_day = None
-    day_start_time = None
+    # ---- State variables ----
+    first_trend      = None
+    seen_opposite    = False
+    current_day      = None
+    day_start_time   = None
+    first_candle_done = False   # True after candle 1 is skipped; entry starts from candle 2
 
     def on_tick(msg):
-        global first_trend, seen_opposite, current_day, day_start_time
+        global first_trend, seen_opposite, current_day, day_start_time, first_candle_done
 
         if msg.get("symbol") != INDEX_SYMBOL:
             return
 
-        ts = datetime.datetime.fromtimestamp(
+        ts  = datetime.datetime.fromtimestamp(
             msg.get("last_traded_time", msg.get("timestamp", datetime.datetime.now().timestamp()))
         )
         ltp = msg["ltp"]
 
         tm.on_tick(ltp, ts)
 
-        bucket = ts.replace(minute=(ts.minute//15)*15, second=0, microsecond=0)
+        bucket = ts.replace(minute=(ts.minute // 15) * 15, second=0, microsecond=0)
 
         candle_closed = False
-        prev_candle = None
+        prev_candle   = None
 
-        # Update or append candle
+        # ---- Update or append candle ----
         if full_candles and full_candles[-1]["time"] == bucket:
-            c = full_candles[-1]
-            c["high"] = max(c["high"], ltp)
-            c["low"] = min(c["low"], ltp)
+            c          = full_candles[-1]
+            c["high"]  = max(c["high"], ltp)
+            c["low"]   = min(c["low"],  ltp)
             c["close"] = ltp
         else:
             if full_candles:
-                prev_candle = full_candles[-1]
+                prev_candle   = full_candles[-1]
                 candle_closed = True
 
             new_candle = {"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
             full_candles.append(new_candle)
 
+            # ---- New day detected — reset all daily state ----
             if current_day != bucket.date():
-                current_day = bucket.date()
-                day_start_time = bucket
-                send_telegram("🔄 New trading day detected - continuous ST continues")
+                current_day       = bucket.date()
+                day_start_time    = bucket
+                first_trend       = None
+                seen_opposite     = False
+                first_candle_done = False
+                send_telegram("🔄 New trading day detected — daily state reset, continuous ST continues")
 
-        # Supertrend (continuous)
+        # ---- Compute continuous SuperTrend ----
         current_st = None
         if len(full_candles) >= ATR_PERIOD + 5:
-            st_values = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
+            st_values  = supertrend(list(full_candles), ATR_PERIOD, MULTIPLIER)
             current_st = st_values[-1] if st_values else None
 
-            # Set first trend once per day
+            # Set first_trend once per day using the first candle's close vs ST
             if first_trend is None and current_st is not None and day_start_time is not None:
-                first_candle_idx = next((i for i, c in enumerate(full_candles) if c["time"] >= day_start_time), -1)
+                first_candle_idx = next(
+                    (i for i, c in enumerate(full_candles) if c["time"] >= day_start_time), -1
+                )
                 if first_candle_idx >= 0:
                     first_close = full_candles[first_candle_idx]["close"]
                     first_trend = "BULLISH" if first_close > current_st else "BEARISH"
                     send_telegram(
-                        f"📌 First trend set (continuous ST): {first_trend} "
+                        f"📌 First trend set: {first_trend} "
                         f"(ST={current_st:.1f}, Close={first_close:.1f})"
                     )
 
-        # Process only on candle close
-        if candle_closed and prev_candle is not None and ts.time() <= ENTRY_CUTOFF:
-            closes = [c["close"] for c in full_candles]
-            fc = list(full_candles)
-            closed_closes = [c["close"] for c in fc[:-1]]
+        # ---- Process only on candle close and within entry window ----
+        if not candle_closed or prev_candle is None or ts.time() > ENTRY_CUTOFF:
+            return
 
-            ema5_val = ema(closed_closes, EMA_FAST)
-            ema20_val = ema(closed_closes, EMA_SLOW)
+        # ---- Compute indicators on closed candles only (exclude live candle) ----
+        fc            = list(full_candles)
+        closed_closes = [c["close"] for c in fc[:-1]]
+        ema5_val      = ema(closed_closes, EMA_FAST)
+        ema20_val     = ema(closed_closes, EMA_SLOW)
 
-            ema5_str = f"{ema5_val:.0f}" if ema5_val is not None else "N/A"
-            ema20_str = f"{ema20_val:.0f}" if ema20_val is not None else "N/A"
-            st_str = f"{current_st:.0f}" if current_st is not None else "N/A"
+        ema5_str  = f"{ema5_val:.0f}"  if ema5_val  is not None else "N/A"
+        ema20_str = f"{ema20_val:.0f}" if ema20_val is not None else "N/A"
+        st_str    = f"{current_st:.0f}" if current_st is not None else "N/A"
 
+        send_telegram(
+            f"CANDLE {prev_candle['time'].time()} | "
+            f"O={prev_candle['open']:.0f} H={prev_candle['high']:.0f} "
+            f"L={prev_candle['low']:.0f} C={prev_candle['close']:.0f} | "
+            f"BC={BC:.0f} TC={TC:.0f} | "
+            f"EMA5={ema5_str} EMA20={ema20_str} ST={st_str} | "
+            f"FT={first_trend} SO={seen_opposite} FCD={first_candle_done}"
+        )
+
+        # ---- Skip candle 1 — start checking from candle 2 ----
+        if first_trend is not None and not first_candle_done:
+            first_candle_done = True
             send_telegram(
-                f"CANDLE {prev_candle['time'].time()} | "
-                f"O={prev_candle['open']:.0f} H={prev_candle['high']:.0f} "
-                f"L={prev_candle['low']:.0f} C={prev_candle['close']:.0f} | "
-                f"BC={BC:.0f} TC={TC:.0f} | "
-                f"EMA5={ema5_str} EMA20={ema20_str} ST={st_str} | "
-                f"FT={first_trend} SO={seen_opposite}"
+                f"⏭️ Candle 1 skipped ({prev_candle['time'].time()}) | "
+                f"FT={first_trend} | Entry check starts from next candle"
             )
+            return
 
-            # Update seen_opposite
-            if first_trend is not None and current_st is not None:
-                is_green = prev_candle["close"] > prev_candle["open"]
-                is_red = prev_candle["close"] < prev_candle["open"]
-                if first_trend == "BULLISH" and is_red and prev_candle["close"] > current_st:
+        # ---- Update seen_opposite (candle 2 onwards) ----
+        if first_trend is not None and current_st is not None:
+            is_green = prev_candle["close"] > prev_candle["open"]
+            is_red   = prev_candle["close"] < prev_candle["open"]
+
+            if first_trend == "BULLISH" and is_red and prev_candle["close"] > current_st:
+                if not seen_opposite:
                     seen_opposite = True
-                elif first_trend == "BEARISH" and is_green and prev_candle["close"] < current_st:
+                    send_telegram(f"👁️ Opposite candle seen (RED above ST) at {prev_candle['time'].time()}")
+
+            elif first_trend == "BEARISH" and is_green and prev_candle["close"] < current_st:
+                if not seen_opposite:
                     seen_opposite = True
+                    send_telegram(f"👁️ Opposite candle seen (GREEN below ST) at {prev_candle['time'].time()}")
 
-            # Triggers
-            if first_trend is not None and seen_opposite and current_st is not None:
-                is_green = prev_candle["close"] > prev_candle["open"]
-                is_red = prev_candle["close"] < prev_candle["open"]
+        # ---- Entry triggers (candle 2 onwards, after seen_opposite) ----
+        if first_trend is not None and seen_opposite and current_st is not None:
+            is_green = prev_candle["close"] > prev_candle["open"]
+            is_red   = prev_candle["close"] < prev_candle["open"]
 
-                if (first_trend == "BEARISH" and is_red and
-                    prev_candle["close"] < BC and
-                    prev_candle["close"] < current_st and
-                    (ema5_val is None or prev_candle["close"] < ema5_val) and
-                    (ema20_val is None or prev_candle["close"] < ema20_val)):
-                    send_telegram("🔥 BEARISH TRIGGER")
-                    tm.enter("BEARISH", ltp)
+            # PUT / BEARISH entry
+            if (first_trend == "BEARISH" and is_red
+                    and prev_candle["close"] < current_st
+                    and prev_candle["close"] < BC
+                    and (ema5_val  is None or prev_candle["close"] < ema5_val)
+                    and (ema20_val is None or prev_candle["close"] < ema20_val)):
+                send_telegram(
+                    f"🔥 BEARISH TRIGGER at {prev_candle['time'].time()} | "
+                    f"Close={prev_candle['close']:.0f} ST={current_st:.0f} BC={BC:.0f}"
+                )
+                tm.enter("BEARISH", ltp)
 
-                elif (first_trend == "BULLISH" and is_green and
-                      prev_candle["close"] > TC and
-                      prev_candle["close"] > current_st and
-                      (ema5_val is None or prev_candle["close"] > ema5_val) and
-                      (ema20_val is None or prev_candle["close"] > ema20_val)):
-                    send_telegram("🚀 BULLISH TRIGGER")
-                    tm.enter("BULLISH", ltp)
+            # CALL / BULLISH entry
+            elif (first_trend == "BULLISH" and is_green
+                    and prev_candle["close"] > current_st
+                    and prev_candle["close"] > TC
+                    and (ema5_val  is None or prev_candle["close"] > ema5_val)
+                    and (ema20_val is None or prev_candle["close"] > ema20_val)):
+                send_telegram(
+                    f"🚀 BULLISH TRIGGER at {prev_candle['time'].time()} | "
+                    f"Close={prev_candle['close']:.0f} ST={current_st:.0f} TC={TC:.0f}"
+                )
+                tm.enter("BULLISH", ltp)
 
-    # ================= WEBSOCKET =================
+    # ---- WebSocket ----
     ws = data_ws.FyersDataSocket(
         access_token=fyers.auth,
         on_connect=lambda: ws.subscribe(symbols=[INDEX_SYMBOL], data_type="SymbolUpdate"),
