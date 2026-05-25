@@ -1,3 +1,31 @@
+"""
+NIFTY STRADDLE LIVE STRATEGY
+==============================
+3-minute candles, EMA5 & EMA20 on combined CE+PE straddle premium.
+ATM strike is determined from the CLOSE of the first 15-minute candle (9:15-9:30).
+Two strategies run independently; each places and manages its own trade.
+
+━━━ STRATEGY 1 — EMA Compression Sell ━━━
+  Case 1: Premium > 200    →  EMA5 ≤ 0.9 × EMA20
+  Case 2: 100 < P ≤ 200   →  EMA5 ≤ 0.8 × EMA20
+  Case 3: P ≤ 100         →  EMA5 ≤ 0.7 × EMA20
+  Signal: red candle that opens above EMA5 AND closes below EMA5
+
+━━━ STRATEGY 2 — Opening-Gap Rejection Sell ━━━
+  Sequential (must occur in order):
+  1. First 3-min candle (9:15): red, close < EMA5 & EMA20, EMA5 < EMA20
+  2. Any later candle closes above EMA20  (recovery)
+  3. Red candle closes below BOTH EMA5 & EMA20  (rejection)
+  4. ≥2 candles close below BOTH EMA5 & EMA20
+  5. Signal: red candle opens above EMA5, closes below BOTH, EMA5 ≤ EMA20
+
+Trade (both strategies):
+  Order sequence on ENTRY : buy CE hedge → buy PE hedge → sell CE → sell PE
+  Order sequence on EXIT  : buy CE → buy PE → sell CE hedge → sell PE hedge
+  SL   : entry_premium + 15 pts (checked on every live tick)
+  Exit : 3:00 PM force-exit if SL not hit
+"""
+
 import datetime
 import logging
 import os
@@ -14,28 +42,27 @@ from fyers_apiv3.FyersWebsocket import data_ws
 # =========================================================
 load_dotenv()
 
-CLIENT_ID        = os.getenv("FYERS_CLIENT_ID")
-ACCESS_TOKEN     = os.getenv("FYERS_ACCESS_TOKEN")
+CLIENT_ID          = os.getenv("FYERS_CLIENT_ID")
+ACCESS_TOKEN       = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE         = 130
-HEDGE_OFFSET     = 1000          # Points away from ATM for hedges
+LOT_SIZE        = 130
+HEDGE_OFFSET    = 1000           # Points away from ATM for hedges
 
-ATM_DECISION_TIME = datetime.time(9, 20)
-ENTRY_CUTOFF      = datetime.time(11, 0)   # No new entries at or after 10:00 AM
+ATM_DECISION_TIME = datetime.time(9, 30)   # Wait for 15-min candle to close
+ENTRY_CUTOFF      = datetime.time(14, 30)  # No new entries at or after 2:30 PM
 TRADING_END       = datetime.time(15, 0)   # Force-exit at 3:00 PM
 
-HISTORY_RESOLUTION = "5"
+HISTORY_RESOLUTION = "3"         # 3-minute candles
 
 EMA_FAST         = 5
 EMA_SLOW         = 20
 MIN_BARS_FOR_EMA = 25
-HIST_PREFILL_BARS = 80
 
-MAX_SL_POINTS    = 25            # SL = entry premium + 25 (combined CE+PE)
+SL_POINTS        = 15            # Combined CE+PE premium SL offset
 
-LOG_FILE = "nifty_strangle_revised.log"
+LOG_FILE = "nifty_straddle_live.log"
 
 # =========================================================
 # LOGGING
@@ -67,7 +94,6 @@ def send_telegram(msg):
 # =========================================================
 # SYMBOL UTILS
 # =========================================================
-
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 1, 26),
     datetime.date(2026, 3, 3),
@@ -80,23 +106,20 @@ SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 9, 14),
     datetime.date(2026, 10, 2),
     datetime.date(2026, 11, 24),
-    datetime.date(2026, 12, 25)
+    datetime.date(2026, 12, 25),
 }
 
 
 def is_last_tuesday(d, holidays=SPECIAL_MARKET_HOLIDAYS):
     is_tuesday   = d.weekday() == 1
     is_last_week = (d + datetime.timedelta(days=7)).month != d.month
-
     if is_tuesday and is_last_week:
         return not (d in holidays)
-
     if d.weekday() == 0:
         next_day = d + datetime.timedelta(days=1)
         is_last_week_tuesday = (next_day + datetime.timedelta(days=7)).month != next_day.month
         if next_day in holidays and is_last_week_tuesday:
             return True
-
     return False
 
 
@@ -115,44 +138,60 @@ def format_expiry(expiry):
     yy = expiry.strftime("%y")
     if is_last_tuesday(expiry):
         return f"{yy}{expiry.strftime('%b').upper()}"
-    m, d = expiry.month, expiry.day
-    m_token = {10: "O", 11: "N", 12: "D"}.get(m, str(m))
-    return f"{yy}{m_token}{d:02d}"
+    m, d  = expiry.month, expiry.day
+    m_tok = {10: "O", 11: "N", 12: "D"}.get(m, str(m))
+    return f"{yy}{m_tok}{d:02d}"
 
 
-def get_nifty_strangle_symbols(fyers, spot=None):
-    if spot is None:
-        r    = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-        spot = float(r["d"][0]["v"]["lp"])
+def get_atm_from_15min_candle(fyers_client):
+    """
+    Fetch the 9:15 AM 15-minute candle for NIFTY50 and return the ATM
+    strike (close rounded to nearest 50). Call this at or after 9:30 AM.
+    """
+    today = datetime.date.today()
+    r = fyers_client.history({
+        "symbol":      "NSE:NIFTY50-INDEX",
+        "resolution":  "15",
+        "date_format": "1",
+        "range_from":  today.strftime("%Y-%m-%d"),
+        "range_to":    today.strftime("%Y-%m-%d"),
+        "cont_flag":   "1",
+    })
+    for c in r.get("candles", []):
+        ts = datetime.datetime.fromtimestamp(c[0])
+        if ts.hour == 9 and ts.minute == 15:
+            close = c[4]
+            atm   = round(close / 50) * 50
+            logger.info(f"[ATM] 15-min candle close={close:.2f} → ATM={atm}")
+            send_telegram(
+                f"📊 15-MIN CANDLE (9:15-9:30)\n"
+                f"Close={close:.2f} → ATM Strike={atm}"
+            )
+            return atm
+    raise RuntimeError("15-min candle at 9:15 not found in API response — check market is open")
 
-    atm = round(spot / 50) * 50
 
-    ce_strike       = atm
-    pe_strike       = atm
-    ce_hedge_strike = atm + HEDGE_OFFSET
-    pe_hedge_strike = atm - HEDGE_OFFSET
-
+def build_straddle_symbols(atm):
+    """Build CE, PE, and hedge symbols from ATM strike."""
     expiry = format_expiry(get_next_expiry())
 
-    ce_symbol       = f"NSE:NIFTY{expiry}{ce_strike}CE"
-    pe_symbol       = f"NSE:NIFTY{expiry}{pe_strike}PE"
-    ce_hedge_symbol = f"NSE:NIFTY{expiry}{ce_hedge_strike}CE"
-    pe_hedge_symbol = f"NSE:NIFTY{expiry}{pe_hedge_strike}PE"
+    ce_sym       = f"NSE:NIFTY{expiry}{atm}CE"
+    pe_sym       = f"NSE:NIFTY{expiry}{atm}PE"
+    ce_hedge_sym = f"NSE:NIFTY{expiry}{atm + HEDGE_OFFSET}CE"
+    pe_hedge_sym = f"NSE:NIFTY{expiry}{atm - HEDGE_OFFSET}PE"
 
     logger.info(
-        f"[STRANGLE SYMBOLS] "
-        f"CE={ce_symbol} | PE={pe_symbol} | "
-        f"CE_HEDGE={ce_hedge_symbol} | PE_HEDGE={pe_hedge_symbol}"
+        f"[SYMBOLS] CE={ce_sym} | PE={pe_sym} | "
+        f"CE_HEDGE={ce_hedge_sym} | PE_HEDGE={pe_hedge_sym}"
     )
     send_telegram(
-        f"📌 NIFTY STRANGLE SYMBOLS\n"
-        f"CE (sell)  : {ce_symbol}\n"
-        f"PE (sell)  : {pe_symbol}\n"
-        f"CE HEDGE   : {ce_hedge_symbol}\n"
-        f"PE HEDGE   : {pe_hedge_symbol}"
+        f"📌 STRADDLE SYMBOLS\n"
+        f"CE (sell)  : {ce_sym}\n"
+        f"PE (sell)  : {pe_sym}\n"
+        f"CE HEDGE   : {ce_hedge_sym}\n"
+        f"PE HEDGE   : {pe_hedge_sym}"
     )
-
-    return ce_symbol, pe_symbol, ce_hedge_symbol, pe_hedge_symbol, atm
+    return ce_sym, pe_sym, ce_hedge_sym, pe_hedge_sym
 
 
 # =========================================================
@@ -176,7 +215,7 @@ class FyersClient:
             "side":        -1,
             "productType": "INTRADAY",
             "validity":    "DAY",
-            "orderTag":    tag
+            "orderTag":    tag,
         })
 
     def buy_market(self, symbol, tag):
@@ -187,45 +226,52 @@ class FyersClient:
             "side":        1,
             "productType": "INTRADAY",
             "validity":    "DAY",
-            "orderTag":    tag
+            "orderTag":    tag,
         })
 
 
 # =========================================================
 # HISTORICAL PREFILL
 # =========================================================
-def fetch_historical_premium(fyers, ce, pe):
+def fetch_historical_premium(fyers_client, ce, pe):
+    """
+    Fetch 3-min combined CE+PE candles for the past 7 days.
+    Returns list of dicts sorted by time.
+    """
     to_dt   = datetime.datetime.now()
     from_dt = to_dt - datetime.timedelta(days=7)
 
     def fetch(symbol):
-        r = fyers.client.history({
-            "symbol":     symbol,
-            "resolution": HISTORY_RESOLUTION,
+        r = fyers_client.history({
+            "symbol":      symbol,
+            "resolution":  HISTORY_RESOLUTION,
             "date_format": "1",
-            "range_from": from_dt.strftime("%Y-%m-%d"),
-            "range_to":   to_dt.strftime("%Y-%m-%d"),
-            "cont_flag":  "1"
+            "range_from":  from_dt.strftime("%Y-%m-%d"),
+            "range_to":    to_dt.strftime("%Y-%m-%d"),
+            "cont_flag":   "1",
         })
-        return r.get("candles", [])
+        return {c[0]: c for c in r.get("candles", [])}
 
-    ce_hist = fetch(ce)
-    pe_hist = fetch(pe)
+    ce_map = fetch(ce)
+    pe_map = fetch(pe)
 
     candles = []
-    for c1, c2 in zip(ce_hist, pe_hist):
-        ts = datetime.datetime.fromtimestamp(c1[0])
-        if ts.time() < datetime.time(9, 15) or ts.time() > datetime.time(15, 30):
+    for ts in sorted(set(ce_map) & set(pe_map)):
+        dt = datetime.datetime.fromtimestamp(ts)
+        if dt.time() < datetime.time(9, 15) or dt.time() > datetime.time(15, 30):
             continue
+        c1, c2 = ce_map[ts], pe_map[ts]
+        o = c1[1] + c2[1]
+        c = c1[4] + c2[4]
         candles.append({
-            "time":  ts,
-            "open":  c1[1] + c2[1],
-            "high":  c1[2] + c2[2],
-            "low":   c1[3] + c2[3],
-            "close": c1[4] + c2[4]
+            "time":  dt,
+            "open":  o,
+            "high":  round(max(o, c), 2),
+            "low":   round(min(o, c), 2),
+            "close": c,
         })
 
-    logger.info(f"[PREFILL] Loaded {len(candles)} candles")
+    logger.info(f"[PREFILL] {len(candles)} combined candles loaded")
     return candles
 
 
@@ -234,43 +280,11 @@ def fetch_historical_premium(fyers, ce, pe):
 # =========================================================
 class StrategyEngine:
     """
-    Strategy Rules
-    ==============
+    Manages two independent straddle sell strategies on 3-minute candles.
 
-    PRE-CONDITION (day-level gate, checked at 9:20 on the 9:15 candle):
-    --------------------------------------------------------------------
-    At 9:20 AM, evaluate the 9:15–9:20 combined CE+PE premium candle:
-      - Must be RED  (close < open)
-      - Close must be below EMA20
-    If this condition fails → disabled_for_day = True, no trades today.
-
-    ENTRY (after gate passes):
-    --------------------------
-    Wait for a RED candle (on close) that:
-      - Closes BELOW the low of the 9:15 candle's combined premium
-      - Candle closes before 10:00 AM (entry_cutoff)
-    Entry = candle close premium.
-    SL    = entry_premium + MAX_SL_POINTS (25 points combined)
-
-    ORDER SEQUENCE on entry:
-      1. Buy CE hedge
-      2. Buy PE hedge
-      3. Sell CE main
-      4. Sell PE main
-
-    EXIT CONDITIONS (whichever hits first):
-    ----------------------------------------
-    1. Live premium >= sl_premium  (SL hit)
-    2. Two consecutive CLOSED green candles with close > EMA20
-    3. Time >= 3:00 PM (EOD force-exit)
-
-    ORDER SEQUENCE on exit:
-      1. Buy CE main
-      2. Buy PE main
-      3. Sell CE hedge
-      4. Sell PE hedge
-
-    Only ONE trade per day. No re-entry after exit.
+    on_candle() is called:
+      - closed=True  : bar just closed; run all phase/entry logic
+      - closed=False : bar forming; only check live SL and EOD exit
     """
 
     def __init__(self, fyers, ce, pe, ce_hedge, pe_hedge):
@@ -280,21 +294,24 @@ class StrategyEngine:
         self.ce_hedge = ce_hedge
         self.pe_hedge = pe_hedge
 
-        self.candles   = deque(maxlen=2000)
-        self.position  = None       # dict with entry/sl details when in trade
+        self.candles = deque(maxlen=2000)
 
-        # --- Day-level state ---
-        self.disabled_for_day            = False
-        self.gate_checked                = False
-        self.gate_passed                 = False
-        self.straddle_920_low            = None  # Low of the 9:15 candle (gate candle)
-        self.consecutive_green_above_ema = 0
+        # ── Strategy 1 state ──
+        self.position1 = None   # dict(entry_premium, sl_premium) when in trade
+        self.s1_done   = False  # True after S1 trade completes (one trade per day)
 
-        self.last_logged_ema_time        = None
+        # ── Strategy 2 state ──
+        self.position2 = None
+        self.s2_done   = False
+        # Phases: 0=init, 1=wait recovery, 2=wait rejection,
+        #         3=count below, 4=wait signal, -1=inactive
+        self.s2_phase  = 0
+        self.s2_count  = 0      # candles below both EMAs counted in phase 3
 
     # ----------------------------------------------------------
-    def compute_ema_series(self, period):
-        """Full EMA series seeded with SMA, returns latest value."""
+    # EMA
+    # ----------------------------------------------------------
+    def _compute_ema(self, period):
         closes = [c["close"] for c in self.candles]
         if len(closes) < period:
             return None
@@ -304,299 +321,287 @@ class StrategyEngine:
             ema = round(close * k + ema * (1 - k), 2)
         return ema
 
-    def get_emas(self):
-        ema5  = self.compute_ema_series(EMA_FAST)
-        ema20 = self.compute_ema_series(EMA_SLOW)
-        return ema5, ema20
+    def _get_emas(self):
+        return self._compute_ema(EMA_FAST), self._compute_ema(EMA_SLOW)
 
     # ----------------------------------------------------------
-    def _enter_trade(self, entry_candle, ema5, ema20):
-        entry_premium = entry_candle["close"]
-        sl_premium    = entry_premium + MAX_SL_POINTS
+    # ORDER HELPERS
+    # ----------------------------------------------------------
+    def _enter_trade(self, strategy_num, candle, ema5, ema20, note=""):
+        entry = candle["close"]
+        sl    = round(entry + SL_POINTS, 2)
+        tag   = f"S{strategy_num}"
 
-        msg = (
-            f"📉 STRANGLE ENTRY\n"
-            f"Entry Premium = {entry_premium:.2f}\n"
-            f"SL (premium)  = {sl_premium:.2f}  (+{MAX_SL_POINTS} pts)\n"
-            f"EMA5={ema5:.2f} | EMA20={ema20:.2f}\n"
-            f"Time: {entry_candle['time']}"
-        )
         logger.info(
-            f"[ENTRY] entry_premium={entry_premium:.2f} sl_premium={sl_premium:.2f} "
-            f"EMA5={ema5:.2f} EMA20={ema20:.2f}"
+            f"[S{strategy_num} ENTRY] entry={entry:.2f} sl={sl:.2f} "
+            f"EMA5={ema5:.2f} EMA20={ema20:.2f} time={candle['time']} {note}"
         )
-        send_telegram(msg)
+        send_telegram(
+            f"📉 STRATEGY {strategy_num} ENTRY\n"
+            f"Premium = {entry:.2f}  SL = {sl:.2f}  (+{SL_POINTS} pts)\n"
+            f"EMA5={ema5:.2f} | EMA20={ema20:.2f}\n"
+            f"Time: {candle['time']}"
+            + (f"\n{note}" if note else "")
+        )
 
-        # ORDER SEQUENCE: Hedges first, then sell main
-        logger.info("[ORDER] Buying CE hedge")
-        self.fyers.buy_market(self.ce_hedge, "CEHEDGEBUY")
+        self.fyers.buy_market(self.ce_hedge, f"{tag}CEHEDGEBUY")
+        self.fyers.buy_market(self.pe_hedge, f"{tag}PEHEDGEBUY")
+        self.fyers.sell_market(self.ce,      f"{tag}SELLCE")
+        self.fyers.sell_market(self.pe,      f"{tag}SELLPE")
 
-        logger.info("[ORDER] Buying PE hedge")
-        self.fyers.buy_market(self.pe_hedge, "PEHEDGEBUY")
-
-        logger.info("[ORDER] Selling CE main")
-        self.fyers.sell_market(self.ce, "STRANGLECE")
-
-        logger.info("[ORDER] Selling PE main")
-        self.fyers.sell_market(self.pe, "STRANGLEPE")
-
-        self.position = {
-            "entry_premium": entry_premium,
-            "sl_premium":    sl_premium,
-        }
-        self.consecutive_green_above_ema = 0
-
-    def _exit_trade(self, reason):
-        logger.info(f"[EXIT] Reason: {reason}")
-        send_telegram(f"🛑 STRANGLE EXIT\nReason: {reason}")
-
-        # ORDER SEQUENCE: Buy main first, then sell hedges
-        logger.info("[ORDER] Buying CE main (exit)")
-        self.fyers.buy_market(self.ce, "EXITCE")
-
-        logger.info("[ORDER] Buying PE main (exit)")
-        self.fyers.buy_market(self.pe, "EXITPE")
-
-        logger.info("[ORDER] Selling CE hedge (exit)")
-        self.fyers.sell_market(self.ce_hedge, "CEHEDGESELL")
-
-        logger.info("[ORDER] Selling PE hedge (exit)")
-        self.fyers.sell_market(self.pe_hedge, "PEHEDGESELL")
-
-        self.disabled_for_day            = True
-        self.position                    = None
-        self.consecutive_green_above_ema = 0
-
-    # ----------------------------------------------------------
-    def _check_915_gate(self, candle, ema20):
-        """
-        Called once with the 9:15 candle (9:15–9:20 bar) as a closed candle.
-        Gate passes if candle is RED and closes below EMA20.
-        Stores straddle_920_low (low of 9:15 candle) for entry condition.
-        """
-        self.gate_checked = True
-
-        is_red      = candle["close"] < candle["open"]
-        below_ema20 = candle["close"] < ema20
-
-        if is_red and below_ema20:
-            self.gate_passed      = True
-            self.straddle_920_low = candle["low"]
-            logger.info(
-                f"[9:15 GATE] PASSED — red candle closes below EMA20. "
-                f"915_low={self.straddle_920_low:.2f} EMA20={ema20:.2f}"
-            )
-            send_telegram(
-                f"✅ 9:15 GATE PASSED\n"
-                f"Candle: O={candle['open']:.2f} H={candle['high']:.2f} "
-                f"L={candle['low']:.2f} C={candle['close']:.2f}\n"
-                f"EMA20={ema20:.2f}\n"
-                f"915 Low (trigger level) = {self.straddle_920_low:.2f}"
-            )
+        position = {"entry_premium": entry, "sl_premium": sl}
+        if strategy_num == 1:
+            self.position1 = position
         else:
-            self.gate_passed      = False
-            self.disabled_for_day = True
-            reason = []
-            if not is_red:
-                reason.append("candle not RED")
-            if not below_ema20:
-                reason.append("close NOT below EMA20")
-            logger.info(
-                f"[9:15 GATE] FAILED ({', '.join(reason)}) — skipping today."
-            )
-            send_telegram(
-                f"❌ 9:15 GATE FAILED ({', '.join(reason)})\n"
-                f"No trades today."
-            )
+            self.position2 = position
+
+    def _exit_trade(self, strategy_num, reason):
+        logger.info(f"[S{strategy_num} EXIT] {reason}")
+        send_telegram(f"🛑 STRATEGY {strategy_num} EXIT\nReason: {reason}")
+
+        tag = f"S{strategy_num}"
+        self.fyers.buy_market(self.ce,       f"{tag}BUYCE")
+        self.fyers.buy_market(self.pe,       f"{tag}BUYPE")
+        self.fyers.sell_market(self.ce_hedge, f"{tag}CEHEDGESELL")
+        self.fyers.sell_market(self.pe_hedge, f"{tag}PEHEDGESELL")
+
+        if strategy_num == 1:
+            self.position1 = None
+            self.s1_done   = True
+        else:
+            self.position2 = None
+            self.s2_done   = True
 
     # ----------------------------------------------------------
-    def on_candle(self, candle, closed, live_premium=None):
-        """
-        closed=True  → bar has closed; run gate / entry / exit logic
-        closed=False → bar still forming; only check live SL
-        live_premium → current combined premium for live SL check
-        """
-        now = datetime.datetime.now()
+    # STRATEGY 1 — EMA Compression Sell
+    # ----------------------------------------------------------
+    @staticmethod
+    def _s1_case_threshold(premium):
+        if premium > 200:
+            return 1, 0.9
+        elif premium > 100:
+            return 2, 0.8
+        else:
+            return 3, 0.7
 
-        # ---- EOD force-exit (live tick level) ----
-        if self.position and now.time() >= TRADING_END:
-            self._exit_trade("EOD 3:00 PM force-exit")
+    def _run_s1(self, candle, ema5, ema20, t):
+        if self.s1_done or self.position1:
+            return
+        if t >= ENTRY_CUTOFF:
             return
 
-        # ---- Live SL check (tick-level) ----
-        if self.position and live_premium is not None:
-            if live_premium >= self.position["sl_premium"]:
-                self._exit_trade(
-                    f"SL HIT (live premium {live_premium:.2f} "
-                    f">= sl {self.position['sl_premium']:.2f})"
+        cn, thr = self._s1_case_threshold(candle["close"])
+        if ema5 > thr * ema20:
+            return
+
+        is_red = candle["close"] < candle["open"]
+        if is_red and candle["open"] > ema5 and candle["close"] < ema5:
+            self._enter_trade(1, candle, ema5, ema20, note=f"Case {cn} | EMA5≤{int(thr*100)}%×EMA20")
+
+    # ----------------------------------------------------------
+    # STRATEGY 2 — Opening-Gap Rejection Sell
+    # ----------------------------------------------------------
+    def _run_s2_phases(self, candle, ema5, ema20, t):
+        """Advance Strategy 2 state machine on a closed candle."""
+        if self.s2_done or self.s2_phase == -1:
+            return
+
+        is_first = (
+            candle["time"].date() == datetime.date.today() and
+            candle["time"].hour  == 9 and
+            candle["time"].minute == 15
+        )
+
+        # ── Phase 0: first 3-min candle of the day ──
+        if self.s2_phase == 0:
+            if is_first:
+                is_red      = candle["close"] < candle["open"]
+                below_both  = candle["close"] < ema5 and candle["close"] < ema20
+                ema_bearish = ema5 < ema20
+                if is_red and below_both and ema_bearish:
+                    self.s2_phase = 1
+                    logger.info(
+                        f"[S2] P0→P1: first candle red, close={candle['close']:.2f} "
+                        f"< EMA5={ema5:.2f} & EMA20={ema20:.2f}, EMA5<EMA20"
+                    )
+                else:
+                    self.s2_phase = -1
+                    reasons = []
+                    if not is_red:       reasons.append("not red")
+                    if not below_both:   reasons.append("close not below both EMAs")
+                    if not ema_bearish:  reasons.append("EMA5 not < EMA20")
+                    logger.info(f"[S2] P0→N/A: first candle failed ({', '.join(reasons)})")
+            elif candle["time"].date() == datetime.date.today():
+                # First candle of today was missed — invalidate
+                self.s2_phase = -1
+                logger.info("[S2] P0→N/A: 9:15 candle not seen, invalidating")
+            return
+
+        # ── Phase 1: wait for recovery (any candle closes above EMA20) ──
+        if self.s2_phase == 1:
+            if candle["close"] > ema20:
+                self.s2_phase = 2
+                logger.info(
+                    f"[S2] P1→P2: recovery at {candle['time']}, "
+                    f"close={candle['close']:.2f} > EMA20={ema20:.2f}"
                 )
+            return
+
+        # ── Phase 2: wait for rejection red candle below both EMAs ──
+        if self.s2_phase == 2:
+            is_red     = candle["close"] < candle["open"]
+            below_both = candle["close"] < ema5 and candle["close"] < ema20
+            if is_red and below_both:
+                self.s2_phase = 3
+                self.s2_count = 0
+                logger.info(
+                    f"[S2] P2→P3: rejection red candle at {candle['time']}, "
+                    f"close={candle['close']:.2f}"
+                )
+            return
+
+        # ── Phase 3: count candles closing below both EMAs (need ≥2) ──
+        if self.s2_phase == 3:
+            if candle["close"] < ema5 and candle["close"] < ema20:
+                self.s2_count += 1
+                logger.info(
+                    f"[S2] P3: count={self.s2_count} at {candle['time']}, "
+                    f"close={candle['close']:.2f}"
+                )
+                if self.s2_count >= 2:
+                    self.s2_phase = 4
+                    logger.info(f"[S2] P3→P4: 2 candles confirmed, awaiting entry signal")
+            return
+
+        # ── Phase 4: wait for entry signal candle ──
+        if self.s2_phase == 4:
+            if self.position2 or t >= ENTRY_CUTOFF:
                 return
+            is_red         = candle["close"] < candle["open"]
+            opens_above_e5 = candle["open"]  > ema5
+            below_both     = candle["close"] < ema5 and candle["close"] < ema20
+            compressed     = ema5 <= ema20
+            if is_red and opens_above_e5 and below_both and compressed:
+                self._enter_trade(
+                    2, candle, ema5, ema20,
+                    note=f"EMA5={ema5:.2f} ≤ EMA20={ema20:.2f}"
+                )
+
+    # ----------------------------------------------------------
+    # MAIN CANDLE HANDLER
+    # ----------------------------------------------------------
+    def on_candle(self, candle, closed, live_premium=None):
+        now = datetime.datetime.now()
+
+        # ── EOD force-exit (tick-level) ──
+        if now.time() >= TRADING_END:
+            if self.position1:
+                self._exit_trade(1, "EOD 3:00 PM force-exit")
+            if self.position2:
+                self._exit_trade(2, "EOD 3:00 PM force-exit")
+            return
+
+        # ── Live SL check (tick-level, both strategies) ──
+        if live_premium is not None:
+            if self.position1 and live_premium >= self.position1["sl_premium"]:
+                self._exit_trade(
+                    1,
+                    f"SL HIT — live premium {live_premium:.2f} "
+                    f">= sl {self.position1['sl_premium']:.2f}"
+                )
+            if self.position2 and live_premium >= self.position2["sl_premium"]:
+                self._exit_trade(
+                    2,
+                    f"SL HIT — live premium {live_premium:.2f} "
+                    f">= sl {self.position2['sl_premium']:.2f}"
+                )
 
         if not closed:
             return
 
-        # ---- From here: closed candles only ----
-        if self.disabled_for_day:
-            return
-
+        # ── Closed candle: add to history ──
         self.candles.append(candle)
 
         if len(self.candles) < MIN_BARS_FOR_EMA:
             return
 
-        ema5, ema20 = self.get_emas()
+        ema5, ema20 = self._get_emas()
         if ema5 is None or ema20 is None:
             return
 
-        # EMA log (once per closed candle)
-        if candle["time"] != self.last_logged_ema_time:
-            logger.info(
-                f"[EMA] {candle['time']} | "
-                f"close={candle['close']:.2f} | "
-                f"EMA5={ema5:.2f} EMA20={ema20:.2f} GAP={ema20 - ema5:.2f}"
-            )
-            self.last_logged_ema_time = candle["time"]
-
-        # ---- 9:15 GATE CHECK ----
-        # The 9:15 candle (9:15–9:20 bar) is fed explicitly from history
-        # at 9:20 AM before the websocket starts. So gate is always checked
-        # on the correct candle before any live ticks arrive.
-        if not self.gate_checked:
-            c_time = candle["time"]
-            if c_time.hour == 9 and c_time.minute == 15:
-                self._check_915_gate(candle, ema20)
-                return   # Don't attempt entry on the gate candle itself
-
-            # Safety net: if we see a candle after 9:20 and gate was never checked
-            if c_time.hour > 9 or (c_time.hour == 9 and c_time.minute > 20):
-                logger.warning("[GATE] 9:15 candle never fed — disabling for day.")
-                send_telegram("⚠️ 9:15 candle not observed — no trades today.")
-                self.gate_checked     = True
-                self.gate_passed      = False
-                self.disabled_for_day = True
-            return
-
-        if not self.gate_passed:
-            return   # Gate failed earlier; already disabled
-
-        # ---- EXIT condition 2: two consecutive green candles above EMA20 ----
-        if self.position:
-            if candle["close"] > candle["open"] and candle["close"] > ema20:
-                self.consecutive_green_above_ema += 1
-                logger.info(
-                    f"[GREEN ABOVE EMA20] Count={self.consecutive_green_above_ema} "
-                    f"close={candle['close']:.2f} EMA20={ema20:.2f}"
-                )
-                if self.consecutive_green_above_ema >= 2:
-                    self._exit_trade("2 consecutive green candles closed above EMA20")
-                    return
-            else:
-                self.consecutive_green_above_ema = 0
-
-        # ---- ENTRY LOGIC ----
-        if self.position:
-            return   # Already in trade; one entry per day only
-
-        # Entry window: only before 10:00 AM
-        if candle["time"].time() >= ENTRY_CUTOFF:
-            logger.info(
-                f"[ENTRY SKIPPED] After 10:00 AM cutoff — "
-                f"candle time {candle['time']}, no more entries today."
-            )
-            send_telegram("⏰ 10:00 AM cutoff reached — no entry taken today.")
-            self.disabled_for_day = True
-            return
-
-        # Entry candle must be RED
-        is_red = candle["close"] < candle["open"]
-        if not is_red:
-            return
-
-        # Entry candle must close BELOW the low of the 9:15 candle
-        if candle["close"] >= self.straddle_920_low:
-            logger.info(
-                f"[ENTRY SCAN] Red candle at {candle['time']} but "
-                f"close={candle['close']:.2f} >= 915_low={self.straddle_920_low:.2f} "
-                f"— not below 9:15 low, skipping."
-            )
-            return
-
-        # All conditions met → enter
         logger.info(
-            f"[ENTRY SIGNAL] Red candle close {candle['close']:.2f} "
-            f"< 9:15 low {self.straddle_920_low:.2f} at {candle['time']}"
+            f"[CANDLE] {candle['time']} "
+            f"O={candle['open']:.2f} H={candle['high']:.2f} "
+            f"L={candle['low']:.2f} C={candle['close']:.2f} "
+            f"EMA5={ema5:.2f} EMA20={ema20:.2f} "
+            f"S2-phase={self.s2_phase}({'N/A' if self.s2_phase == -1 else self.s2_count if self.s2_phase == 3 else ''})"
         )
-        self._enter_trade(candle, ema5, ema20)
+
+        t = candle["time"].time()
+
+        # Candle-level 3PM exit (belt-and-suspenders alongside tick-level check)
+        if t >= TRADING_END:
+            if self.position1:
+                self._exit_trade(1, "EOD 3:00 PM (candle-level)")
+            if self.position2:
+                self._exit_trade(2, "EOD 3:00 PM (candle-level)")
+            return
+
+        # ── Strategy 2 phase transitions ──
+        self._run_s2_phases(candle, ema5, ema20, t)
+
+        # ── Strategy 1 entry check ──
+        self._run_s1(candle, ema5, ema20, t)
 
 
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("[BOOT] NIFTY STRANGLE EMA STRATEGY STARTED (REVISED v3)")
-    send_telegram("🚀 NIFTY STRANGLE EMA STRATEGY STARTED (REVISED v3)")
+    logger.info("[BOOT] NIFTY STRADDLE LIVE STRATEGY STARTED")
+    send_telegram("🚀 NIFTY STRADDLE LIVE STRATEGY STARTED")
 
     fyers = FyersClient()
 
-    # Wait until ATM decision time (9:20 AM)
+    # ── Step 1: Wait until 9:30 AM (first 15-min candle closes) ──
+    logger.info(f"[WAIT] Waiting until {ATM_DECISION_TIME} for 15-min candle to close...")
     while datetime.datetime.now().time() < ATM_DECISION_TIME:
         time.sleep(1)
 
-    # Step 1: Get symbols — spot price fetched at 9:20 AM
-    ce, pe, ce_hedge, pe_hedge, atm = get_nifty_strangle_symbols(fyers.client)
+    # ── Step 2: Determine ATM from 15-min candle close ──
+    atm = get_atm_from_15min_candle(fyers.client)
+
+    # ── Step 3: Build symbols ──
+    ce, pe, ce_hedge, pe_hedge = build_straddle_symbols(atm)
     engine = StrategyEngine(fyers, ce, pe, ce_hedge, pe_hedge)
 
-    # Step 2: Prefill historical candles for EMA warm-up
-    hist = fetch_historical_premium(fyers, ce, pe)
+    # ── Step 4: Prefill historical 3-min candles ──
+    hist  = fetch_historical_premium(fyers.client, ce, pe)
     today = datetime.date.today()
 
-    # Load only previous days' candles for EMA seed
+    # Previous days → seed EMA deque only (don't run strategy logic)
     for c in hist:
         if c["time"].date() < today:
             engine.candles.append(c)
 
-    # EMA boot log
+    # Log EMA state after prefill
     if len(engine.candles) >= MIN_BARS_FOR_EMA:
-        ema5, ema20 = engine.get_emas()
-        if ema5 and ema20:
-            logger.info(
-                f"[EMA BOOT] EMA5={ema5:.2f} EMA20={ema20:.2f} GAP={ema20 - ema5:.2f}"
-            )
+        e5, e20 = engine._get_emas()
+        if e5 and e20:
+            logger.info(f"[EMA BOOT] EMA5={e5:.2f} EMA20={e20:.2f} GAP={e20 - e5:.2f}")
             send_telegram(
-                f"📊 EMA READY (BOOT)\n"
-                f"EMA5={ema5:.2f}\n"
-                f"EMA20={ema20:.2f}\n"
-                f"GAP={ema20 - ema5:.2f}"
+                f"📊 EMA READY\nEMA5={e5:.2f}\nEMA20={e20:.2f}\nGAP={e20 - e5:.2f}"
             )
 
-    # Step 3: Find today's 9:15 candle from history and feed as gate candle
-    candle_915 = None
+    # ── Step 5: Feed today's historical candles (9:15–9:30) through engine ──
+    # This triggers S2 phase 0 check on the 9:15 candle and warms today's EMA.
     for c in hist:
-        if (c["time"].date() == today and
-                c["time"].hour == 9 and c["time"].minute == 15):
-            candle_915 = c
-            break
+        if c["time"].date() == today:
+            engine.on_candle(c, closed=True)
 
-    if candle_915:
-        logger.info(
-            f"[9:15 CANDLE] O={candle_915['open']:.2f} H={candle_915['high']:.2f} "
-            f"L={candle_915['low']:.2f} C={candle_915['close']:.2f}"
-        )
-        send_telegram(
-            f"📊 9:15 CANDLE (CE+PE combined)\n"
-            f"O={candle_915['open']:.2f} H={candle_915['high']:.2f} "
-            f"L={candle_915['low']:.2f} C={candle_915['close']:.2f}"
-        )
-        # Feed as closed candle — this triggers the gate check
-        engine.on_candle(candle_915, closed=True)
-    else:
-        logger.warning("[9:15 CANDLE] Not found in history — disabling for day.")
-        send_telegram("⚠️ 9:15 candle not found in history — no trades today.")
-        engine.disabled_for_day = True
-
-    # ========= WEBSOCKET =========
-    last   = {}      # latest LTP per symbol
-    candle = None    # current forming candle (combined premium)
+    # ── Step 6: Websocket for live ticks ──
+    last   = {}     # latest LTP per symbol
+    candle = None   # current forming 3-min candle (combined premium)
 
     SUBSCRIBED_SYMBOLS = [ce, pe]
 
@@ -618,37 +623,37 @@ if __name__ == "__main__":
         if ce not in last or pe not in last:
             return
 
-        now = datetime.datetime.now()
+        now     = datetime.datetime.now()
+        premium = last[ce] + last[pe]
 
-        # Feed EOD exit at tick level too (belt-and-suspenders)
+        # EOD: pass live premium for tick-level exit
         if now.time() >= TRADING_END:
-            if engine.position:
-                engine.on_candle(candle or {}, closed=False, live_premium=last[ce] + last[pe])
+            engine.on_candle(candle or {}, closed=False, live_premium=premium)
             return
 
-        premium = last[ce] + last[pe]
-        epoch   = extract_tick_epoch(msg)
-        dt      = datetime.datetime.fromtimestamp(epoch)
-        bucket  = dt.replace(second=0, microsecond=0, minute=(dt.minute // 5) * 5)
+        epoch  = extract_tick_epoch(msg)
+        dt     = datetime.datetime.fromtimestamp(epoch)
+        # 3-minute bucket: round minute down to nearest 3
+        bucket = dt.replace(second=0, microsecond=0, minute=(dt.minute // 3) * 3)
 
         if candle is None or candle["time"] != bucket:
             if candle:
-                # Candle just closed — pass it with closed=True
+                # Previous candle just closed
                 engine.on_candle(candle, closed=True, live_premium=None)
-            # Start new candle
+            # Open new candle
             candle = {
                 "time":  bucket,
                 "open":  premium,
                 "high":  premium,
                 "low":   premium,
-                "close": premium
+                "close": premium,
             }
         else:
             candle["high"]  = max(candle["high"], premium)
-            candle["low"]   = min(candle["low"], premium)
+            candle["low"]   = min(candle["low"],  premium)
             candle["close"] = premium
 
-        # Live tick — pass live premium for SL check only
+        # Live tick: SL check only
         engine.on_candle(candle, closed=False, live_premium=premium)
 
     def on_open():
