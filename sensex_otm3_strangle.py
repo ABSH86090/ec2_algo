@@ -36,7 +36,7 @@ STRIKE_STEP   = 100    # SENSEX option strike interval
 OTM_DISTANCE  = 3      # OTM3 = 3 strikes away from ATM
 
 ENTRY_TIME     = datetime.time(9, 16, 0)
-HARD_EXIT_TIME = datetime.time(15, 25, 0)
+HARD_EXIT_TIME = datetime.time(15, 9, 0)
 LOG_FILE       = "otm3_strangle.log"
 
 # Add known market holidays here
