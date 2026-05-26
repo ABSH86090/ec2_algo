@@ -221,13 +221,13 @@ class TradeManager:
         pe_ltp = self.fyers.get_ltp(pe_sym)
 
         # Sell CE
-        ce_resp = self.fyers.sell_mkt(ce_sym, QTY, "OTM3_CE_SELL")
+        ce_resp = self.fyers.sell_mkt(ce_sym, QTY, "OTM3CESELL")
         if not ce_resp or ce_resp.get("s") != "ok":
             send_telegram(f"❌ CE SELL FAILED: {ce_resp}")
             return
 
         # Sell PE (roll back CE if this fails)
-        pe_resp = self.fyers.sell_mkt(pe_sym, QTY, "OTM3_PE_SELL")
+        pe_resp = self.fyers.sell_mkt(pe_sym, QTY, "OTM3PESELL")
         if not pe_resp or pe_resp.get("s") != "ok":
             send_telegram(f"❌ PE SELL FAILED — rolling back CE: {pe_resp}")
             self.fyers.buy_mkt(ce_sym, QTY, "CE_ROLLBACK")
@@ -237,8 +237,8 @@ class TradeManager:
         ce_sl = round(ce_ltp * (1 + SL_PCT), 1)
         pe_sl = round(pe_ltp * (1 + SL_PCT), 1)
 
-        ce_sl_resp = self.fyers.place_sl_buy(ce_sym, QTY, ce_sl, "CE_SL")
-        pe_sl_resp = self.fyers.place_sl_buy(pe_sym, QTY, pe_sl, "PE_SL")
+        ce_sl_resp = self.fyers.place_sl_buy(ce_sym, QTY, ce_sl, "CESL")
+        pe_sl_resp = self.fyers.place_sl_buy(pe_sym, QTY, pe_sl, "PESL")
 
         now = datetime.datetime.now()
         self.legs = {
