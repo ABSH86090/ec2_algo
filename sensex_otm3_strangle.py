@@ -26,7 +26,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL  = "BSE:SENSEX-INDEX"
 LOT_SIZE      = 20
-LOTS          = 4
+LOTS          = 2
 QTY           = LOT_SIZE * LOTS
 
 SL_PCT           = 0.30   # 30% initial stop-loss above sell price
@@ -37,7 +37,7 @@ OTM_DISTANCE     = 3      # OTM3 = 3 strikes away from ATM
 COMBINED_SL_LIMIT = 5000  # exit all if combined MTM loss reaches this (₹)
 
 ENTRY_TIME     = datetime.time(9, 16, 0)
-HARD_EXIT_TIME = datetime.time(15, 10, 0)
+HARD_EXIT_TIME = datetime.time(15, 9, 0)
 LOG_FILE       = "otm3_strangle.log"
 
 # Add known market holidays here
