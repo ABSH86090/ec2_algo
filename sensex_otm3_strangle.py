@@ -1,10 +1,10 @@
 # =========================================================
 # SENSEX OTM3 SHORT STRANGLE WITH TRAILING SL
-# Entry  : 9:16 AM — Sell OTM3 CE + OTM3 PE
+# Entry  : 9:16 AM — Sell OTM3 CE + OTM3 PE (no trade on Thursdays)
 # SL     : 30% above sell price per leg (broker SL-L order)
 # Trail  : every 10 pts of favorable move → shift SL down 10 pts
 #          (cancel old SL order, place fresh SL order)
-# Exit   : SL hit per leg | 15:25 hard exit
+# Exit   : SL hit per leg | combined MTM loss ≥ ₹5000 | 15:25 hard exit
 # =========================================================
 
 import datetime
@@ -26,17 +26,18 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL  = "BSE:SENSEX-INDEX"
 LOT_SIZE      = 20
-LOTS          = 1
+LOTS          = 4
 QTY           = LOT_SIZE * LOTS
 
-SL_PCT        = 0.30   # 30% initial stop-loss above sell price
-TRAIL_TRIGGER = 10     # pts of favorable move required to trigger trail
-TRAIL_STEP    = 10     # pts to move SL down on each trail
-STRIKE_STEP   = 100    # SENSEX option strike interval
-OTM_DISTANCE  = 3      # OTM3 = 3 strikes away from ATM
+SL_PCT           = 0.30   # 30% initial stop-loss above sell price
+TRAIL_TRIGGER    = 10     # pts of favorable move required to trigger trail
+TRAIL_STEP       = 10     # pts to move SL down on each trail
+STRIKE_STEP      = 100    # SENSEX option strike interval
+OTM_DISTANCE     = 3      # OTM3 = 3 strikes away from ATM
+COMBINED_SL_LIMIT = 5000  # exit all if combined MTM loss reaches this (₹)
 
 ENTRY_TIME     = datetime.time(9, 16, 0)
-HARD_EXIT_TIME = datetime.time(15, 9, 0)
+HARD_EXIT_TIME = datetime.time(15, 10, 0)
 LOG_FILE       = "otm3_strangle.log"
 
 # Add known market holidays here
@@ -182,6 +183,7 @@ class TradeManager:
         sl_price     – current SL trigger price (rises with losses, trails down with wins)
         sl_order_id  – active broker SL order ID
         trail_ref    – price level from which next 10-pt trail is measured
+        current_ltp  – latest known LTP (used for combined MTM calculation)
         active       – False once the leg is closed
         last_sl_chk  – datetime of last orderbook status poll (throttle)
     """
@@ -196,6 +198,10 @@ class TradeManager:
     # ---- Entry --------------------------------------------------------
     def enter(self, index_ltp):
         if self.entry_done or self.trade_date == datetime.date.today():
+            return
+
+        if datetime.date.today().weekday() == 3:   # 3 = Thursday
+            send_telegram("⏭️ No trade today — Thursday (expiry day). Skipping.")
             return
 
         ce_sym, pe_sym = build_otm3_symbols(index_ltp)
@@ -232,6 +238,7 @@ class TradeManager:
                 "sl_price":    ce_sl,
                 "sl_order_id": (ce_sl_resp or {}).get("id", ""),
                 "trail_ref":   ce_ltp,   # trail measured from entry price
+                "current_ltp": ce_ltp,
                 "active":      True,
                 "last_sl_chk": now,
             },
@@ -241,6 +248,7 @@ class TradeManager:
                 "sl_price":    pe_sl,
                 "sl_order_id": (pe_sl_resp or {}).get("id", ""),
                 "trail_ref":   pe_ltp,
+                "current_ltp": pe_ltp,
                 "active":      True,
                 "last_sl_chk": now,
             },
@@ -262,10 +270,27 @@ class TradeManager:
     def on_option_tick(self, symbol, current_ltp):
         for leg_name, leg in self.legs.items():
             if leg["symbol"] == symbol and leg["active"]:
+                leg["current_ltp"] = current_ltp
                 self._detect_sl_fill(leg_name, leg, current_ltp)
                 if leg["active"]:
                     self._trail(leg_name, leg, current_ltp)
                 break
+
+        self._check_combined_loss()
+
+    def _check_combined_loss(self):
+        """Exit all if total MTM loss across active legs reaches COMBINED_SL_LIMIT."""
+        combined_loss = sum(
+            (leg["current_ltp"] - leg["entry_price"]) * QTY
+            for leg in self.legs.values()
+            if leg["active"]
+        )
+        if combined_loss >= COMBINED_SL_LIMIT:
+            send_telegram(
+                f"🚨 COMBINED SL HIT: MTM loss = ₹{combined_loss:.0f} "
+                f"(limit ₹{COMBINED_SL_LIMIT}) — exiting all legs."
+            )
+            self.exit_all("COMBINED_SL")
 
     def _detect_sl_fill(self, leg_name, leg, current_ltp):
         """
