@@ -380,9 +380,9 @@ class StrategyEngine:
         if premium > 200:
             return 1, 0.9
         elif premium > 100:
-            return 2, 0.8
+            return 2, 0.9
         else:
-            return 3, 0.7
+            return 3, 0.9
 
     def _run_s1(self, candle, ema5, ema20, t):
         if self.s1_done or self.position1:
