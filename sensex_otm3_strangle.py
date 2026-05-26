@@ -230,7 +230,7 @@ class TradeManager:
         pe_resp = self.fyers.sell_mkt(pe_sym, QTY, "OTM3PESELL")
         if not pe_resp or pe_resp.get("s") != "ok":
             send_telegram(f"❌ PE SELL FAILED — rolling back CE: {pe_resp}")
-            self.fyers.buy_mkt(ce_sym, QTY, "CE_ROLLBACK")
+            self.fyers.buy_mkt(ce_sym, QTY, "CEROLLBACK")
             return
 
         # SL = 30% above sell price
@@ -358,7 +358,7 @@ class TradeManager:
 
         # Place new (lower) SL order
         resp = self.fyers.place_sl_buy(
-            leg["symbol"], QTY, leg["sl_price"], f"{leg_name}_SL_TRAIL"
+            leg["symbol"], QTY, leg["sl_price"], f"{leg_name}SLTRAIL"
         )
         leg["sl_order_id"] = (resp or {}).get("id", "")
 
@@ -377,7 +377,7 @@ class TradeManager:
                 continue
             if leg["sl_order_id"]:
                 self.fyers.cancel_order(leg["sl_order_id"])
-            self.fyers.buy_mkt(leg["symbol"], QTY, f"EXIT_{reason}_{leg_name}")
+            self.fyers.buy_mkt(leg["symbol"], QTY, f"EXIT{reason}{leg_name}")
             leg["active"] = False
             send_telegram(f"🏁 {leg_name} CLOSED ({reason})")
         self.all_exited = True
