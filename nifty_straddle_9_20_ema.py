@@ -14,7 +14,7 @@ Two strategies run independently; each places and manages its own trade.
 ━━━ STRATEGY 2 — Opening-Gap Rejection Sell ━━━
   Sequential (must occur in order):
   1. First 3-min candle (9:15): red, close < EMA5 & EMA20, EMA5 < EMA20
-  2. Any later candle closes above EMA20  (recovery)
+  2. Any later candle: close > EMA5 & EMA20, and EMA5 > EMA20  (recovery)
   3. Red candle closes below BOTH EMA5 & EMA20  (rejection)
   4. ≥2 candles close below BOTH EMA5 & EMA20
   5. Signal: red candle opens above EMA5, closes below BOTH, EMA5 ≤ EMA20
@@ -22,8 +22,9 @@ Two strategies run independently; each places and manages its own trade.
 Trade (both strategies):
   Order sequence on ENTRY : buy CE hedge → buy PE hedge → sell CE → sell PE
   Order sequence on EXIT  : buy CE → buy PE → sell CE hedge → sell PE hedge
-  SL   : entry_premium + 15 pts (checked on every live tick)
-  Exit : 3:00 PM force-exit if SL not hit
+  SL        : entry_premium + 15 pts (checked on every live tick)
+  Cost-lock : if live premium drops 20 pts from entry, SL is moved to entry (breakeven)
+  Exit      : 3:00 PM force-exit if SL not hit
 """
 
 import datetime
@@ -61,6 +62,7 @@ EMA_SLOW         = 20
 MIN_BARS_FOR_EMA = 25
 
 SL_POINTS        = 15            # Combined CE+PE premium SL offset
+COST_LOCK_PTS    = 20            # Profit pts to trigger SL move to entry (breakeven)
 
 LOG_FILE = "nifty_straddle_live.log"
 
@@ -284,7 +286,12 @@ class StrategyEngine:
 
     on_candle() is called:
       - closed=True  : bar just closed; run all phase/entry logic
-      - closed=False : bar forming; only check live SL and EOD exit
+      - closed=False : bar forming; only check live SL / cost-lock / EOD exit
+
+    Position dict keys:
+      entry_premium  : combined premium at entry
+      sl_premium     : current SL level (entry + SL_POINTS, then moves to entry on cost-lock)
+      cost_locked    : True once SL has been moved to breakeven
     """
 
     def __init__(self, fyers, ce, pe, ce_hedge, pe_hedge):
@@ -297,7 +304,7 @@ class StrategyEngine:
         self.candles = deque(maxlen=2000)
 
         # ── Strategy 1 state ──
-        self.position1 = None   # dict(entry_premium, sl_premium) when in trade
+        self.position1 = None   # dict when in trade, None otherwise
         self.s1_done   = False  # True after S1 trade completes (one trade per day)
 
         # ── Strategy 2 state ──
@@ -334,11 +341,14 @@ class StrategyEngine:
 
         logger.info(
             f"[S{strategy_num} ENTRY] entry={entry:.2f} sl={sl:.2f} "
+            f"cost_lock_at={entry - COST_LOCK_PTS:.2f} "
             f"EMA5={ema5:.2f} EMA20={ema20:.2f} time={candle['time']} {note}"
         )
         send_telegram(
             f"📉 STRATEGY {strategy_num} ENTRY\n"
-            f"Premium = {entry:.2f}  SL = {sl:.2f}  (+{SL_POINTS} pts)\n"
+            f"Premium  = {entry:.2f}\n"
+            f"SL       = {sl:.2f}  (+{SL_POINTS} pts)\n"
+            f"CostLock = {entry - COST_LOCK_PTS:.2f}  (SL→cost if premium hits this)\n"
             f"EMA5={ema5:.2f} | EMA20={ema20:.2f}\n"
             f"Time: {candle['time']}"
             + (f"\n{note}" if note else "")
@@ -349,7 +359,11 @@ class StrategyEngine:
         self.fyers.sell_market(self.ce,      f"{tag}SELLCE")
         self.fyers.sell_market(self.pe,      f"{tag}SELLPE")
 
-        position = {"entry_premium": entry, "sl_premium": sl}
+        position = {
+            "entry_premium": entry,
+            "sl_premium":    sl,
+            "cost_locked":   False,   # becomes True once cost-lock triggers
+        }
         if strategy_num == 1:
             self.position1 = position
         else:
@@ -360,8 +374,8 @@ class StrategyEngine:
         send_telegram(f"🛑 STRATEGY {strategy_num} EXIT\nReason: {reason}")
 
         tag = f"S{strategy_num}"
-        self.fyers.buy_market(self.ce,       f"{tag}BUYCE")
-        self.fyers.buy_market(self.pe,       f"{tag}BUYPE")
+        self.fyers.buy_market(self.ce,        f"{tag}BUYCE")
+        self.fyers.buy_market(self.pe,        f"{tag}BUYPE")
         self.fyers.sell_market(self.ce_hedge, f"{tag}CEHEDGESELL")
         self.fyers.sell_market(self.pe_hedge, f"{tag}PEHEDGESELL")
 
@@ -371,6 +385,32 @@ class StrategyEngine:
         else:
             self.position2 = None
             self.s2_done   = True
+
+    # ----------------------------------------------------------
+    # COST-LOCK: move SL to breakeven once 20 pts in profit
+    # ----------------------------------------------------------
+    def _check_cost_lock(self, strategy_num, position, live_premium):
+        """
+        If premium has dropped COST_LOCK_PTS from entry (market moved in our favour)
+        and cost-lock has not fired yet, move sl_premium to entry_premium (breakeven).
+        Called on every live tick while position is open.
+        """
+        if position["cost_locked"]:
+            return
+        if live_premium <= position["entry_premium"] - COST_LOCK_PTS:
+            position["sl_premium"]  = position["entry_premium"]
+            position["cost_locked"] = True
+            logger.info(
+                f"[S{strategy_num} COST LOCK] "
+                f"Premium {live_premium:.2f} dropped {COST_LOCK_PTS} pts from entry "
+                f"{position['entry_premium']:.2f} — SL moved to entry (breakeven)"
+            )
+            send_telegram(
+                f"🔒 STRATEGY {strategy_num} — SL MOVED TO COST\n"
+                f"Live premium : {live_premium:.2f}\n"
+                f"Entry        : {position['entry_premium']:.2f}\n"
+                f"New SL       : {position['entry_premium']:.2f}  (breakeven)"
+            )
 
     # ----------------------------------------------------------
     # STRATEGY 1 — EMA Compression Sell
@@ -408,7 +448,7 @@ class StrategyEngine:
 
         is_first = (
             candle["time"].date() == datetime.date.today() and
-            candle["time"].hour  == 9 and
+            candle["time"].hour   == 9 and
             candle["time"].minute == 15
         )
 
@@ -432,18 +472,25 @@ class StrategyEngine:
                     if not ema_bearish:  reasons.append("EMA5 not < EMA20")
                     logger.info(f"[S2] P0→N/A: first candle failed ({', '.join(reasons)})")
             elif candle["time"].date() == datetime.date.today():
-                # First candle of today was missed — invalidate
+                # 9:15 candle was missed — invalidate
                 self.s2_phase = -1
                 logger.info("[S2] P0→N/A: 9:15 candle not seen, invalidating")
             return
 
-        # ── Phase 1: wait for recovery (any candle closes above EMA20) ──
+        # ── Phase 1: wait for green candle closing above BOTH EMA5 & EMA20,
+        #             with EMA5 also above EMA20  (true recovery confirmation) ──
         if self.s2_phase == 1:
-            if candle["close"] > ema20:
+            recovery = (
+                candle["close"] > ema5 and   # close above EMA5
+                candle["close"] > ema20 and  # close above EMA20
+                ema5 > ema20                 # EMA5 crossed above EMA20
+            )
+            if recovery:
                 self.s2_phase = 2
                 logger.info(
                     f"[S2] P1→P2: recovery at {candle['time']}, "
-                    f"close={candle['close']:.2f} > EMA20={ema20:.2f}"
+                    f"close={candle['close']:.2f} > EMA5={ema5:.2f} & EMA20={ema20:.2f}, "
+                    f"EMA5 > EMA20"
                 )
             return
 
@@ -470,7 +517,7 @@ class StrategyEngine:
                 )
                 if self.s2_count >= 2:
                     self.s2_phase = 4
-                    logger.info(f"[S2] P3→P4: 2 candles confirmed, awaiting entry signal")
+                    logger.info("[S2] P3→P4: 2 candles confirmed, awaiting entry signal")
             return
 
         # ── Phase 4: wait for entry signal candle ──
@@ -501,19 +548,29 @@ class StrategyEngine:
                 self._exit_trade(2, "EOD 3:00 PM force-exit")
             return
 
-        # ── Live SL check (tick-level, both strategies) ──
+        # ── Live tick processing (SL check + cost-lock) ──
         if live_premium is not None:
+
+            # Cost-lock check first — may tighten SL before the SL check below
+            if self.position1:
+                self._check_cost_lock(1, self.position1, live_premium)
+            if self.position2:
+                self._check_cost_lock(2, self.position2, live_premium)
+
+            # SL check (uses potentially updated sl_premium after cost-lock)
             if self.position1 and live_premium >= self.position1["sl_premium"]:
                 self._exit_trade(
                     1,
                     f"SL HIT — live premium {live_premium:.2f} "
                     f">= sl {self.position1['sl_premium']:.2f}"
+                    + (" (cost-lock SL)" if self.position1 and self.position1.get("cost_locked") else "")
                 )
             if self.position2 and live_premium >= self.position2["sl_premium"]:
                 self._exit_trade(
                     2,
                     f"SL HIT — live premium {live_premium:.2f} "
                     f">= sl {self.position2['sl_premium']:.2f}"
+                    + (" (cost-lock SL)" if self.position2 and self.position2.get("cost_locked") else "")
                 )
 
         if not closed:
@@ -534,7 +591,8 @@ class StrategyEngine:
             f"O={candle['open']:.2f} H={candle['high']:.2f} "
             f"L={candle['low']:.2f} C={candle['close']:.2f} "
             f"EMA5={ema5:.2f} EMA20={ema20:.2f} "
-            f"S2-phase={self.s2_phase}({'N/A' if self.s2_phase == -1 else self.s2_count if self.s2_phase == 3 else ''})"
+            f"S2-phase={self.s2_phase}"
+            + (f"(count={self.s2_count})" if self.s2_phase == 3 else "")
         )
 
         t = candle["time"].time()
@@ -653,7 +711,7 @@ if __name__ == "__main__":
             candle["low"]   = min(candle["low"],  premium)
             candle["close"] = premium
 
-        # Live tick: SL check only
+        # Live tick: cost-lock + SL check
         engine.on_candle(candle, closed=False, live_premium=premium)
 
     def on_open():
