@@ -564,7 +564,7 @@ if __name__ == "__main__":
     pe_candle = None
 
     def on_tick(msg):
-        nonlocal ce_candle, pe_candle
+        global ce_candle, pe_candle
 
         if "symbol" not in msg or "ltp" not in msg:
             return
