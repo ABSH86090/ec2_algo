@@ -24,13 +24,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL  = "BSE:SENSEX-INDEX"
-LOT_SIZE      = 80
-QTY           = LOT_SIZE        # 1 lot per leg
+LOT_SIZE      = 20
+LOTS          = 4               # number of lots per leg
+QTY           = LOT_SIZE * LOTS # total qty per leg = 80
 
 SL_PCT        = 0.20            # 20% above sell price
 STRIKE_STEP   = 100             # SENSEX strike interval
 CE_OTM        = 2               # OTM2 for CE leg
 PE_OTM        = 3               # OTM3 for PE leg
+
+TICK_SIZE      = 0.05               # SENSEX option minimum price movement
 
 ENTRY_TIME     = datetime.time(9, 16, 0)
 HARD_EXIT_TIME = datetime.time(15, 10, 0)
@@ -38,17 +41,7 @@ LOG_FILE       = "sensex_dte0_asymmetric_strangle.log"
 
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 1, 26),
-    datetime.date(2026, 3, 3),
-    datetime.date(2026, 3, 26),
-    datetime.date(2026, 3, 31),
-    datetime.date(2026, 4, 14),
-    datetime.date(2026, 5, 1),
-    datetime.date(2026, 5, 28),
-    datetime.date(2026, 6, 26),
-    datetime.date(2026, 9, 14),
-    datetime.date(2026, 10, 2),
-    datetime.date(2026, 11, 24),
-    datetime.date(2026, 12, 25),
+    datetime.date(2026, 1, 15),
 }
 
 # ================= LOGGING =================
@@ -62,6 +55,11 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
+
+# ================= HELPERS =================
+def round_tick(price):
+    """Round price to the nearest valid SENSEX option tick (0.05)."""
+    return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
 # ================= TELEGRAM =================
 def send_telegram(msg):
@@ -109,16 +107,17 @@ class Fyers:
 
     def place_sl_buy(self, symbol, qty, trigger, tag):
         """SL-Limit BUY to cover a short when premium rises to `trigger`."""
-        limit = round(trigger * 1.05, 1)
+        stop  = round_tick(trigger)
+        limit = round_tick(trigger * 1.05)
         resp = self.client.place_order({
             "symbol": symbol, "qty": qty,
             "type": 4, "side": 1,
             "productType": "INTRADAY", "validity": "DAY",
-            "stopPrice": round(trigger, 1),
+            "stopPrice": stop,
             "limitPrice": limit,
             "orderTag": tag,
         })
-        logger.info(f"SL_BUY {symbol} trigger={trigger} limit={limit} → {resp}")
+        logger.info(f"SL_BUY {symbol} stop={stop} limit={limit} → {resp}")
         return resp
 
     def cancel_order(self, order_id):
@@ -221,9 +220,9 @@ class TradeManager:
             self.fyers.buy_mkt(ce_sym, QTY, "CEROLLBACK")
             return
 
-        # SL = 20% above sell price
-        ce_sl = round(ce_ltp * (1 + SL_PCT), 1)
-        pe_sl = round(pe_ltp * (1 + SL_PCT), 1)
+        # SL = 20% above sell price, rounded to nearest tick
+        ce_sl = round_tick(ce_ltp * (1 + SL_PCT))
+        pe_sl = round_tick(pe_ltp * (1 + SL_PCT))
 
         ce_sl_resp = self.fyers.place_sl_buy(ce_sym, QTY, ce_sl, "CESL")
         pe_sl_resp = self.fyers.place_sl_buy(pe_sym, QTY, pe_sl, "PESL")
