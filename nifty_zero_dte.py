@@ -29,7 +29,8 @@ ACCESS_TOKEN       = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE        = 260           # NIFTY lot size — verify with NSE before running
+LOT_SIZE        = 65           # NIFTY lot size — verify with NSE before running
+NUM_LOTS        = 4            # Number of lots to trade per leg
 STRIKE_STEP     = 50           # NIFTY strike spacing in points
 OTM2_CE_STRIKES = 2            # CE leg : ATM + 2×50 = ATM+100
 OTM3_PE_STRIKES = 3            # PE leg : ATM − 3×50 = ATM−150
@@ -37,7 +38,14 @@ OTM3_PE_STRIKES = 3            # PE leg : ATM − 3×50 = ATM−150
 ENTRY_TIME  = datetime.time(9, 16)
 TRADING_END = datetime.time(15, 10)   # 3:10 PM force-exit
 
+TICK_SIZE = 0.05               # NIFTY options minimum price movement
+
 LOG_FILE = "nifty_otm_strangle_dte0.log"
+
+
+def round_price(price):
+    """Round price to the nearest NIFTY options tick (0.05)."""
+    return round(round(price / TICK_SIZE) * TICK_SIZE, 2)
 
 # =========================================================
 # LOGGING
@@ -206,7 +214,7 @@ class FyersClient:
     def sell_market(self, symbol, tag):
         resp = self.client.place_order({
             "symbol":      symbol,
-            "qty":         LOT_SIZE,
+            "qty":         LOT_SIZE * NUM_LOTS,
             "type":        2,
             "side":        -1,
             "productType": "INTRADAY",
@@ -219,7 +227,7 @@ class FyersClient:
     def buy_market(self, symbol, tag):
         resp = self.client.place_order({
             "symbol":      symbol,
-            "qty":         LOT_SIZE,
+            "qty":         LOT_SIZE * NUM_LOTS,
             "type":        2,
             "side":        1,
             "productType": "INTRADAY",
@@ -258,8 +266,8 @@ class StrangleEngine:
     def enter_trade(self, ce_ltp, pe_ltp):
         self.ce_entry = ce_ltp
         self.pe_entry = pe_ltp
-        self.ce_sl    = round(ce_ltp * 2, 2)
-        self.pe_sl    = round(pe_ltp * 2, 2)
+        self.ce_sl    = round_price(ce_ltp * 2)
+        self.pe_sl    = round_price(pe_ltp * 2)
 
         logger.info(
             f"[ENTRY] CE entry≈{ce_ltp:.2f}  SL={self.ce_sl:.2f}  (+100%)"
