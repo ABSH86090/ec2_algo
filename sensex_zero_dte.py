@@ -38,7 +38,17 @@ LOG_FILE       = "sensex_dte0_asymmetric_strangle.log"
 
 SPECIAL_MARKET_HOLIDAYS = {
     datetime.date(2026, 1, 26),
-    datetime.date(2026, 1, 15),
+    datetime.date(2026, 3, 3),
+    datetime.date(2026, 3, 26),
+    datetime.date(2026, 3, 31),
+    datetime.date(2026, 4, 14),
+    datetime.date(2026, 5, 1),
+    datetime.date(2026, 5, 28),
+    datetime.date(2026, 6, 26),
+    datetime.date(2026, 9, 14),
+    datetime.date(2026, 10, 2),
+    datetime.date(2026, 11, 24),
+    datetime.date(2026, 12, 25),
 }
 
 # ================= LOGGING =================
