@@ -33,7 +33,7 @@ ACCESS_TOKEN       = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE        = 75           # NIFTY lot size — verify with NSE before running
+LOT_SIZE        = 65           # NIFTY lot size — verify with NSE before running
 NUM_LOTS        = 5            # Number of lots to trade per leg
 STRIKE_STEP     = 50           # NIFTY strike spacing in points
 OTM4_STRIKES    = 4            # Both legs: ATM ± 4×50 = ATM ± 200
