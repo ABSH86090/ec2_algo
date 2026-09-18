@@ -6,6 +6,17 @@ is a market holiday).
 
 Per-leg SL = 100% of each leg's individual entry price (legs exit independently).
 Force-exit at 3:10 PM for any remaining open positions.
+
+RE-ENTRY ON SL (NEW)
+---------------------
+When a leg's stop-loss is hit (not the EOD force-exit), that leg is allowed to
+re-enter EXACTLY ONCE for the day:
+  - New strike is recomputed from LIVE spot at the moment of re-entry, using
+    OTM4 (ATM +/- 4 strikes) for that leg.
+  - New SL for the re-entered leg = 50% above its fresh entry premium.
+  - Lot size for the re-entered leg is unchanged (still NUM_LOTS).
+  - If the re-entered leg itself hits SL, it exits for good — no further
+    re-entry (max 1 re-entry per leg per day).
 """
 
 import datetime
@@ -30,10 +41,16 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 LOT_SIZE        = 65           # NIFTY lot size — verify with NSE before running
-NUM_LOTS        = 4            # Number of lots to trade per leg
+NUM_LOTS        = 4            # Number of lots to trade per leg (also used on re-entry)
 STRIKE_STEP     = 50           # NIFTY strike spacing in points
-OTM2_CE_STRIKES = 2            # CE leg : ATM + 2×50 = ATM+100
-OTM3_PE_STRIKES = 3            # PE leg : ATM − 3×50 = ATM−150
+OTM2_CE_STRIKES = 2            # Original CE leg : ATM + 2×50 = ATM+100
+OTM3_PE_STRIKES = 3            # Original PE leg : ATM − 3×50 = ATM−150
+
+# ---- Re-entry-on-SL config ----
+REENTRY_ENABLED      = True    # master switch for the re-entry-on-SL feature
+REENTRY_OTM_STRIKES  = 4       # re-entered leg uses OTM4 (ATM +/- 4×50), recomputed from live spot
+REENTRY_SL_PCT       = 0.50    # re-entered leg's SL = entry * (1 + 0.50) = 50% above entry
+REENTRY_MAX_PER_LEG  = 1       # hard cap: at most one re-entry per leg, ever, per day
 
 ENTRY_TIME  = datetime.time(9, 16)
 TRADING_END = datetime.time(15, 10)   # 3:10 PM force-exit
@@ -176,6 +193,16 @@ def get_option_ltps(fyers_client, ce_sym, pe_sym):
     return ce_ltp, pe_ltp
 
 
+def get_single_ltp(fyers_client, symbol):
+    """Return LTP for a single symbol (used for re-entry pricing)."""
+    r = fyers_client.quotes({"symbols": symbol})
+    for item in r.get("d", []):
+        lp = item.get("v", {}).get("lp")
+        if lp is not None:
+            return float(lp)
+    raise RuntimeError(f"LTP fetch failed for {symbol}. Response: {r}")
+
+
 def build_strangle_symbols(atm):
     """Build OTM2 CE and OTM3 PE Fyers symbol strings for today's expiry."""
     expiry     = get_expiry_for_today()
@@ -243,10 +270,12 @@ class FyersClient:
 # =========================================================
 class StrangleEngine:
     """
-    Holds the short strangle position and manages per-leg SL.
+    Holds the short strangle position and manages per-leg SL, plus a single
+    allowed re-entry per leg when that leg's SL (not EOD) is hit.
 
     CE and PE are independent: either can hit SL while the other stays open.
-    SL for each leg = 100% of its entry LTP (i.e. price doubles → exit).
+    Original legs' SL = 100% of entry LTP.
+    Re-entered legs' SL = 50% of their own fresh entry LTP (REENTRY_SL_PCT).
     """
 
     def __init__(self, fyers, ce_sym, pe_sym):
@@ -256,17 +285,25 @@ class StrangleEngine:
 
         self.ce_entry = None
         self.pe_entry = None
-        self.ce_sl    = None    # ce_entry × 2
-        self.pe_sl    = None    # pe_entry × 2
+        self.ce_sl    = None    # ce_entry × 2  (or ×1.5 if this is a re-entered leg)
+        self.pe_sl    = None
 
         self.ce_open  = False
         self.pe_open  = False
+
+        # Re-entry bookkeeping
+        self.ce_reentry_count = 0
+        self.pe_reentry_count = 0
+
+        # Set by main() after the websocket is created, so the engine can
+        # subscribe to a newly-selected re-entry symbol on the fly.
+        self.subscribe_callback = None
 
     # ----------------------------------------------------------
     def enter_trade(self, ce_ltp, pe_ltp):
         self.ce_entry = ce_ltp
         self.pe_entry = pe_ltp
-        self.ce_sl    = round_price(ce_ltp * 2)
+        self.ce_sl    = round_price(ce_ltp * 2)   # 100% SL on original legs
         self.pe_sl    = round_price(pe_ltp * 2)
 
         logger.info(
@@ -291,7 +328,8 @@ class StrangleEngine:
         self.pe_open = True
 
     # ----------------------------------------------------------
-    def _exit_ce(self, reason):
+    def _exit_ce(self, reason, trigger):
+        """trigger: 'SL' or 'EOD' — re-entry is only attempted on 'SL'."""
         if not self.ce_open:
             return
         logger.info(f"[CE EXIT] {reason}")
@@ -299,7 +337,11 @@ class StrangleEngine:
         self.fyers.buy_market(self.ce_sym, "STRCEXIT")
         self.ce_open = False
 
-    def _exit_pe(self, reason):
+        if trigger == "SL":
+            self._reenter_ce()
+
+    def _exit_pe(self, reason, trigger):
+        """trigger: 'SL' or 'EOD' — re-entry is only attempted on 'SL'."""
         if not self.pe_open:
             return
         logger.info(f"[PE EXIT] {reason}")
@@ -307,9 +349,113 @@ class StrangleEngine:
         self.fyers.buy_market(self.pe_sym, "STRPEXIT")
         self.pe_open = False
 
+        if trigger == "SL":
+            self._reenter_pe()
+
     def exit_all(self, reason):
-        self._exit_ce(reason)
-        self._exit_pe(reason)
+        """EOD force-exit — never triggers re-entry."""
+        self._exit_ce(reason, trigger="EOD")
+        self._exit_pe(reason, trigger="EOD")
+
+    # ----------------------------------------------------------
+    def _reenter_ce(self):
+        if not REENTRY_ENABLED:
+            return
+        if self.ce_reentry_count >= REENTRY_MAX_PER_LEG:
+            logger.info("[CE REENTRY] Skipped — re-entry already used for this leg today.")
+            return
+        if datetime.datetime.now().time() >= TRADING_END:
+            logger.info("[CE REENTRY] Skipped — past EOD cutoff.")
+            return
+
+        try:
+            spot   = get_nifty_spot(self.fyers.client)
+            atm    = get_atm(spot)
+            expiry = get_expiry_for_today()
+            exp_str = format_expiry(expiry)
+            new_strike = atm + REENTRY_OTM_STRIKES * STRIKE_STEP
+            new_sym    = f"NSE:NIFTY{exp_str}{new_strike}CE"
+            new_ltp    = get_single_ltp(self.fyers.client, new_sym)
+        except Exception as e:
+            logger.error(f"[CE REENTRY] Aborted — could not price new leg: {e}")
+            send_telegram(f"⚠️ CE RE-ENTRY FAILED (pricing error): {e}")
+            return
+
+        new_sl = round_price(new_ltp * (1 + REENTRY_SL_PCT))
+
+        logger.info(
+            f"[CE REENTRY] spot={spot:.2f} ATM={atm} → new strike {new_strike} "
+            f"(OTM{REENTRY_OTM_STRIKES}) sym={new_sym} entry≈{new_ltp:.2f} SL={new_sl:.2f} "
+            f"(+{int(REENTRY_SL_PCT*100)}%)"
+        )
+        send_telegram(
+            f"🔁 CE RE-ENTRY  {datetime.datetime.now().strftime('%H:%M:%S')}\n"
+            f"Spot: {spot:.2f}  →  ATM: {atm}  →  OTM{REENTRY_OTM_STRIKES} strike: {new_strike}\n"
+            f"Symbol: {new_sym}\n"
+            f"Entry ≈ {new_ltp:.2f}  |  SL = {new_sl:.2f}  (+{int(REENTRY_SL_PCT*100)}%)\n"
+            f"Lots: {NUM_LOTS}  |  No further re-entry after this."
+        )
+
+        self.fyers.sell_market(new_sym, "STRCE_RE")
+
+        # Swap the leg onto the new symbol/entry/SL and re-subscribe the feed
+        self.ce_sym   = new_sym
+        self.ce_entry = new_ltp
+        self.ce_sl    = new_sl
+        self.ce_open  = True
+        self.ce_reentry_count += 1
+
+        if self.subscribe_callback:
+            self.subscribe_callback(new_sym)
+
+    def _reenter_pe(self):
+        if not REENTRY_ENABLED:
+            return
+        if self.pe_reentry_count >= REENTRY_MAX_PER_LEG:
+            logger.info("[PE REENTRY] Skipped — re-entry already used for this leg today.")
+            return
+        if datetime.datetime.now().time() >= TRADING_END:
+            logger.info("[PE REENTRY] Skipped — past EOD cutoff.")
+            return
+
+        try:
+            spot   = get_nifty_spot(self.fyers.client)
+            atm    = get_atm(spot)
+            expiry = get_expiry_for_today()
+            exp_str = format_expiry(expiry)
+            new_strike = atm - REENTRY_OTM_STRIKES * STRIKE_STEP
+            new_sym    = f"NSE:NIFTY{exp_str}{new_strike}PE"
+            new_ltp    = get_single_ltp(self.fyers.client, new_sym)
+        except Exception as e:
+            logger.error(f"[PE REENTRY] Aborted — could not price new leg: {e}")
+            send_telegram(f"⚠️ PE RE-ENTRY FAILED (pricing error): {e}")
+            return
+
+        new_sl = round_price(new_ltp * (1 + REENTRY_SL_PCT))
+
+        logger.info(
+            f"[PE REENTRY] spot={spot:.2f} ATM={atm} → new strike {new_strike} "
+            f"(OTM{REENTRY_OTM_STRIKES}) sym={new_sym} entry≈{new_ltp:.2f} SL={new_sl:.2f} "
+            f"(+{int(REENTRY_SL_PCT*100)}%)"
+        )
+        send_telegram(
+            f"🔁 PE RE-ENTRY  {datetime.datetime.now().strftime('%H:%M:%S')}\n"
+            f"Spot: {spot:.2f}  →  ATM: {atm}  →  OTM{REENTRY_OTM_STRIKES} strike: {new_strike}\n"
+            f"Symbol: {new_sym}\n"
+            f"Entry ≈ {new_ltp:.2f}  |  SL = {new_sl:.2f}  (+{int(REENTRY_SL_PCT*100)}%)\n"
+            f"Lots: {NUM_LOTS}  |  No further re-entry after this."
+        )
+
+        self.fyers.sell_market(new_sym, "STRPE_RE")
+
+        self.pe_sym   = new_sym
+        self.pe_entry = new_ltp
+        self.pe_sl    = new_sl
+        self.pe_open  = True
+        self.pe_reentry_count += 1
+
+        if self.subscribe_callback:
+            self.subscribe_callback(new_sym)
 
     # ----------------------------------------------------------
     def on_tick(self, ce_ltp=None, pe_ltp=None):
@@ -328,14 +474,16 @@ class StrangleEngine:
             if ce_ltp >= self.ce_sl:
                 self._exit_ce(
                     f"SL hit — CE live {ce_ltp:.2f} >= SL {self.ce_sl:.2f} "
-                    f"(entry {self.ce_entry:.2f})"
+                    f"(entry {self.ce_entry:.2f})",
+                    trigger="SL",
                 )
 
         if pe_ltp is not None and self.pe_open:
             if pe_ltp >= self.pe_sl:
                 self._exit_pe(
                     f"SL hit — PE live {pe_ltp:.2f} >= SL {self.pe_sl:.2f} "
-                    f"(entry {self.pe_entry:.2f})"
+                    f"(entry {self.pe_entry:.2f})",
+                    trigger="SL",
                 )
 
     @property
@@ -396,20 +544,21 @@ if __name__ == "__main__":
     engine = StrangleEngine(fyers, ce_sym, pe_sym)
     engine.enter_trade(ce_ltp, pe_ltp)
 
-    # ── Websocket for live SL / EOD monitoring ──
-    last_ltp = {}   # {symbol: ltp}
-
+    # ── Websocket for live SL / EOD / re-entry monitoring ──
     def on_tick(msg):
         if "symbol" not in msg or "ltp" not in msg:
             return
         sym = msg["symbol"]
-        if sym not in (ce_sym, pe_sym):
-            return
-        last_ltp[sym] = float(msg["ltp"])
-        engine.on_tick(
-            ce_ltp=last_ltp.get(ce_sym),
-            pe_ltp=last_ltp.get(pe_sym),
-        )
+        ltp = float(msg["ltp"])
+
+        # Route the tick to whichever leg it currently belongs to.
+        # engine.ce_sym / engine.pe_sym are mutable and change after a re-entry.
+        if sym == engine.ce_sym:
+            engine.on_tick(ce_ltp=ltp, pe_ltp=None)
+        elif sym == engine.pe_sym:
+            engine.on_tick(ce_ltp=None, pe_ltp=ltp)
+        # else: tick for a symbol we're no longer tracking (e.g. old CE
+        # strike after a re-entry) — ignore it.
 
     def on_open():
         ws.subscribe(symbols=[ce_sym, pe_sym], data_type="SymbolUpdate")
@@ -421,4 +570,8 @@ if __name__ == "__main__":
         on_message=on_tick,
         log_path="",
     )
+
+    # Let the engine subscribe to freshly-selected re-entry symbols on the fly.
+    engine.subscribe_callback = lambda sym: ws.subscribe(symbols=[sym], data_type="SymbolUpdate")
+
     ws.connect()
