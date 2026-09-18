@@ -11,7 +11,7 @@ fyers = fyersModel.FyersModel(
     log_path=""
 )
 
-TARGET_DATE   = datetime.date(2026, 9, 18)
+TARGET_DATE   = datetime.date(2026, 9, 17)
 LOOKBACK_DAYS = 7          # extra prior days fetched only to seed EMA5/EMA20
 START_TIME = datetime.time(9, 15)
 END_TIME   = datetime.time(15, 15)
