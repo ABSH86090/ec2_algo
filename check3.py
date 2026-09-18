@@ -94,8 +94,8 @@ atm = round(spot / 50) * 50
 ce_strike = atm - 50
 pe_strike = atm + 50
 
-ce_symbol = f"NSE:NIFTY{expiry_code}{ce_strike}CE"
-pe_symbol = f"NSE:NIFTY{expiry_code}{pe_strike}PE"
+ce_symbol = f"NSE:NIFTY2692223400CE"
+pe_symbol = f"NSE:NIFTY2692223400PE"
 print(f"Expiry code={expiry_code}  Spot(9:15 close)={spot}  ATM={atm}  "
       f"ITM1 CE={ce_strike} ({ce_symbol})  ITM1 PE={pe_strike} ({pe_symbol})\n")
 
