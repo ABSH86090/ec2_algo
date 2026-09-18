@@ -34,9 +34,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 LOT_SIZE        = 65           # NIFTY lot size — verify with NSE before running
-NUM_LOTS        = 5            # Number of lots to trade per leg
+NUM_LOTS        = 8            # Number of lots to trade per leg
 STRIKE_STEP     = 50           # NIFTY strike spacing in points
-OTM4_STRIKES    = 4            # Both legs: ATM ± 4×50 = ATM ± 200
+OTM4_STRIKES    = 5            # Both legs: ATM ± 4×50 = ATM ± 200
 
 SL_PCT           = 0.70        # Initial SL at 70% above entry  (price × 1.70)
 TRAIL_TRIGGER_PCT = 0.05       # Trail fires when price drops 5% from trail reference
