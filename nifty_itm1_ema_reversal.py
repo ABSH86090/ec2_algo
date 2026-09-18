@@ -58,7 +58,7 @@ ACCESS_TOKEN       = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE      = 1     # qty sent to the API — adjust if your broker needs
+LOT_SIZE      = 65     # qty sent to the API — adjust if your broker needs
                        # the actual share count for 1 lot instead of "1".
 STRIKE_STEP   = 50    # Nifty strike interval
 
