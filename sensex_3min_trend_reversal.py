@@ -95,7 +95,7 @@ ITM_OFFSET = 100           # 2 strikes ITM = 200 points
 DECISION_TIME = datetime.time(9, 16, 0)     # when ITM2 strikes are locked in
 HARD_EXIT_TIME = datetime.time(14, 50)
 
-PROXIMITY_PCT = 0.05        # "close to" = within 5% of the CPR level
+PROXIMITY_PCT = 0.10        # "close to" = within 5% of the CPR level
 
 LOT_SIZE = 20
 LOTS = 1
@@ -331,7 +331,7 @@ def low1_near_level(low1_value, levels):
 
 
 # ================= SWING REVERSAL BREAKOUT ENGINE =================
-MIN_CANDLES_BETWEEN_LOWS = 5   # Low2 must be at least this many candles after Low1
+MIN_CANDLES_BETWEEN_LOWS = 2   # Low2 must be at least this many candles after Low1
 
 
 class SwingReversalEngine:
