@@ -88,7 +88,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL = "BSE:SENSEX-INDEX"
 
-TIMEFRAME_MIN = 3          # candle timeframe for pattern detection
+TIMEFRAME_MIN = 5          # candle timeframe for pattern detection
 STRIKE_STEP = 100          # Sensex option strike interval
 ITM_OFFSET = 100           # 2 strikes ITM = 200 points
 
