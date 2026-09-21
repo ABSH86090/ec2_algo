@@ -90,7 +90,7 @@ INDEX_SYMBOL = "BSE:SENSEX-INDEX"
 
 TIMEFRAME_MIN = 3          # candle timeframe for pattern detection
 STRIKE_STEP = 100          # Sensex option strike interval
-ITM_OFFSET = 200           # 2 strikes ITM = 200 points
+ITM_OFFSET = 100           # 2 strikes ITM = 200 points
 
 DECISION_TIME = datetime.time(9, 16, 0)     # when ITM2 strikes are locked in
 HARD_EXIT_TIME = datetime.time(14, 50)
