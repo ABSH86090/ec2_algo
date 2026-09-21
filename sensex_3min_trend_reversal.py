@@ -186,7 +186,7 @@ def get_option_prev_day_levels(fyers, symbol):
 
     resp = fyers.client.history({
         "symbol": symbol,
-        "resolution": "15",
+        "resolution": "5",
         "date_format": "1",
         "range_from": start,
         "range_to": end,
