@@ -38,9 +38,10 @@
 #       No new entries are taken after 3:00 PM.
 #
 # 5. TRAILING SL: after entry, every subsequent GREEN candle whose LOW is
-#    above the HIGH of the current reference candle (trigger candle
-#    first, then each new trailing candle) shifts SL up to that candle's
-#    low, and becomes the new reference candle.
+#    higher than the LOW of the last green candle formed (the trigger
+#    candle counts as the first "last green candle") shifts SL up to
+#    this candle's low, and this candle becomes the new "last green
+#    candle" for the next comparison.
 #
 # 6. EXIT / RESULT:
 #       - SL hit while it has been trailed at least once  -> WIN
@@ -498,7 +499,7 @@ class LegTradeManager:
             "entry": entry_price,
             "sl": sl,
             "original_sl": sl,
-            "reference_high": trigger["high"],   # next trailing shift compares against this
+            "reference_low": trigger["low"],   # trigger candle counts as the first "last green candle"
             "trailed": False
         }
 
@@ -512,22 +513,31 @@ class LegTradeManager:
         return True
 
     def on_new_candle(self, candle):
-        """Evaluate trailing-SL shift on each closed candle while in a position."""
+        """Evaluate trailing-SL shift on each closed candle while in a position.
+        Rule: every GREEN candle whose LOW is higher than the LOW of the
+        last green candle formed shifts SL up to this candle's low, and
+        this candle becomes the new "last green candle" for the next
+        comparison -- whether or not it triggered a shift."""
         if not self.pos:
             return
 
         is_green = candle["close"] > candle["open"]
-        if is_green and candle["low"] > self.pos["reference_high"]:
+        if not is_green:
+            return
+
+        if candle["low"] > self.pos["reference_low"]:
             new_sl = candle["low"] - SL_BUFFER
             if new_sl > self.pos["sl"]:
                 self.pos["sl"] = new_sl
                 self.pos["trailed"] = True
-                self.pos["reference_high"] = candle["high"]
                 logger.info(
                     f"[{self.label}] SL TRAILED -> {round(new_sl,2)} "
-                    f"(green candle low={candle['low']} above prior ref high, @ {candle['time']})"
+                    f"(green candle low={candle['low']} above last green candle's low "
+                    f"{self.pos['reference_low']}, @ {candle['time']})"
                 )
                 send_telegram(f"🔧 [{self.label}] SL trailed to {round(new_sl,2)}")
+
+        self.pos["reference_low"] = candle["low"]
 
     def on_tick(self, ltp, now):
         # 3:00 PM cutoff: force-close any open position, cancel any pending
