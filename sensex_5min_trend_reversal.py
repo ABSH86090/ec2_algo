@@ -15,8 +15,10 @@
 # 2. On each leg's OWN 5-min candle series (built from that option's own
 #    premium ticks), find an "identifying candle":
 #       - Every closed candle since the last reset is a base candidate.
-#       - A candidate QUALIFIES once some later candle's HIGH reaches
-#         >= 120% of the candidate's low (a +20% rally off that low).
+#       - A candidate QUALIFIES once some LATER candle's HIGH reaches
+#         >= 120% of the candidate's low (a +20% rally off that low). A
+#         candle can never confirm itself off its own high/low range --
+#         only a subsequent candle's high counts.
 #       - When more than one candidate qualifies at once (e.g. a fast
 #         move that jumps past several +20% thresholds within one
 #         candle), the one with the LOWEST LOW is chosen as the
@@ -345,22 +347,17 @@ class RetestEngine:
             return None
 
         if self.state == "SEARCH_BASE":
-            # Find every pending candidate whose +20% rally target has
-            # been reached by this candle's high, and lock onto the one
-            # with the LOWEST LOW among them -- the true start of the
-            # swing/trend, even if a higher-low candle in between also
-            # happens to qualify on the same candle.
+            # Find every PRIOR pending candidate whose +20% rally target
+            # has been reached by this candle's high, and lock onto the
+            # one with the LOWEST LOW among them -- the true start of the
+            # swing/trend. A candle can only confirm an EARLIER candle's
+            # low; it can never confirm itself off its own high/low range
+            # -- "a later candle rallies off an earlier low" is the whole
+            # point, not one volatile candle's own intrabar swing.
             qualifying = [
                 cand for cand in self.pending_candidates
                 if candle["high"] >= cand["low"] * (1 + RALLY_PCT)
             ]
-
-            # The just-closed candle itself is also a valid candidate
-            # going forward (and, in the edge case where its own high
-            # already clears +20% above its own low within the same
-            # candle, it is eligible too).
-            if candle["high"] >= candle["low"] * (1 + RALLY_PCT):
-                qualifying.append(candle)
 
             confirmed = min(qualifying, key=lambda c: c["low"]) if qualifying else None
 
