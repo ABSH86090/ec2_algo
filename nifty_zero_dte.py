@@ -396,7 +396,7 @@ class StrangleEngine:
             f"Lots: {NUM_LOTS}  |  No further re-entry after this."
         )
 
-        self.fyers.sell_market(new_sym, "STRCE_RE")
+        self.fyers.sell_market(new_sym, "STRCERE")
 
         # Swap the leg onto the new symbol/entry/SL and re-subscribe the feed
         self.ce_sym   = new_sym
@@ -446,7 +446,7 @@ class StrangleEngine:
             f"Lots: {NUM_LOTS}  |  No further re-entry after this."
         )
 
-        self.fyers.sell_market(new_sym, "STRPE_RE")
+        self.fyers.sell_market(new_sym, "STRPERE")
 
         self.pe_sym   = new_sym
         self.pe_entry = new_ltp
