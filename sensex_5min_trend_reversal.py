@@ -57,8 +57,13 @@
 #       - Max 3 trades total per leg -> leg stops trading for the day.
 #       (whichever limit is hit first stops the leg; 3 is a hard ceiling,
 #       not "3 more on top of losses").
-#    After a trade closes, if the leg is still allowed to trade, it
-#    resets and starts searching for a brand-new identifying candle.
+#    After a trade closes (win OR loss), the SAME identifying candle
+#    stays active for a 5-candle grace window: if a fresh green-after-
+#    red retest off that SAME low fires within those 5 candles, it is
+#    traded immediately (no new +20% rally needs to reconfirm). Only
+#    once a 6th candle closes with still no new setup, AND price is
+#    trading below that old low, does the search abandon it and start
+#    tracking a brand-new low from that candle onward.
 #
 # 8. The SENSEX INDEX is used ONLY ONCE, at 09:16, to compute ATM and
 #    derive the ITM1 CE/PE strikes. Everything else is computed purely
@@ -328,12 +333,37 @@ class RetestEngine:
         self.losses = 0
         self.busy = False          # True while a trade from this leg is open
 
+        # post-exit grace window (see start_post_exit_search)
+        self.in_post_exit_grace = False
+        self.candles_since_exit = 0
+
     def start_new_search(self):
-        """Call after a trade closes (and the leg is still allowed to trade)."""
+        """Full reset: clears the identifying candle entirely. Used only
+        when abandoning the old low (see the 6-candle / below-old-low
+        rule in on_new_candle), never called directly after a trade
+        exit anymore -- see start_post_exit_search for that."""
         self.state = "SEARCH_BASE"
         self.pending_candidates = []
         self.identified_candle = None
         self.busy = False
+        self.in_post_exit_grace = False
+        self.candles_since_exit = 0
+
+    def start_post_exit_search(self):
+        """Call after a trade closes (win or loss) and the leg is still
+        allowed to trade. Keeps the SAME identifying candle active --
+        does NOT clear it -- and re-enters SEARCH_TRIGGER so a fresh
+        setup off that same low can be traded immediately. Gives it a
+        5-candle grace window: for candles 1-5 after the exit, the usual
+        band-floor invalidation is suspended (a dip below the low does
+        not throw the candidate away). Only once a 6th candle closes
+        with still no new trigger AND price is trading below the old
+        low does the search fall back to start_new_search() and adopt a
+        fresh low (handled in on_new_candle)."""
+        self.state = "SEARCH_TRIGGER"
+        self.busy = False
+        self.in_post_exit_grace = True
+        self.candles_since_exit = 0
 
     def on_new_candle(self, candle):
         """candle = the candle that JUST closed.
@@ -378,19 +408,44 @@ class RetestEngine:
             lower_band = id_low * (1 - RETEST_BAND_LOWER_PCT)
             upper_band = id_low * (1 + RETEST_BAND_UPPER_PCT)
 
-            # invalidation: price broke below the LOWER BAND (not just below
-            # the bare identifying low -- the band intentionally allows up
-            # to 10% below it as still-valid retest territory).
-            if candle["low"] < lower_band:
-                logger.info(
-                    f"[{self.label}] price broke below the retest band (low={candle['low']}, "
-                    f"band floor={round(lower_band,2)}) @ {candle['time']}; "
-                    f"restarting base search from this candle."
-                )
-                self.state = "SEARCH_BASE"
-                self.identified_candle = None
-                self.pending_candidates = [candle]
-                return None
+            if self.in_post_exit_grace:
+                self.candles_since_exit += 1
+
+                # Candles 1-5 after the exit: the old low stays valid no
+                # matter what price does -- band-floor invalidation is
+                # suspended so a fresh setup off the SAME low can still
+                # be taken. Only check for abandonment from candle 6
+                # onward, and only if price is trading below the bare
+                # old low (not just below the -10% band floor).
+                if self.candles_since_exit >= 6 and candle["low"] < id_low:
+                    logger.info(
+                        f"[{self.label}] post-exit grace window used up (6 candles, no new "
+                        f"setup) and price ({candle['low']}) is below old low ({id_low}) "
+                        f"@ {candle['time']}; adopting new low from this candle."
+                    )
+                    self.state = "SEARCH_BASE"
+                    self.identified_candle = None
+                    self.pending_candidates = [candle]
+                    self.in_post_exit_grace = False
+                    return None
+                # otherwise (still within 5 candles, or price still at/above
+                # the old low past candle 6): keep waiting on the old low,
+                # fall through to the normal trigger check below.
+            else:
+                # Normal (pre-entry) invalidation: price broke below the
+                # LOWER BAND (not just below the bare identifying low --
+                # the band intentionally allows up to 10% below it as
+                # still-valid retest territory).
+                if candle["low"] < lower_band:
+                    logger.info(
+                        f"[{self.label}] price broke below the retest band (low={candle['low']}, "
+                        f"band floor={round(lower_band,2)}) @ {candle['time']}; "
+                        f"restarting base search from this candle."
+                    )
+                    self.state = "SEARCH_BASE"
+                    self.identified_candle = None
+                    self.pending_candidates = [candle]
+                    return None
 
             is_green = candle["close"] > candle["open"]
 
@@ -403,8 +458,11 @@ class RetestEngine:
                     f"({candle['time']}) -- within -{RETEST_BAND_LOWER_PCT*100:.0f}%/"
                     f"+{RETEST_BAND_UPPER_PCT*100:.0f}% of identifying low {round(id_low,2)}; "
                     f"prior candle red @ {prev_candle['time']}"
+                    + (f"; reused via post-exit grace (candle {self.candles_since_exit}/5)"
+                       if self.in_post_exit_grace else "")
                 )
                 self.busy = True
+                self.in_post_exit_grace = False
                 return {
                     "trigger_candle": candle,
                     "identified_candle": self.identified_candle
@@ -424,10 +482,11 @@ class RetestEngine:
                 f"losses={self.losses} (caps: {MAX_TRADES_PER_LEG} trades / {MAX_LOSSES_PER_LEG} losses)"
             )
         else:
-            self.start_new_search()
+            self.start_post_exit_search()
             logger.info(
                 f"[{self.label}] leg continues -- trades={self.trades_taken}, losses={self.losses}; "
-                f"searching for next identifying candle."
+                f"keeping identifying low {round(self.identified_candle['low'],2)} active for "
+                f"up to 5 more candles before considering a new low."
             )
 
 
