@@ -25,7 +25,7 @@ single-leg BUY strategies.
   Step 3 (GREEN)  : The VERY NEXT candle is GREEN (close > open) with
                       close > EMA20  AND  EMA5 > EMA20
   Step 4 (BUY)    : Buy the option at market.
-                      SL     = low of the red candle
+                      SL     = lower of (red candle low, green candle low)
                       Target = entry + 2 × (entry − SL)      (1:2 R:R)
 
   Reset rule      : If EMA5 goes below EMA20 at any time before the
@@ -383,7 +383,11 @@ class StrikeStrategy:
     # ----------------------------------------------------------
     def _enter_trade(self, red, green, ema5, ema20):
         entry  = green["close"]
-        sl     = red["low"]
+        # SL = lower of the red candle's low and the green candle's low
+        if green["low"] < red["low"]:
+            sl, sl_src = green["low"], f"green candle low @ {green['time'].strftime('%H:%M')}"
+        else:
+            sl, sl_src = red["low"], f"red candle low @ {red['time'].strftime('%H:%M')}"
         risk   = entry - sl
         if risk <= 0:
             logger.info(
@@ -396,13 +400,13 @@ class StrikeStrategy:
 
         logger.info(
             f"[{self.label} ENTRY #{self.trades_taken}] symbol={self.symbol} "
-            f"entry={entry:.2f} sl={sl:.2f} target={target:.2f} risk={risk:.2f} "
+            f"entry={entry:.2f} sl={sl:.2f} ({sl_src}) target={target:.2f} risk={risk:.2f} "
             f"red={red['time']} green={green['time']} EMA5={ema5:.2f} EMA20={ema20:.2f}"
         )
         send_telegram(
             f"📈 {self.label} BUY #{self.trades_taken} — {self.symbol}\n"
             f"Entry  = {entry:.2f}\n"
-            f"SL     = {sl:.2f} (red candle low @ {red['time'].strftime('%H:%M')})\n"
+            f"SL     = {sl:.2f} ({sl_src})\n"
             f"Target = {target:.2f} (2 × {risk:.2f})\n"
             f"EMA5={ema5:.2f} | EMA20={ema20:.2f}\n"
             f"Signal candle: {green['time'].strftime('%H:%M')}"
