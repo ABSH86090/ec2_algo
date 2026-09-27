@@ -36,7 +36,7 @@ QTY           = LOT_SIZE * LOTS # total qty per leg = 80
 SL_PCT          = 0.20          # 20% above sell price (used for BOTH original and reentry SL)
 STRIKE_STEP     = 100           # SENSEX strike interval
 CE_OTM          = 2             # OTM2 for CE leg
-PE_OTM          = 3             # OTM3 for PE leg
+PE_OTM          = 2             # OTM2 for PE leg
 MAX_REENTRIES   = 1             # exactly one reentry per leg after its SL is hit
 
 TICK_SIZE      = 0.05               # SENSEX option minimum price movement
