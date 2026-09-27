@@ -41,7 +41,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 LOT_SIZE        = 65           # NIFTY lot size — verify with NSE before running
-NUM_LOTS        = 4            # Number of lots to trade per leg (also used on re-entry)
+NUM_LOTS        = 6            # Number of lots to trade per leg (also used on re-entry)
 STRIKE_STEP     = 50           # NIFTY strike spacing in points
 OTM2_CE_STRIKES = 2            # Original CE leg : ATM + 2×50 = ATM+100
 OTM3_PE_STRIKES = 3            # Original PE leg : ATM − 3×50 = ATM−150
