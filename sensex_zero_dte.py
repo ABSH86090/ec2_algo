@@ -1,11 +1,12 @@
 # =========================================================
 # SENSEX ASYMMETRIC DTE0 SHORT STRANGLE  (+ 1x reentry on SL)
 # Entry  : 9:16 AM on expiry day (Thursday) only
-#          Sell OTM2 CE + Sell OTM3 PE — 1 lot each
+#          Sell OTM2 CE + Sell OTM2 PE — LOTS lots each
 # SL     : 20% above sell price per leg (fixed SL-L order)
-# Reentry: If SL hit on a leg, place ONE limit sell reentry
-#          at the ORIGINAL entry price for that same strike.
-#          If/when it fills, a fresh SL (20% above the
+# Reentry: If SL hit on a leg, place ONE SL-Limit SELL (stop order)
+#          with trigger = ORIGINAL entry price for that same strike.
+#          It stays pending until premium falls back to entry price,
+#          then sells. Once filled, a fresh SL (20% above the
 #          reentry fill price) is placed for that leg.
 #          No further reentries after that.
 # Exit   : SL hit per leg | 15:10 hard exit
@@ -38,6 +39,8 @@ STRIKE_STEP     = 100           # SENSEX strike interval
 CE_OTM          = 2             # OTM2 for CE leg
 PE_OTM          = 2             # OTM2 for PE leg
 MAX_REENTRIES   = 1             # exactly one reentry per leg after its SL is hit
+
+REENTRY_LIMIT_BUFFER = 0.05     # reentry SL-sell limit = trigger * (1 - 5%) so it fills on a fast drop
 
 TICK_SIZE      = 0.05               # SENSEX option minimum price movement
 
@@ -111,8 +114,32 @@ class Fyers:
         logger.info(f"SELL_MKT {symbol} qty={qty} → {resp}")
         return resp
 
+    def sell_sl(self, symbol, qty, trigger, tag):
+        """
+        SL-Limit SELL (stop order) — used for the reentry.
+        Stays pending until LTP falls to `trigger`, then a limit sell
+        is sent at trigger*(1-buffer). Unlike a plain limit sell, this
+        does NOT fill immediately when market is above the trigger.
+        """
+        stop  = round_tick(trigger)
+        limit = round_tick(trigger * (1 - REENTRY_LIMIT_BUFFER))
+        resp = self.client.place_order({
+            "symbol": symbol, "qty": qty,
+            "type": 4, "side": -1,
+            "productType": "INTRADAY", "validity": "DAY",
+            "stopPrice": stop,
+            "limitPrice": limit,
+            "orderTag": tag,
+        })
+        logger.info(f"SL_SELL {symbol} qty={qty} stop={stop} limit={limit} → {resp}")
+        return resp
+
     def sell_limit(self, symbol, qty, price, tag):
-        """Limit SELL — used for the reentry order at the original entry price."""
+        """
+        Plain limit SELL. Only used as a reentry fallback when LTP is already
+        at/below the entry price (an SL-sell would be rejected by Fyers since
+        stopPrice must not be higher than LTP). Rests until price rises back to `price`.
+        """
         px = round_tick(price)
         resp = self.client.place_order({
             "symbol": symbol, "qty": qty,
@@ -206,8 +233,8 @@ def build_entry_symbols(index_ltp):
     expiry    = get_weekly_expiry()
     exp_token = format_expiry(expiry)
 
-    ce_strike = atm + CE_OTM * STRIKE_STEP   # OTM2
-    pe_strike = atm - PE_OTM * STRIKE_STEP   # OTM3
+    ce_strike = atm + CE_OTM * STRIKE_STEP
+    pe_strike = atm - PE_OTM * STRIKE_STEP
 
     ce_sym = f"BSE:SENSEX{exp_token}{ce_strike}CE"
     pe_sym = f"BSE:SENSEX{exp_token}{pe_strike}PE"
@@ -223,8 +250,8 @@ def build_entry_symbols(index_ltp):
 # ================= TRADE MANAGER =================
 # Per-leg state machine:
 #   OPEN            -> original short is live, original SL-buy order working
-#   WAITING_REENTRY -> original SL was hit; a limit SELL reentry order is
-#                      resting at the original entry price, not yet filled
+#   WAITING_REENTRY -> original SL was hit; an SL-Limit SELL reentry order is
+#                      pending with trigger at the original entry price
 #   REENTRY_OPEN    -> reentry short is live, a fresh SL-buy order is working
 #   CLOSED          -> nothing live for this leg anymore (terminal)
 class TradeManager:
@@ -250,13 +277,13 @@ class TradeManager:
         ce_ltp = self.fyers.get_ltp(ce_sym)
         pe_ltp = self.fyers.get_ltp(pe_sym)
 
-        # Sell CE (OTM2)
+        # Sell CE
         ce_resp = self.fyers.sell_mkt(ce_sym, QTY, "CESELL")
         if not ce_resp or ce_resp.get("s") != "ok":
             send_telegram(f"❌ CE SELL FAILED: {ce_resp}")
             return
 
-        # Sell PE (OTM3) — roll back CE on failure
+        # Sell PE — roll back CE on failure
         pe_resp = self.fyers.sell_mkt(pe_sym, QTY, "PESELL")
         if not pe_resp or pe_resp.get("s") != "ok":
             send_telegram(f"❌ PE SELL FAILED — rolling back CE: {pe_resp}")
@@ -356,10 +383,29 @@ class TradeManager:
                 self._check_all_closed()
 
     def _place_reentry(self, leg_name, leg):
-        """Place ONE limit SELL reentry at the original entry price."""
-        resp = self.fyers.sell_limit(
-            leg["symbol"], QTY, leg["entry_price"], f"{leg_name}REENTRY"
-        )
+        """
+        Place ONE SL-Limit SELL reentry with trigger = original entry price.
+        (A plain limit sell below market fills instantly — that was the bug.)
+        """
+        try:
+            ltp_now = self.fyers.get_ltp(leg["symbol"])
+        except Exception:
+            ltp_now = leg["current_ltp"]
+
+        if ltp_now > leg["entry_price"]:
+            # Normal case: premium is above entry → SL-sell waits for it to fall back.
+            resp = self.fyers.sell_sl(
+                leg["symbol"], QTY, leg["entry_price"], f"{leg_name}REENTRY"
+            )
+            order_kind = "SL-sell trigger"
+        else:
+            # Premium already back at/below entry → SL-sell would be rejected
+            # (stopPrice > LTP). Rest a limit sell at entry instead.
+            resp = self.fyers.sell_limit(
+                leg["symbol"], QTY, leg["entry_price"], f"{leg_name}REENTRY"
+            )
+            order_kind = "limit sell (LTP already ≤ entry)"
+
         if not resp or resp.get("s") != "ok":
             send_telegram(f"❌ {leg_name} REENTRY ORDER FAILED — no reentry: {resp}")
             leg["state"] = "CLOSED"
@@ -370,15 +416,16 @@ class TradeManager:
         leg["state"] = "WAITING_REENTRY"
         leg["reentries_used"] += 1
         send_telegram(
-            f"🔁 {leg_name} REENTRY PLACED: limit sell {leg['symbol']} "
-            f"@ {leg['entry_price']:.1f} (orig sell price)"
+            f"🔁 {leg_name} REENTRY PENDING: {order_kind} {leg['symbol']} "
+            f"@ {leg['entry_price']:.1f} (orig sell price)  ltp={ltp_now:.1f}"
         )
 
-    # ---- Step 2: reentry limit fill → place fresh SL on the new short -
+    # ---- Step 2: reentry fill → place fresh SL on the new short -------
     def _detect_reentry_fill(self, leg_name, leg, current_ltp):
-        """Reentry limit sell fills once premium decays back to (or below) entry price."""
-        if current_ltp > leg["entry_price"]:
-            return
+        """
+        Poll the reentry order every 5s regardless of LTP, so a fill is
+        never missed and the new short is never left without an SL.
+        """
         if not self._throttled(leg):
             return
 
@@ -393,6 +440,9 @@ class TradeManager:
             leg["reentry_sl_price"]    = new_sl
             leg["reentry_sl_order_id"] = (sl_resp or {}).get("id", "")
             leg["state"] = "REENTRY_OPEN"
+
+            if not sl_resp or sl_resp.get("s") != "ok":
+                send_telegram(f"🚨 {leg_name} REENTRY SL ORDER FAILED — position unprotected! {sl_resp}")
 
             send_telegram(
                 f"✅ {leg_name} REENTRY FILLED @ {fill_price:.1f}  new SL={new_sl:.1f}"
@@ -436,10 +486,16 @@ class TradeManager:
                 send_telegram(f"🏁 {leg_name} CLOSED ({reason})")
 
             elif leg["state"] == "WAITING_REENTRY":
-                if leg["reentry_order_id"]:
-                    self.fyers.cancel_order(leg["reentry_order_id"])
+                # Check it didn't fill in the last few seconds before cancelling
+                status, _ = self.fyers.get_order_details(leg["reentry_order_id"])
+                if status == 2:
+                    self.fyers.buy_mkt(leg["symbol"], QTY, f"EXIT{reason}{leg_name}REENTRY")
+                    send_telegram(f"🏁 {leg_name} REENTRY (just filled) CLOSED ({reason})")
+                else:
+                    if leg["reentry_order_id"]:
+                        self.fyers.cancel_order(leg["reentry_order_id"])
+                    send_telegram(f"🏁 {leg_name} REENTRY ORDER CANCELLED ({reason}) — no position held")
                 leg["state"] = "CLOSED"
-                send_telegram(f"🏁 {leg_name} REENTRY ORDER CANCELLED ({reason}) — no position held")
 
             elif leg["state"] == "REENTRY_OPEN":
                 if leg["reentry_sl_order_id"]:
