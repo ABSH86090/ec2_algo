@@ -87,7 +87,7 @@ MIN_CANDLES_ABOVE_EMAS  = 15     # Step 1 requirement
 CONSECUTIVE_REQUIRED    = True   # 15 candles must be in a row
 RESET_COUNT_AFTER_TRADE = False  # require fresh 15 candles after each trade?
 MAX_TRADES_PER_STRIKE   = 2
-TARGET_RR               = 2.0    # target = 2 × SL distance
+TARGET_RR               = 1.5    # target = 2 × SL distance
 
 LOG_FILE = "nifty_itm1_ema_pullback_buy.log"
 
