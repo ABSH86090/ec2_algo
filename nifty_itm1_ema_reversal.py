@@ -1,39 +1,45 @@
 """
-NIFTY ITM1 EMA-REVERSAL SELL STRATEGY
-=======================================
-5-minute candles, EMA5 & EMA20 computed on the INDIVIDUAL option premium
-(not a combined straddle). CE and PE strikes are chosen independently and
-run as two fully independent single-leg strategies.
+NIFTY ATM 62%-RETRACEMENT SELL STRATEGY  (2-min EMA20 confirmation)
+=====================================================================
+Levels come from the first 30-minute candle (9:15-9:45) on the ATM strike.
+Entry is confirmed on 2-minute candles using EMA20 of that SAME option's
+premium. CE and PE are checked and traded independently (same ATM strike).
 
-━━━ STRIKE SELECTION ━━━
-  At 9:16 AM, fetch NIFTY50 spot price.
-  ATM      = round(spot / 50) * 50
-  ITM1 CE  = ATM - 50   (one strike in-the-money for a call)
-  ITM1 PE  = ATM + 50   (one strike in-the-money for a put)
-  These two strikes are fixed for the day. Each is tracked/traded on its
-  OWN 5-min candle series and its OWN EMA5/EMA20 — no combined premium.
+━━━ SETUP (once, at 9:45 AM) ━━━
+  1. ATM strike = round(NIFTY50 30-min candle (9:15-9:45) CLOSE / 50) * 50
+  2. For EACH of ATM-CE and ATM-PE, independently:
+       - Pull that option's own 9:15-9:45 30-min candle.
+       - If it is NOT red (close >= open)  → no trade on that leg.
+       - If it IS red:
+           high, low  = candle high/low
+           length     = high - low
+           level_62   = low + 0.62 * length     (62% retracement level)
+           sl_price   = high                    (stop, above entry)
+  3. Prefill 2-min candles for the strike (last few days + today so far)
+     so EMA20 is warmed up before live trading starts (same method as the
+     ITM1 EMA script).
 
-━━━ ENTRY SIGNAL (checked on each closed 5-min candle, per strike) ━━━
-  On the CLOSING candle (N):
-    close(N) < EMA5(N)  AND  close(N) < EMA20(N)  AND  EMA5(N) < EMA20(N)
-  On the PRECEDING candle (N-1):
-    EMA5(N-1) > EMA20(N-1)          (i.e. the EMA5/EMA20 crossover happens
-                                      exactly on candle N)
-  → SELL the strike (naked, single leg, no hedge).
+━━━ ENTRY ━━━
+  Step A (arm)    : after 9:45, live LTP must first rise to >= level_62.
+  Step B (confirm): after that, the first CLOSED 2-min candle that is
+                      - RED (close < open), AND
+                      - close < EMA20 (2-min, on the option premium), AND
+                      - close < level_62
+                    → SELL at market immediately.
+  (Set REQUIRE_LEVEL_TOUCH = False to skip step A.)
 
-━━━ EXIT (the ONLY ways out) ━━━
-  1. SL      : high of the entry/signal candle + 2 points (checked on every
-               live tick against the option's live LTP).
-  2. Reversal: on any later closed candle that is GREEN (close > open) AND
-               close > EMA5 AND close > EMA20 AND EMA5 > EMA20.
-  3. EOD     : 3:00 PM hard force-exit safety net, regardless of 1/2.
+━━━ SL / TARGET (fixed at entry) ━━━
+  sl_price     = 30-min candle high
+  risk         = sl_price - actual entry price
+  target_price = entry - 2 * risk              (2:1 reward:risk)
 
-  Only ONE trade is taken per strike per day. Once a strike's trade exits
-  (for any reason above), that strike is done for the day — no re-entry.
+━━━ EXIT (only three ways, once in a position) ━━━
+  1. Target hit : live LTP <= target_price
+  2. SL hit     : live LTP >= sl_price
+  3. Safety net : 3:14 PM — force market-exit if still in a position;
+                  if entry never triggered, the leg is abandoned for the day.
 
-Qty per order = 1 (as configured in LOT_SIZE below — adjust to your
-broker's actual per-lot quantity if the API expects total share count
-rather than a lot count).
+Only ONE trade per leg (CE / PE) per day.
 """
 
 import datetime
@@ -58,22 +64,27 @@ ACCESS_TOKEN       = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE      = 65     # qty sent to the API — adjust if your broker needs
-                       # the actual share count for 1 lot instead of "1".
-STRIKE_STEP   = 50    # Nifty strike interval
+LOT_SIZE    = 65     # qty sent to the API
+STRIKE_STEP = 50
 
-DECISION_TIME      = datetime.time(9, 16)   # spot checked at 9:16 AM
-TRADING_END         = datetime.time(15, 0)  # 3:00 PM EOD force-exit (safety net)
+RETRACEMENT         = 0.62   # 62% retracement of the red 30-min candle
+REQUIRE_LEVEL_TOUCH = True   # price must reach the 62% level before a 2-min
+                             # red candle can trigger the entry
+REWARD_RISK         = 2.0    # target = entry - 2 * (SL - entry)
 
-HISTORY_RESOLUTION = "5"    # 5-minute candles
+MARKET_OPEN        = datetime.time(9, 15)
+MARKET_CLOSE       = datetime.time(15, 30)
+FIRST_CANDLE_START = datetime.time(9, 15)
+SETUP_WAIT_TIME    = datetime.time(9, 45)   # wait for the 30-min candle to close
+SAFETY_TIME        = datetime.time(15, 14)  # EOD safety net
 
-EMA_FAST         = 5
-EMA_SLOW         = 20
-MIN_BARS_FOR_EMA = 21        # need at least EMA_SLOW+1 candles for prev+curr EMA20
+FIRST_CANDLE_RESOLUTION = "30"   # levels from the 30-min candle
+EMA_RESOLUTION          = "2"    # EMA20 on 2-min candles
+EMA_TF_MINUTES          = 2
+EMA_PERIOD              = 20
+PREFILL_DAYS            = 7      # calendar days of 2-min history for EMA warm-up
 
-SL_OFFSET_POINTS = 2          # SL = signal-candle high + 2 points
-
-LOG_FILE = "nifty_itm1_ema_reversal.log"
+LOG_FILE = "nifty_atm_62_retracement_ema_sell.log"
 
 # =========================================================
 # LOGGING
@@ -103,21 +114,13 @@ def send_telegram(msg):
 
 
 # =========================================================
-# EXPIRY / SYMBOL UTILS  (unchanged from reference script)
+# EXPIRY / SYMBOL UTILS  (unchanged)
 # =========================================================
 SPECIAL_MARKET_HOLIDAYS = {
-    datetime.date(2026, 1, 26),
-    datetime.date(2026, 3, 3),
-    datetime.date(2026, 3, 26),
-    datetime.date(2026, 3, 31),
-    datetime.date(2026, 4, 14),
-    datetime.date(2026, 5, 1),
-    datetime.date(2026, 5, 28),
-    datetime.date(2026, 6, 26),
-    datetime.date(2026, 9, 14),
-    datetime.date(2026, 10, 2),
-    datetime.date(2026, 11, 24),
-    datetime.date(2026, 12, 25),
+    datetime.date(2026, 1, 26), datetime.date(2026, 3, 3), datetime.date(2026, 3, 26),
+    datetime.date(2026, 3, 31), datetime.date(2026, 4, 14), datetime.date(2026, 5, 1),
+    datetime.date(2026, 5, 28), datetime.date(2026, 6, 26), datetime.date(2026, 9, 14),
+    datetime.date(2026, 10, 2), datetime.date(2026, 11, 24), datetime.date(2026, 12, 25),
 }
 
 
@@ -154,112 +157,76 @@ def format_expiry(expiry):
     return f"{yy}{m_tok}{d:02d}"
 
 
-def get_spot_price(fyers_client):
-    """Fetch live NIFTY50 spot LTP via the quotes endpoint."""
-    r = fyers_client.quotes({"symbols": "NSE:NIFTY50-INDEX"})
-    try:
-        ltp = r["d"][0]["v"]["lp"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Could not read spot LTP from quotes response: {r}") from e
-    logger.info(f"[SPOT] NIFTY50 LTP = {ltp:.2f}")
-    return ltp
-
-
-def compute_itm1_strikes(spot):
-    atm     = round(spot / STRIKE_STEP) * STRIKE_STEP
-    ce_strike = atm - STRIKE_STEP   # ITM1 call: one step below ATM
-    pe_strike = atm + STRIKE_STEP   # ITM1 put:  one step above ATM
-    logger.info(f"[STRIKES] spot={spot:.2f} ATM={atm} ITM1_CE={ce_strike} ITM1_PE={pe_strike}")
-    send_telegram(
-        f"📌 STRIKE SELECTION (9:16 AM)\n"
-        f"Spot     = {spot:.2f}\n"
-        f"ATM      = {atm}\n"
-        f"ITM1 CE  = {ce_strike}\n"
-        f"ITM1 PE  = {pe_strike}"
-    )
-    return atm, ce_strike, pe_strike
-
-
 def build_symbol(strike, opt_type):
     expiry = format_expiry(get_next_expiry())
     return f"NSE:NIFTY{expiry}{strike}{opt_type}"
 
 
 # =========================================================
-# FYERS CLIENT  (naked sell / buy only — no hedge legs)
+# CANDLE HELPERS
 # =========================================================
-class FyersClient:
-    def __init__(self):
-        self.client = fyersModel.FyersModel(
-            client_id=CLIENT_ID,
-            token=ACCESS_TOKEN,
-            is_async=False,
-            log_path=""
-        )
-        self.auth = f"{CLIENT_ID}:{ACCESS_TOKEN}"
-
-    def sell_market(self, symbol, tag):
-        return self.client.place_order({
-            "symbol":      symbol,
-            "qty":         LOT_SIZE,
-            "type":        2,
-            "side":        -1,
-            "productType": "INTRADAY",
-            "validity":    "DAY",
-            "orderTag":    tag,
-        })
-
-    def buy_market(self, symbol, tag):
-        return self.client.place_order({
-            "symbol":      symbol,
-            "qty":         LOT_SIZE,
-            "type":        2,
-            "side":        1,
-            "productType": "INTRADAY",
-            "validity":    "DAY",
-            "orderTag":    tag,
-        })
-
-
-# =========================================================
-# HISTORICAL PREFILL  (per-strike, individual premium)
-# =========================================================
-def fetch_historical_candles(fyers_client, symbol):
-    """Fetch 5-min candles for a single option symbol over the past 7 days."""
-    to_dt   = datetime.datetime.now()
-    from_dt = to_dt - datetime.timedelta(days=7)
-
+def fetch_candles(fyers_client, symbol, resolution, from_date, to_date):
+    """Fetch candles for `symbol` between two dates (inclusive), market hours only."""
     r = fyers_client.history({
         "symbol":      symbol,
-        "resolution":  HISTORY_RESOLUTION,
+        "resolution":  resolution,
         "date_format": "1",
-        "range_from":  from_dt.strftime("%Y-%m-%d"),
-        "range_to":    to_dt.strftime("%Y-%m-%d"),
+        "range_from":  from_date.strftime("%Y-%m-%d"),
+        "range_to":    to_date.strftime("%Y-%m-%d"),
         "cont_flag":   "1",
     })
-
     candles = []
     for c in r.get("candles", []):
         dt = datetime.datetime.fromtimestamp(c[0])
-        if dt.time() < datetime.time(9, 15) or dt.time() > datetime.time(15, 30):
+        if dt.time() < MARKET_OPEN or dt.time() >= MARKET_CLOSE:
             continue
-        candles.append({
-            "time":  dt,
-            "open":  c[1],
-            "high":  c[2],
-            "low":   c[3],
-            "close": c[4],
-        })
-
+        candles.append({"time": dt, "open": c[1], "high": c[2], "low": c[3], "close": c[4]})
     candles.sort(key=lambda c: c["time"])
-    logger.info(f"[PREFILL] {symbol}: {len(candles)} candles loaded")
     return candles
 
 
+def get_first_30min_candle(fyers_client, symbol, retries=6, wait_s=5):
+    """Fetch today's 9:15-9:45 30-min candle (retries briefly right after 9:45)."""
+    today = datetime.date.today()
+    for attempt in range(retries):
+        for c in fetch_candles(fyers_client, symbol, FIRST_CANDLE_RESOLUTION, today, today):
+            if c["time"].time() == FIRST_CANDLE_START:
+                return c
+        time.sleep(wait_s)
+    raise RuntimeError(f"9:15 30-min candle not found for {symbol} — check market is open")
+
+
+def get_atm_from_first_candle(fyers_client):
+    candle = get_first_30min_candle(fyers_client, "NSE:NIFTY50-INDEX")
+    atm = round(candle["close"] / STRIKE_STEP) * STRIKE_STEP
+    logger.info(f"[ATM] 30-min candle (9:15-9:45) close={candle['close']:.2f} → ATM={atm}")
+    send_telegram(f"📊 30-MIN CANDLE (9:15-9:45)\nClose={candle['close']:.2f} → ATM Strike={atm}")
+    return atm
+
+
+def bucket_start(dt):
+    """Start time of the 2-min candle containing `dt`, aligned to 9:15
+    (9:15, 9:17, 9:19 ... — same grid Fyers uses for 2-min history)."""
+    session_open = dt.replace(hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute,
+                              second=0, microsecond=0)
+    mins = int((dt - session_open).total_seconds() // 60)
+    mins = (mins // EMA_TF_MINUTES) * EMA_TF_MINUTES
+    return session_open + datetime.timedelta(minutes=mins)
+
+
+def tick_datetime(msg):
+    """Exchange time of a websocket tick; falls back to local clock."""
+    ts = msg.get("exch_feed_time") or msg.get("last_traded_time")
+    if not ts:
+        return datetime.datetime.now()
+    ts = int(ts)
+    if ts > 10_000_000_000:        # milliseconds → seconds
+        ts //= 1000
+    return datetime.datetime.fromtimestamp(ts)
+
+
 # =========================================================
-# EMA HELPER (pure function — recomputed over an explicit closes list,
-# so we can independently evaluate EMA "as of the previous candle" vs
-# EMA "as of the current candle" for crossover detection)
+# EMA HELPER  (same as ITM1 EMA script)
 # =========================================================
 def compute_ema(closes, period):
     if len(closes) < period:
@@ -272,247 +239,281 @@ def compute_ema(closes, period):
 
 
 # =========================================================
-# STRIKE STRATEGY  (one instance per strike — CE and PE run independently)
+# FYERS CLIENT
 # =========================================================
-class StrikeStrategy:
+class FyersClient:
+    def __init__(self):
+        self.client = fyersModel.FyersModel(
+            client_id=CLIENT_ID,
+            token=ACCESS_TOKEN,
+            is_async=False,
+            log_path=""
+        )
+        self.auth = f"{CLIENT_ID}:{ACCESS_TOKEN}"
+
+    def _order(self, symbol, side, tag):
+        resp = self.client.place_order({
+            "symbol":      symbol,
+            "qty":         LOT_SIZE,
+            "type":        2,          # 2 = Market order
+            "side":        side,
+            "productType": "INTRADAY",
+            "validity":    "DAY",
+            "orderTag":    tag,
+        })
+        logger.info(f"[ORDER] {symbol} side={side} tag={tag} response={resp}")
+        return resp
+
+    def sell_market(self, symbol, tag):
+        return self._order(symbol, -1, tag)
+
+    def buy_market(self, symbol, tag):
+        return self._order(symbol, 1, tag)
+
+
+# =========================================================
+# OPTION LEG STRATEGY  (one instance per leg — CE and PE run independently)
+# =========================================================
+class OptionLegStrategy:
     """
-    Single-leg, naked-sell EMA-reversal strategy for ONE option strike.
-
-    Entry (on a closed candle N):
-        close(N) < EMA5(N) and close(N) < EMA20(N) and EMA5(N) < EMA20(N)
-        and EMA5(N-1) > EMA20(N-1)                     (crossover on N)
-      → SELL the strike.
-
-    Exit (only three ways out):
-        1. SL       : live price >= entry_signal_candle.high + SL_OFFSET_POINTS
-                      (checked every tick)
-        2. Reversal : closed candle is green, close > EMA5 & EMA20, EMA5 > EMA20
-        3. EOD      : 3:00 PM force-exit safety net
-
-    Only one trade per strike per day (self.done flag).
+    states: "waiting"     (live price has not yet reached the 62% level)
+            "armed"       (62% level reached; waiting for a 2-min red candle
+                           to close below EMA20 and the 62% level)
+            "in_position" (sold at market, monitoring SL/target)
+            "done"        (exited, or abandoned at EOD without entering)
     """
 
-    def __init__(self, fyers, symbol, label):
+    def __init__(self, fyers, symbol, label, high, low, level, sl_price):
         self.fyers  = fyers
         self.symbol = symbol
-        self.label  = label   # "CE" or "PE", used in logs/order tags
+        self.label  = label   # "CE" or "PE"
 
-        self.candles  = deque(maxlen=2000)
-        self.position = None   # dict when in a trade, None otherwise
-        self.done     = False  # True once this strike's one trade has exited
+        self.high     = high
+        self.low      = low
+        self.level    = level       # 62% retracement level
+        self.sl_price = sl_price
 
-    # ----------------------------------------------------------
-    def _enter_trade(self, candle, ema5, ema20):
-        entry    = candle["close"]
-        sl_price = round(candle["high"] + SL_OFFSET_POINTS, 2)
-        tag      = f"ITM1{self.label}"
+        self.target_price = None    # fixed at entry
+        self.entry_price  = None
+        self.state        = "waiting" if REQUIRE_LEVEL_TOUCH else "armed"
+
+        self.candles         = deque(maxlen=3000)   # closed 2-min candles
+        self.live_candle     = None
+        self.live_is_partial = False
 
         logger.info(
-            f"[{self.label} ENTRY] symbol={self.symbol} entry={entry:.2f} "
-            f"sl={sl_price:.2f} (signal_high={candle['high']:.2f}+{SL_OFFSET_POINTS}) "
-            f"EMA5={ema5:.2f} EMA20={ema20:.2f} time={candle['time']}"
+            f"[{self.label} SETUP] symbol={self.symbol} H={high:.2f} L={low:.2f} "
+            f"62%_level={level:.2f} sl={sl_price:.2f} state={self.state}"
+        )
+        send_telegram(
+            f"📌 {self.label} SETUP — {self.symbol}\n"
+            f"30-min candle: H={high:.2f} L={low:.2f}\n"
+            f"62% level = {level:.2f}\n"
+            f"SL        = {sl_price:.2f}\n"
+            f"Entry: price must reach {level:.2f}, then a 2-min red candle must close "
+            f"below EMA20 and below {level:.2f}"
+        )
+
+    # ---------------- EMA warm-up ----------------
+    def prefill(self):
+        """Load closed 2-min candles (previous days + today so far) for EMA20."""
+        now     = datetime.datetime.now()
+        from_dt = now.date() - datetime.timedelta(days=PREFILL_DAYS)
+        hist    = fetch_candles(self.fyers.client, self.symbol, EMA_RESOLUTION, from_dt, now.date())
+        tf      = datetime.timedelta(minutes=EMA_TF_MINUTES)
+        for c in hist:
+            if c["time"] + tf <= now:          # skip the candle still forming
+                self._append_closed(c)
+        ema20 = self._ema20()
+        logger.info(
+            f"[{self.label} PREFILL] {len(self.candles)} closed 2-min candles loaded, "
+            f"EMA20={ema20 if ema20 is None else f'{ema20:.2f}'}"
+        )
+
+    def _backfill_gap(self, upto_time):
+        """If 2-min candles are missing before `upto_time`, fetch them from history."""
+        tf = datetime.timedelta(minutes=EMA_TF_MINUTES)
+        if not self.candles or self.candles[-1]["time"] + tf >= upto_time:
+            return
+        try:
+            today = datetime.date.today()
+            hist  = fetch_candles(self.fyers.client, self.symbol, EMA_RESOLUTION, today, today)
+            added = 0
+            for c in hist:
+                if self.candles[-1]["time"] < c["time"] < upto_time:
+                    self._append_closed(c)
+                    added += 1
+            if added:
+                logger.info(f"[{self.label} BACKFILL] added {added} missing 2-min candle(s)")
+        except Exception as e:
+            logger.warning(f"[{self.label} BACKFILL] failed: {e}")
+
+    def _append_closed(self, candle):
+        if self.candles and candle["time"] <= self.candles[-1]["time"]:
+            return False
+        self.candles.append(dict(candle))
+        return True
+
+    def _ema20(self):
+        return compute_ema([c["close"] for c in self.candles], EMA_PERIOD)
+
+    # ---------------- orders ----------------
+    def _enter(self, ltp, candle, ema20):
+        risk = self.sl_price - ltp
+        if risk <= 0:
+            logger.info(f"[{self.label}] entry skipped — live {ltp:.2f} already >= SL {self.sl_price:.2f}")
+            return
+        self.entry_price  = ltp
+        self.target_price = round(ltp - REWARD_RISK * risk, 2)
+
+        logger.info(
+            f"[{self.label} ENTRY] symbol={self.symbol} 2-min red candle {candle['time']:%H:%M} "
+            f"C={candle['close']:.2f} < EMA20={ema20:.2f} & < 62%={self.level:.2f} — "
+            f"selling at market, live={ltp:.2f} sl={self.sl_price:.2f} target={self.target_price:.2f}"
         )
         send_telegram(
             f"📉 {self.label} ENTRY — {self.symbol}\n"
-            f"Sell price = {entry:.2f}\n"
-            f"SL         = {sl_price:.2f}  (signal-candle high {candle['high']:.2f} + {SL_OFFSET_POINTS})\n"
-            f"EMA5={ema5:.2f} | EMA20={ema20:.2f}\n"
-            f"Time: {candle['time']}"
+            f"2-min red candle ({candle['time']:%H:%M}) closed {candle['close']:.2f}\n"
+            f"below EMA20 {ema20:.2f} and 62% level {self.level:.2f} — SOLD at market\n"
+            f"Entry  ≈ {ltp:.2f}\n"
+            f"SL     = {self.sl_price:.2f}\n"
+            f"Target = {self.target_price:.2f}  ({REWARD_RISK:g}x risk)"
         )
+        self.fyers.sell_market(self.symbol, f"ATM62{self.label}SELL")
+        self.state = "in_position"
 
-        self.fyers.sell_market(self.symbol, f"{tag}SELL")
-
-        self.position = {
-            "entry_price": entry,
-            "sl_price":    sl_price,
-            "entry_time":  candle["time"],
-        }
-
-    def _exit_trade(self, reason):
+    def _exit(self, reason):
         logger.info(f"[{self.label} EXIT] symbol={self.symbol} {reason}")
         send_telegram(f"🛑 {self.label} EXIT — {self.symbol}\nReason: {reason}")
+        self.fyers.buy_market(self.symbol, f"ATM62{self.label}BUY")
+        self.state = "done"
 
-        tag = f"ITM1{self.label}"
-        self.fyers.buy_market(self.symbol, f"{tag}BUY")
-
-        self.position = None
-        self.done     = True   # only 1 trade per strike per day
-
-    # ----------------------------------------------------------
-    def on_candle(self, candle, closed, live_price=None):
-        now = datetime.datetime.now()
-
-        # ── EOD force-exit safety net (tick-level, always checked first) ──
-        if now.time() >= TRADING_END:
-            if self.position:
-                self._exit_trade("EOD 3:00 PM force-exit (safety net)")
+    # ---------------- candle close ----------------
+    def _on_candle_close(self, candle, partial, ltp):
+        self._backfill_gap(candle["time"])
+        if not self._append_closed(candle):
             return
-
-        # ── Live tick: SL check ──
-        if live_price is not None and self.position:
-            if live_price >= self.position["sl_price"]:
-                self._exit_trade(
-                    f"SL HIT — live price {live_price:.2f} >= SL {self.position['sl_price']:.2f}"
-                )
-
-        if not closed:
-            return
-
-        # ── Closed candle: update history ──
-        self.candles.append(candle)
-        closes = [c["close"] for c in self.candles]
-
-        if len(closes) < MIN_BARS_FOR_EMA:
-            return
-
-        ema5_curr  = compute_ema(closes, EMA_FAST)
-        ema20_curr = compute_ema(closes, EMA_SLOW)
-        prev_closes = closes[:-1]
-        ema5_prev   = compute_ema(prev_closes, EMA_FAST)
-        ema20_prev  = compute_ema(prev_closes, EMA_SLOW)
-
-        if ema5_curr is None or ema20_curr is None:
-            return
-
+        ema20 = self._ema20()
+        is_red = candle["close"] < candle["open"]
         logger.info(
-            f"[{self.label} CANDLE] {candle['time']} "
-            f"O={candle['open']:.2f} H={candle['high']:.2f} "
-            f"L={candle['low']:.2f} C={candle['close']:.2f} "
-            f"EMA5={ema5_curr:.2f} EMA20={ema20_curr:.2f} "
-            f"position={'YES' if self.position else 'no'} done={self.done}"
+            f"[{self.label} 2MIN] {candle['time']:%H:%M} O={candle['open']:.2f} "
+            f"H={candle['high']:.2f} L={candle['low']:.2f} C={candle['close']:.2f} "
+            f"red={is_red} EMA20={ema20 if ema20 is None else f'{ema20:.2f}'} state={self.state}"
+            f"{' (partial)' if partial else ''}"
         )
+        if self.state != "armed" or ema20 is None:
+            return
+        if partial:
+            # first live candle started mid-bucket, so its open isn't reliable
+            return
+        close_time = (candle["time"] + datetime.timedelta(minutes=EMA_TF_MINUTES)).time()
+        if close_time >= SAFETY_TIME:
+            return
+        if is_red and candle["close"] < ema20 and candle["close"] < self.level:
+            self._enter(ltp, candle, ema20)
 
-        # Candle-level EOD guard (belt-and-suspenders alongside tick-level)
-        if candle["time"].time() >= TRADING_END:
-            if self.position:
-                self._exit_trade("EOD 3:00 PM (candle-level)")
+    # ---------------- tick ----------------
+    def on_tick(self, ltp, tick_dt, now_dt):
+        if self.state == "done":
             return
 
-        # ── If in a position, only the reversal-exit check applies ──
-        if self.position:
-            is_green = candle["close"] > candle["open"]
-            reversal = (
-                is_green and
-                candle["close"] > ema5_curr and
-                candle["close"] > ema20_curr and
-                ema5_curr > ema20_curr
-            )
-            if reversal:
-                self._exit_trade(
-                    f"Reversal signal — green candle closed above both EMAs "
-                    f"(EMA5={ema5_curr:.2f} > EMA20={ema20_curr:.2f})"
-                )
+        # ── EOD safety net ──
+        if now_dt.time() >= SAFETY_TIME:
+            if self.state == "in_position":
+                self._exit("3:14 PM safety-net force-exit")
+            else:
+                logger.info(f"[{self.label} SAFETY] entry never triggered — no trade")
+                send_telegram(f"🕒 {self.label} SAFETY NET — entry never triggered, no trade ({self.symbol})")
+                self.state = "done"
             return
 
-        # ── Not in a position: check for entry (only once per day) ──
-        if self.done:
-            return
-        if ema5_prev is None or ema20_prev is None:
+        # ── Build 2-min candles from ticks ──
+        if tick_dt.time() >= MARKET_OPEN:
+            bucket = bucket_start(tick_dt)
+            lc = self.live_candle
+            if lc is None or bucket > lc["time"]:
+                if lc is not None:
+                    self._on_candle_close(lc, self.live_is_partial, ltp)
+                self.live_is_partial = lc is None
+                self.live_candle = {"time": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp}
+            elif bucket == lc["time"]:
+                lc["high"]  = max(lc["high"], ltp)
+                lc["low"]   = min(lc["low"], ltp)
+                lc["close"] = ltp
+
+        # ── Arm once the 62% level is reached ──
+        if self.state == "waiting" and ltp >= self.level:
+            self.state = "armed"
+            logger.info(f"[{self.label} ARMED] live {ltp:.2f} >= 62% level {self.level:.2f} — "
+                        f"waiting for 2-min red candle below EMA20 & 62% level")
+            send_telegram(f"🎯 {self.label} ARMED — {self.symbol}\nLive {ltp:.2f} reached 62% level "
+                          f"{self.level:.2f}\nWaiting for 2-min red candle close below EMA20 & level")
             return
 
-        entry_signal = (
-            candle["close"] < ema5_curr and
-            candle["close"] < ema20_curr and
-            ema5_curr < ema20_curr and
-            ema5_prev > ema20_prev
-        )
-        if entry_signal:
-            self._enter_trade(candle, ema5_curr, ema20_curr)
+        # ── SL / target ──
+        if self.state == "in_position":
+            if ltp <= self.target_price:
+                self._exit(f"TARGET HIT — live price {ltp:.2f} <= target {self.target_price:.2f}")
+            elif ltp >= self.sl_price:
+                self._exit(f"SL HIT — live price {ltp:.2f} >= SL {self.sl_price:.2f}")
 
 
 # =========================================================
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("[BOOT] NIFTY ITM1 EMA-REVERSAL STRATEGY STARTED")
-    send_telegram("🚀 NIFTY ITM1 EMA-REVERSAL STRATEGY STARTED")
+    logger.info("[BOOT] NIFTY ATM 62%-RETRACEMENT + 2-MIN EMA20 SELL STRATEGY STARTED")
+    send_telegram("🚀 NIFTY ATM 62%-RETRACEMENT + 2-MIN EMA20 SELL STRATEGY STARTED")
 
     fyers = FyersClient()
 
-    # ── Step 1: wait until 9:16 AM ──
-    logger.info(f"[WAIT] Waiting until {DECISION_TIME} to check spot & pick strikes...")
-    while datetime.datetime.now().time() < DECISION_TIME:
+    # ── Step 1: wait for the first 30-min candle (9:15-9:45) to close ──
+    logger.info(f"[WAIT] Waiting until {SETUP_WAIT_TIME} for the 30-min candle to close...")
+    while datetime.datetime.now().time() < SETUP_WAIT_TIME:
         time.sleep(1)
 
-    # ── Step 2: spot → ITM1 CE / PE strikes ──
-    spot = get_spot_price(fyers.client)
-    atm, ce_strike, pe_strike = compute_itm1_strikes(spot)
+    # ── Step 2: ATM strike from NIFTY's own first 30-min candle ──
+    atm = get_atm_from_first_candle(fyers.client)
+    ce_symbol = build_symbol(atm, "CE")
+    pe_symbol = build_symbol(atm, "PE")
+    logger.info(f"[SYMBOLS] ATM={atm} CE={ce_symbol} PE={pe_symbol}")
+    send_telegram(f"📌 ATM={atm}\nCE: {ce_symbol}\nPE: {pe_symbol}")
 
-    ce_symbol = build_symbol(ce_strike, "CE")
-    pe_symbol = build_symbol(pe_strike, "PE")
-    logger.info(f"[SYMBOLS] CE={ce_symbol} | PE={pe_symbol}")
-    send_telegram(f"📌 SYMBOLS\nCE (sell): {ce_symbol}\nPE (sell): {pe_symbol}")
+    # ── Step 3: evaluate each leg's own first 30-min candle, then warm up EMA20 ──
+    engines = {}
+    for label, symbol in [("CE", ce_symbol), ("PE", pe_symbol)]:
+        candle = get_first_30min_candle(fyers.client, symbol)
+        is_red = candle["close"] < candle["open"]
+        logger.info(
+            f"[{label} 30MIN] O={candle['open']:.2f} H={candle['high']:.2f} "
+            f"L={candle['low']:.2f} C={candle['close']:.2f} red={is_red}"
+        )
+        if not is_red:
+            logger.info(f"[{label}] first candle not red — no trade on this leg")
+            send_telegram(f"⚪ {label} — first 30-min candle not red, skipping this leg")
+            continue
 
-    ce_engine = StrikeStrategy(fyers, ce_symbol, "CE")
-    pe_engine = StrikeStrategy(fyers, pe_symbol, "PE")
-    engines   = {ce_symbol: ce_engine, pe_symbol: pe_engine}
+        high, low = candle["high"], candle["low"]
+        level     = round(low + RETRACEMENT * (high - low), 2)
+        engine    = OptionLegStrategy(fyers, symbol, label, high, low, level, sl_price=high)
+        engine.prefill()
+        engines[symbol] = engine
 
-    # ── Step 3: prefill historical 5-min candles (past days only, EMA warm-up) ──
-    today = datetime.date.today()
-    for symbol, engine in engines.items():
-        hist = fetch_historical_candles(fyers.client, symbol)
-        for c in hist:
-            if c["time"].date() < today:
-                engine.candles.append(c)
-        closes = [c["close"] for c in engine.candles]
-        if len(closes) >= MIN_BARS_FOR_EMA:
-            e5, e20 = compute_ema(closes, EMA_FAST), compute_ema(closes, EMA_SLOW)
-            logger.info(f"[EMA BOOT] {symbol}: EMA5={e5:.2f} EMA20={e20:.2f}")
+    if not engines:
+        logger.info("[DONE] Neither CE nor PE had a red first candle — nothing to trade today.")
+        send_telegram("⚪ Neither CE nor PE had a red first candle — no trades today.")
+        sys.exit(0)
 
-        # feed any of today's candles that already exist (e.g. 9:15 candle,
-        # if it happened to close before 9:16 decision time)
-        for c in hist:
-            if c["time"].date() == today:
-                engine.on_candle(c, closed=True)
-
-    # ── Step 4: websocket for live ticks ──
-    SUBSCRIBED_SYMBOLS = [ce_symbol, pe_symbol]
-    live_candle = {ce_symbol: None, pe_symbol: None}
-
-    def extract_tick_epoch(msg):
-        ts = msg.get("last_traded_time") or msg.get("timestamp") or msg.get("tt")
-        return int(ts // 1000) if ts and ts > 10_000_000_000 else int(ts)
+    # ── Step 4: websocket — live ticks build 2-min candles and drive entry / SL / target ──
+    SUBSCRIBED_SYMBOLS = list(engines.keys())
 
     def on_tick(msg):
         if "symbol" not in msg or "ltp" not in msg:
             return
-
         sym = msg["symbol"]
         if sym not in engines:
             return
-
-        engine = engines[sym]
-        ltp    = msg["ltp"]
-        now    = datetime.datetime.now()
-
-        # EOD: pass live price for tick-level force-exit
-        if now.time() >= TRADING_END:
-            engine.on_candle(live_candle[sym] or {}, closed=False, live_price=ltp)
-            return
-
-        epoch  = extract_tick_epoch(msg)
-        dt     = datetime.datetime.fromtimestamp(epoch)
-        bucket = dt.replace(second=0, microsecond=0, minute=(dt.minute // 5) * 5)
-
-        candle = live_candle[sym]
-        if candle is None or candle["time"] != bucket:
-            if candle:
-                engine.on_candle(candle, closed=True, live_price=None)
-            candle = {
-                "time":  bucket,
-                "open":  ltp,
-                "high":  ltp,
-                "low":   ltp,
-                "close": ltp,
-            }
-            live_candle[sym] = candle
-        else:
-            candle["high"]  = max(candle["high"], ltp)
-            candle["low"]   = min(candle["low"],  ltp)
-            candle["close"] = ltp
-
-        # Live tick: SL check
-        engine.on_candle(candle, closed=False, live_price=ltp)
+        engines[sym].on_tick(msg["ltp"], tick_datetime(msg), datetime.datetime.now())
 
     def on_open():
         ws.subscribe(symbols=SUBSCRIBED_SYMBOLS, data_type="SymbolUpdate")
