@@ -68,6 +68,16 @@
 # 8. The SENSEX INDEX is used ONLY ONCE, at 09:16, to compute ATM and
 #    derive the ITM1 CE/PE strikes. Everything else is computed purely
 #    from each option contract's own premium data.
+#
+# 9. SEED CANDLE: the websocket only starts delivering ticks once it
+#    connects, which lags the start of the current 5-min bucket by a few
+#    seconds to over a minute. Left alone, the first candle of the day
+#    would be built only from ticks seen after connect time, silently
+#    missing whatever happened earlier in that bucket (e.g. the true low
+#    of the day, made before the websocket was even listening). Before
+#    connecting, each leg's currently-forming candle is fetched via REST
+#    history and used to seed CandleBuilder, so the first candle reflects
+#    the FULL bucket's true O/H/L/C, not a partial one.
 # =========================================================
 
 import datetime
@@ -490,11 +500,63 @@ class RetestEngine:
             )
 
 
+# ================= SEED CANDLE (fixes the partial-first-candle gap) =================
+def fetch_seed_candle(fyers, symbol, timeframe_min):
+    """The websocket only starts receiving ticks once it connects, which is
+    always at least a couple of seconds -- sometimes over a minute -- after
+    the current 5-min bucket started. Left alone, CandleBuilder would seed
+    its first candle from the first tick it happens to see, silently
+    missing whatever happened earlier in that bucket (a low made in the
+    first 80 seconds, say, would never be recorded).
+
+    This pulls the CURRENTLY-FORMING candle's true Open/High/Low/Close so
+    far via the REST history API (same endpoint used for backfilling),
+    finds the one whose bucket matches "now", and returns it so
+    CandleBuilder can be seeded with it instead of starting from None.
+    Returns None if no matching candle is available yet (e.g. brand new
+    contract with no history, or called right at/before market open)."""
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+
+    try:
+        resp = fyers.client.history({
+            "symbol": symbol,
+            "resolution": str(timeframe_min),
+            "date_format": "1",
+            "range_from": today_str,
+            "range_to": today_str,
+            "cont_flag": "1"
+        })
+    except Exception as e:
+        logger.warning(f"Seed-candle history fetch failed for {symbol}: {e}")
+        return None
+
+    candles = resp.get("candles") or []
+    if not candles:
+        return None
+
+    now = datetime.datetime.now()
+    bucket = now.replace(
+        minute=(now.minute // timeframe_min) * timeframe_min,
+        second=0, microsecond=0
+    )
+
+    for ts_epoch, o, h, l, c, _vol in candles:
+        ts = datetime.datetime.fromtimestamp(ts_epoch)
+        if ts == bucket:
+            return {"time": bucket, "open": o, "high": h, "low": l, "close": c}
+
+    return None
+
+
 # ================= 5-MIN CANDLE BUILDER =================
 class CandleBuilder:
-    def __init__(self, timeframe_min):
+    def __init__(self, timeframe_min, seed=None):
+        """seed: an optional {'time','open','high','low','close'} dict for
+        the currently-forming candle, fetched via fetch_seed_candle(), so
+        the first candle reflects the FULL bucket rather than only
+        whatever ticks arrived after the websocket connected."""
         self.timeframe_min = timeframe_min
-        self.current = None
+        self.current = dict(seed) if seed else None
 
     def on_tick(self, ltp, ts):
         bucket = ts.replace(
@@ -661,8 +723,25 @@ if __name__ == "__main__":
     ce_tm = LegTradeManager(fyers, itm1_ce, "CE", ce_engine)
     pe_tm = LegTradeManager(fyers, itm1_pe, "PE", pe_engine)
 
-    ce_builder = CandleBuilder(TIMEFRAME_MIN)
-    pe_builder = CandleBuilder(TIMEFRAME_MIN)
+    # Seed each leg's currently-forming candle from REST history BEFORE the
+    # websocket connects, so the first candle of the day (or of whatever
+    # bucket we start in) reflects the true full-bucket O/H/L/C instead of
+    # only ticks seen after connect time.
+    ce_seed = fetch_seed_candle(fyers, itm1_ce, TIMEFRAME_MIN)
+    pe_seed = fetch_seed_candle(fyers, itm1_pe, TIMEFRAME_MIN)
+
+    if ce_seed:
+        logger.info(f"[CE] seeded current candle from history -> {ce_seed}")
+    else:
+        logger.warning("[CE] no seed candle available yet; first live candle may be partial.")
+
+    if pe_seed:
+        logger.info(f"[PE] seeded current candle from history -> {pe_seed}")
+    else:
+        logger.warning("[PE] no seed candle available yet; first live candle may be partial.")
+
+    ce_builder = CandleBuilder(TIMEFRAME_MIN, seed=ce_seed)
+    pe_builder = CandleBuilder(TIMEFRAME_MIN, seed=pe_seed)
 
     def on_tick(msg):
         symbol = msg.get("symbol")
