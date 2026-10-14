@@ -26,12 +26,26 @@ SELL strategies.
            closing below EMA21 after the previous trade has exited).
 
 ━━━ SCENARIO 2 ━━━
-  Entry  : a later RED candle that closes below the first candle's LOW
-           (set S2_BREAK_LEVEL = "close" to use the first candle's close)
-           → SELL at market.
-  SL     : high of the entry candle, checked every tick.
-  Exit   : SL hit, OR a 5-min candle closes above EMA21, OR 3:00 PM.
-  Trades : only 1 per leg.
+  A) Breakdown [S2B] — entry candle must CLOSE by 9:45 AM
+     Entry : RED candle closing below the first candle's LOW
+             (S2_BREAK_LEVEL = "close" to use the first candle's close).
+     SL    : high of the entry candle (every tick).
+     Exit  : SL, OR a 5-min candle closes above EMA21, OR 3:00 PM.
+
+  B) Pin-bar re-entry [S2P] — only after A
+     If A's SL is hit on the very next candle AND that candle closes as a
+     RED PIN BAR (red, open in the bottom PIN_BAR_OPEN_MAX_FRAC = 50% of
+     its high-low range), SELL again at its close.
+     SL    : high of the pin-bar candle.   Exit : SL or 3:00 PM.
+
+  C) Fallback [S2F] — only if A gave no entry by 9:45 AM
+     Wait for a GREEN candle that OPENS below EMA21 and CLOSES above it.
+     If, within the next 5 candles, a RED candle OPENS above EMA21 and
+     CLOSES below it, SELL.
+     SL    : high of that red candle.      Exit : SL or 3:00 PM.
+     If 5 candles pass, wait for a new such green candle.
+     A newer such green candle restarts the 5-candle window.
+     Only 1 fallback trade.
 
 ━━━ HEDGE (expiry day only) ━━━
   Expiry: NIFTY = Tuesday, SENSEX = Thursday; moved to the previous trading
@@ -118,8 +132,10 @@ CANDLE_MINUTES     = 5
 EMA_PERIOD = 21
 
 S1_MAX_TRADES   = 2        # Scenario 1 trades per leg per day
-S2_MAX_TRADES   = 1        # Scenario 2: only 1 trade
 S2_BREAK_LEVEL  = "low"    # "low" or "close" of the first candle
+S2_BREAKDOWN_DEADLINE = datetime.time(9, 45)   # breakdown entry candle must CLOSE by this
+S2_FALLBACK_WINDOW    = 5                      # red candle must come within N candles of green
+PIN_BAR_OPEN_MAX_FRAC = 0.5   # red pin bar: open within the bottom 50% of the high-low range
 
 
 LOG_FILE = "atm_ema21_option_sell.log"
@@ -386,6 +402,14 @@ def compute_ema(closes, period):
 # LEG STRATEGY (one instance per option: ATM CE, ATM PE)
 # =========================================================
 class LegStrategy:
+    """
+    Trade kinds (also used in order tags, letters/digits only):
+      S1  – Scenario 1 trade
+      S2B – Scenario 2 first-candle breakdown
+      S2P – Scenario 2 pin-bar re-entry after S2B SL hit on the next candle
+      S2F – Scenario 2 fallback (green above EMA21 → red below EMA21 within 5)
+    """
+
     def __init__(self, fyers, symbol, label, hedge_symbol=None):
         self.fyers        = fyers
         self.symbol       = symbol
@@ -400,17 +424,44 @@ class LegStrategy:
         self.first_candle = None
 
         self.position     = None
-        self.trades_taken = 0
+        self.trades_taken = 0      # all trades on this leg (for tag numbering)
+        self.s1_trades    = 0
         self.lock         = threading.RLock()
 
+        # Scenario 2 state machine
+        #   BREAKDOWN      – waiting for red close below first candle (till 9:45)
+        #   BREAKDOWN_OPEN – S2B trade running
+        #   PINBAR_WATCH   – S2B stopped out; check if that candle is a red pin bar
+        #   FALLBACK       – no breakdown by 9:45; green>EMA21 then red<EMA21 within 5
+        #   DONE           – no more Scenario 2 trades today
+        self.s2_phase      = None
+        self.fb_green      = None    # green candle that armed the fallback window
+        self.fb_count      = 0       # candles seen since that green candle
+        self.last_sl_exit  = None    # info about the most recent SL exit
+
         # While replaying today's already-closed candles at startup (e.g. a
-        # restart at 10:30) we only rebuild scenario / day high — no orders
-        # are placed on old candles. Live candles turn this off.
+        # restart at 10:30) we only rebuild state — no orders are placed on
+        # old candles. Live candles turn this off.
         self.replaying    = False
 
-    @property
-    def max_trades(self):
-        return {1: S1_MAX_TRADES, 2: S2_MAX_TRADES}.get(self.scenario, 0)
+    # ----------------------------------------------------------
+    @staticmethod
+    def _bucket(dt):
+        return dt.replace(second=0, microsecond=0,
+                          minute=(dt.minute // CANDLE_MINUTES) * CANDLE_MINUTES)
+
+    @staticmethod
+    def _is_red_pin_bar(c):
+        """Red candle whose OPEN sits in the lower part of its full high-low range."""
+        rng = c["high"] - c["low"]
+        if c["close"] >= c["open"] or rng <= 0:
+            return False
+        return (c["open"] - c["low"]) <= PIN_BAR_OPEN_MAX_FRAC * rng
+
+    def _notify(self, msg):
+        logger.info(f"[{self.label}] {msg}")
+        if not self.replaying:
+            send_telegram(f"ℹ️ {self.label} {self.symbol}\n{msg}")
 
     # ----------------------------------------------------------
     def _classify_first_candle(self, candle, ema):
@@ -426,9 +477,11 @@ class LegStrategy:
             reason = f"{colour} & closed above EMA21 → wait for red close below EMA21"
         elif is_red and candle["close"] < ema:
             self.scenario = 2
+            self.s2_phase = "BREAKDOWN"
             lvl = candle[S2_BREAK_LEVEL]
             reason = (f"RED & closed below EMA21 → wait for red close below "
-                      f"first-candle {S2_BREAK_LEVEL} {lvl:.2f}")
+                      f"first-candle {S2_BREAK_LEVEL} {lvl:.2f} "
+                      f"(entry candle must close by {S2_BREAKDOWN_DEADLINE:%H:%M})")
         else:
             self.scenario = 0
             reason = "first candle fits neither scenario → no trade today"
@@ -446,18 +499,19 @@ class LegStrategy:
         )
 
     # ----------------------------------------------------------
-    def _enter_trade(self, candle, sl, ema, why):
+    def _enter_trade(self, candle, sl, ema, kind, why):
+        """Returns True if the short was placed."""
         with self.lock:
             if self.position:
-                return
+                return False
             entry = candle["close"]
             risk  = sl - entry
             if risk <= 0:
-                logger.info(f"[{self.label} SKIP] SL {sl:.2f} <= entry {entry:.2f}")
-                return
+                logger.info(f"[{self.label} SKIP {kind}] SL {sl:.2f} <= entry {entry:.2f}")
+                return False
 
             n   = self.trades_taken + 1
-            tag = f"ATM{self.label}S{self.scenario}T{n}"
+            tag = f"ATM{self.label}{kind}T{n}"
 
             # Expiry-day hedge first — never sell naked if it fails
             hedge_bought = False
@@ -466,7 +520,7 @@ class LegStrategy:
                 if not order_ok(resp):
                     logger.error(f"[{self.label}] hedge buy failed — short NOT placed")
                     send_telegram(f"❗ {self.label} hedge buy failed — skipping short")
-                    return
+                    return False
                 hedge_bought = True
 
             resp = self.fyers.sell_market(self.symbol, tag)
@@ -474,33 +528,38 @@ class LegStrategy:
                 logger.error(f"[{self.label}] short sell failed")
                 if hedge_bought:
                     self.fyers.sell_market(self.hedge_symbol, f"{tag}HX")
-                return
+                return False
 
             self.trades_taken = n
             self.position = {
+                "kind":         kind,
                 "entry_price":  entry,
                 "sl_price":     sl,
-                "entry_time":   candle["time"],
+                "entry_candle": candle["time"],
                 "tag":          tag,
                 "hedge":        hedge_bought,
             }
 
             hedge_txt = f"\nHedge bought: {self.hedge_symbol}" if hedge_bought else ""
+            exit_txt  = ("SL / close above EMA21 / 3:00 PM" if kind == "S2B"
+                         else "SL / 3:00 PM")
             logger.info(
-                f"[{self.label} SELL #{n}] scenario={self.scenario} symbol={self.symbol} "
+                f"[{self.label} SELL #{n} {kind}] symbol={self.symbol} "
                 f"entry={entry:.2f} sl={sl:.2f} risk={risk:.2f} EMA21={ema:.2f} "
-                f"candle={candle['time'].strftime('%H:%M')} ({why})"
+                f"candle={candle['time']:%H:%M} ({why})"
                 f"{' hedge=' + self.hedge_symbol if hedge_bought else ''}"
             )
             send_telegram(
-                f"📉 {self.label} SELL #{n} (Scenario {self.scenario}) — {self.symbol}\n"
+                f"📉 {self.label} SELL #{n} [{kind}] — {self.symbol}\n"
                 f"Entry = {entry:.2f}\n"
                 f"SL    = {sl:.2f} ({why})\n"
                 f"EMA21 = {ema:.2f}\n"
-                f"Signal candle: {candle['time'].strftime('%H:%M')}{hedge_txt}"
+                f"Exit  : {exit_txt}\n"
+                f"Signal candle: {candle['time']:%H:%M}{hedge_txt}"
             )
+            return True
 
-    def _exit_trade(self, reason, price=None):
+    def _exit_trade(self, reason, price=None, sl_hit=False):
         with self.lock:
             if not self.position:
                 return
@@ -517,11 +576,22 @@ class LegStrategy:
             if pos["hedge"]:
                 self.fyers.sell_market(self.hedge_symbol, f"{pos['tag']}HX")
 
-            logger.info(f"[{self.label} EXIT] symbol={self.symbol} {reason}{pnl_txt}")
-            send_telegram(f"🛑 {self.label} EXIT — {self.symbol}\nReason: {reason}{pnl_txt}")
+            logger.info(f"[{self.label} EXIT {pos['kind']}] symbol={self.symbol} {reason}{pnl_txt}")
+            send_telegram(f"🛑 {self.label} EXIT [{pos['kind']}] — {self.symbol}\n"
+                          f"Reason: {reason}{pnl_txt}")
 
-            if self.trades_taken >= self.max_trades:
-                logger.info(f"[{self.label}] max trades for scenario {self.scenario} done")
+            # Scenario 2 phase after an exit
+            if pos["kind"] == "S2B":
+                if sl_hit:
+                    self.last_sl_exit = {
+                        "entry_candle": pos["entry_candle"],
+                        "exit_candle":  self._bucket(datetime.datetime.now()),
+                    }
+                    self.s2_phase = "PINBAR_WATCH"
+                else:
+                    self.s2_phase = "DONE"
+            elif pos["kind"] in ("S2P", "S2F"):
+                self.s2_phase = "DONE"
 
     def force_eod_exit(self):
         if self.position:
@@ -537,7 +607,8 @@ class LegStrategy:
             return
         if ltp >= self.position["sl_price"]:
             self._exit_trade(
-                f"SL HIT — LTP {ltp:.2f} >= SL {self.position['sl_price']:.2f}", ltp
+                f"SL HIT — LTP {ltp:.2f} >= SL {self.position['sl_price']:.2f}",
+                ltp, sl_hit=True
             )
 
     def on_closed_candle(self, candle):
@@ -553,11 +624,11 @@ class LegStrategy:
 
         ema_txt = f"{ema:.2f}" if ema is not None else "n/a"
         logger.info(
-            f"[{self.label} CANDLE] {candle['time'].strftime('%H:%M')} "
+            f"[{self.label} CANDLE] {candle['time']:%H:%M} "
             f"O={candle['open']:.2f} H={candle['high']:.2f} "
             f"L={candle['low']:.2f} C={candle['close']:.2f} EMA21={ema_txt} "
-            f"dayHigh={self.day_high} scenario={self.scenario} "
-            f"pos={'YES' if self.position else 'no'} trades={self.trades_taken}"
+            f"dayHigh={self.day_high} scenario={self.scenario} s2={self.s2_phase} "
+            f"pos={self.position['kind'] if self.position else 'no'} trades={self.trades_taken}"
         )
 
         if not is_today:
@@ -577,37 +648,99 @@ class LegStrategy:
                 self._exit_trade("EOD 3:00 PM (candle-level)", candle["close"])
             return
 
-        # Scenario 2 exit: candle closes above EMA21
+        close_time = (candle["time"] + datetime.timedelta(minutes=CANDLE_MINUTES)).time()
+        # No new trades from replayed candles or from the candle closing at 3:00 PM
+        can_enter  = (not self.replaying) and close_time < TRADING_END
+
+        if self.scenario == 1:
+            self._scenario1(candle, ema, can_enter)
+        else:
+            self._scenario2(candle, ema, close_time, can_enter)
+
+    # ----------------------------------------------------------
+    def _scenario1(self, candle, ema, can_enter):
+        if self.position or self.s1_trades >= S1_MAX_TRADES or not can_enter:
+            return
+        if candle["close"] < candle["open"] and candle["close"] < ema:
+            if self._enter_trade(candle, self.day_high, ema, "S1", "SL = option day high"):
+                self.s1_trades += 1
+
+    def _scenario2(self, candle, ema, close_time, can_enter):
+        is_red   = candle["close"] < candle["open"]
+        is_green = candle["close"] > candle["open"]
+
+        # ── Exit rule that only applies to the breakdown trade ──
         if self.position:
-            if self.scenario == 2 and candle["close"] > ema:
+            if self.position["kind"] == "S2B" and candle["close"] > ema:
                 self._exit_trade(
                     f"candle closed above EMA21 ({candle['close']:.2f} > {ema:.2f})",
                     candle["close"]
                 )
             return
 
-        if self.trades_taken >= self.max_trades:
+        # ── Pin-bar re-entry check (runs on the candle in which the S2B SL hit) ──
+        if self.s2_phase == "PINBAR_WATCH":
+            self.s2_phase = "DONE"
+            info = self.last_sl_exit or {}
+            next_candle = info.get("entry_candle", candle["time"]) + \
+                datetime.timedelta(minutes=CANDLE_MINUTES)
+            sl_on_next  = (info.get("exit_candle") == next_candle == candle["time"])
+
+            if not sl_on_next:
+                self._notify("S2 breakdown SL was not hit on the very next candle "
+                             "→ no pin-bar re-entry; Scenario 2 done for today")
+                return
+            if not self._is_red_pin_bar(candle):
+                self._notify(f"SL candle {candle['time']:%H:%M} is not a red pin bar "
+                             f"→ no re-entry; Scenario 2 done for today")
+                return
+            if can_enter:
+                self._enter_trade(candle, candle["high"], ema, "S2P",
+                                  "red pin bar re-entry, SL = pin bar high")
             return
 
-        if self.replaying:
-            return   # never trade on a replayed (old) candle
-
-        # A candle closing at 3:00 PM must not open a trade
-        candle_close_time = (candle["time"] + datetime.timedelta(minutes=CANDLE_MINUTES)).time()
-        if candle_close_time >= TRADING_END:
+        # ── First-candle breakdown, entry candle must close by 9:45 ──
+        if self.s2_phase == "BREAKDOWN":
+            if close_time <= S2_BREAKDOWN_DEADLINE:
+                level = self.first_candle[S2_BREAK_LEVEL]
+                if is_red and candle["close"] < level and can_enter:
+                    if self._enter_trade(candle, candle["high"], ema, "S2B",
+                                         "SL = entry candle high"):
+                        self.s2_phase = "BREAKDOWN_OPEN"
+                        return
+            if close_time >= S2_BREAKDOWN_DEADLINE:
+                self.s2_phase = "FALLBACK"
+                self._notify(f"No breakdown entry by {S2_BREAKDOWN_DEADLINE:%H:%M} → "
+                             f"switching to fallback: wait for green candle crossing EMA21 upward, "
+                             f"then red candle crossing it downward within {S2_FALLBACK_WINDOW} candles")
             return
 
-        is_red = candle["close"] < candle["open"]
-        if not is_red:
-            return
+        # ── Fallback: green close above EMA21, then red close below EMA21 within 5 ──
+        if self.s2_phase == "FALLBACK":
+            if self.fb_green is not None:
+                self.fb_count += 1
+                if is_red and candle["open"] > ema and candle["close"] < ema:
+                    if can_enter and self._enter_trade(
+                            candle, candle["high"], ema, "S2F",
+                            f"red crossed EMA21 down {self.fb_count} candle(s) after green "
+                            f"{self.fb_green['time']:%H:%M}, SL = red candle high"):
+                        self.s2_phase = "FALLBACK_OPEN"
+                        return
 
-        if self.scenario == 1 and candle["close"] < ema:
-            self._enter_trade(candle, self.day_high, ema, "SL = option day high")
+            if is_green and candle["open"] < ema and candle["close"] > ema:
+                self.fb_green = candle
+                self.fb_count = 0
+                self._notify(f"Fallback armed: green {candle['time']:%H:%M} crossed EMA21 "
+                             f"upward (O {candle['open']:.2f} < {ema:.2f} < C {candle['close']:.2f})"
+                             f" → watching next {S2_FALLBACK_WINDOW} candles for a red candle "
+                             f"opening above and closing below EMA21")
+                return
 
-        elif self.scenario == 2:
-            level = self.first_candle[S2_BREAK_LEVEL]
-            if candle["close"] < level:
-                self._enter_trade(candle, candle["high"], ema, "SL = entry candle high")
+            if self.fb_green is not None and self.fb_count >= S2_FALLBACK_WINDOW:
+                self._notify(f"Fallback window from green {self.fb_green['time']:%H:%M} "
+                             f"expired → waiting for a new green candle crossing EMA21 upward")
+                self.fb_green = None
+                self.fb_count = 0
 
 
 # =========================================================
