@@ -1,13 +1,14 @@
 """
-NIFTY ATM EMA21 OPTION-SELLING STRATEGY
-=======================================
+NIFTY / SENSEX ATM EMA21 OPTION-SELLING STRATEGY
+================================================
 5-minute candles. EMA21 is computed on the INDIVIDUAL option premium of the
 ATM CE and the ATM PE. The two legs run as fully independent single-leg
 SELL strategies.
 
 ━━━ STRIKE SELECTION ━━━
-  Uses the CLOSE of the NIFTY50 index 9:15 5-min candle (closes at 9:20 AM).
-  ATM = round(close_920 / 50) * 50   → ATM CE and ATM PE, fixed for the day.
+  Index by weekday: Mon/Tue/Fri = NIFTY, Wed/Thu = SENSEX (DAY_TO_INDEX).
+  Uses the CLOSE of that index's 9:15 5-min candle (closes at 9:20 AM).
+  ATM = round(close_920 / step) * step (50 NIFTY, 100 SENSEX) → ATM CE & PE.
 
 ━━━ SCENARIO DETECTION (per leg) ━━━
   Look at the option's own 9:15–9:20 candle ("first candle"):
@@ -33,6 +34,8 @@ SELL strategies.
   Trades : only 1 per leg.
 
 ━━━ HEDGE (expiry day only) ━━━
+  Expiry: NIFTY = Tuesday, SENSEX = Thursday; moved to the previous trading
+  day when that day is a holiday.
   On expiry day, before each SELL, BUY a same-type option HEDGE_DISTANCE
   (300) points further OTM:  CE hedge = ATM + 300 CE,  PE hedge = ATM − 300 PE.
   If the hedge order fails, the short is NOT placed.
@@ -63,9 +66,47 @@ ACCESS_TOKEN       = os.getenv("FYERS_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-LOT_SIZE      = 65     # qty sent to the API
-STRIKE_STEP   = 50     # Nifty strike interval
-INDEX_SYMBOL  = "NSE:NIFTY50-INDEX"
+# ── Which index to trade, by weekday (Mon=0 … Fri=4) ──
+DAY_TO_INDEX = {
+    0: "NIFTY",    # Monday
+    1: "NIFTY",    # Tuesday
+    2: "SENSEX",   # Wednesday
+    3: "SENSEX",   # Thursday
+    4: "NIFTY",    # Friday
+}
+
+INDEX_CONFIG = {
+    "NIFTY": {
+        "index_symbol":   "NSE:NIFTY50-INDEX",
+        "option_prefix":  "NSE:NIFTY",
+        "strike_step":    50,
+        "lot_size":       65,     # qty sent to the API
+        "expiry_weekday": 1,      # Tuesday
+        "hedge_distance": 300,
+    },
+    "SENSEX": {
+        "index_symbol":   "BSE:SENSEX-INDEX",
+        "option_prefix":  "BSE:SENSEX",
+        "strike_step":    100,
+        "lot_size":       20,     # qty sent to the API
+        "expiry_weekday": 3,      # Thursday
+        "hedge_distance": 300,
+    },
+}
+
+_today_wd = datetime.date.today().weekday()
+if _today_wd not in DAY_TO_INDEX:
+    print("Weekend — no index configured for today. Exiting.")
+    sys.exit(0)
+
+INDEX_NAME     = DAY_TO_INDEX[_today_wd]
+CFG            = INDEX_CONFIG[INDEX_NAME]
+INDEX_SYMBOL   = CFG["index_symbol"]
+OPTION_PREFIX  = CFG["option_prefix"]
+STRIKE_STEP    = CFG["strike_step"]
+LOT_SIZE       = CFG["lot_size"]
+EXPIRY_WEEKDAY = CFG["expiry_weekday"]
+HEDGE_DISTANCE = CFG["hedge_distance"]
 
 DECISION_TIME   = datetime.time(9, 20, 5)  # just after 9:20 candle close
 FIRST_CANDLE    = datetime.time(9, 15)     # 5-min candle 9:15–9:20
@@ -80,9 +121,8 @@ S1_MAX_TRADES   = 2        # Scenario 1 trades per leg per day
 S2_MAX_TRADES   = 1        # Scenario 2: only 1 trade
 S2_BREAK_LEVEL  = "low"    # "low" or "close" of the first candle
 
-HEDGE_DISTANCE  = 300      # points away for the expiry-day hedge
 
-LOG_FILE = "nifty_atm_ema21_option_sell.log"
+LOG_FILE = "atm_ema21_option_sell.log"
 
 # =========================================================
 # LOGGING
@@ -134,37 +174,46 @@ SPECIAL_MARKET_HOLIDAYS = {          # NSE trading holidays 2026
 }
 
 
-def is_last_tuesday(d, holidays=SPECIAL_MARKET_HOLIDAYS):
-    is_tuesday   = d.weekday() == 1
-    is_last_week = (d + datetime.timedelta(days=7)).month != d.month
-    if is_tuesday and is_last_week:
-        return not (d in holidays)
-    if d.weekday() == 0:
-        next_day = d + datetime.timedelta(days=1)
-        is_last_week_tuesday = (next_day + datetime.timedelta(days=7)).month != next_day.month
-        if next_day in holidays and is_last_week_tuesday:
-            return True
-    return False
+def _shift_for_holidays(d):
+    """Move an expiry back to the previous trading day if it is a holiday/weekend."""
+    while d in SPECIAL_MARKET_HOLIDAYS or d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def _expiry_info():
+    """
+    Returns (actual_expiry_date, is_monthly) for the active index.
+    Scheduled expiry = next EXPIRY_WEEKDAY (Tue for NIFTY, Thu for SENSEX);
+    if that day is a holiday the expiry moves to the previous trading day.
+    Monthly = the scheduled day is the last such weekday of its month.
+    """
+    today = datetime.date.today()
+    scheduled = today + datetime.timedelta(days=(EXPIRY_WEEKDAY - today.weekday()) % 7)
+    actual = _shift_for_holidays(scheduled)
+
+    # Already past this week's (possibly shifted) expiry → next week
+    if actual < today or (actual == today and
+                          datetime.datetime.now().time() >= datetime.time(15, 30)):
+        scheduled += datetime.timedelta(days=7)
+        actual = _shift_for_holidays(scheduled)
+
+    is_monthly = (scheduled + datetime.timedelta(days=7)).month != scheduled.month
+    return actual, is_monthly
 
 
 def get_next_expiry():
-    today = datetime.date.today()
-    days  = (1 - today.weekday()) % 7
-    expiry = today + datetime.timedelta(days=days)
-    if today.weekday() == 1 and datetime.datetime.now().time() >= datetime.time(15, 30):
-        expiry += datetime.timedelta(days=7)
-    if expiry in SPECIAL_MARKET_HOLIDAYS:
-        expiry -= datetime.timedelta(days=1)
-    return expiry
+    return _expiry_info()[0]
 
 
 def is_expiry_day():
     return datetime.date.today() == get_next_expiry()
 
 
-def format_expiry(expiry):
+def format_expiry():
+    expiry, is_monthly = _expiry_info()
     yy = expiry.strftime("%y")
-    if is_last_tuesday(expiry):
+    if is_monthly:
         return f"{yy}{expiry.strftime('%b').upper()}"
     m, d  = expiry.month, expiry.day
     m_tok = {10: "O", 11: "N", 12: "D"}.get(m, str(m))
@@ -172,8 +221,7 @@ def format_expiry(expiry):
 
 
 def build_symbol(strike, opt_type):
-    expiry = format_expiry(get_next_expiry())
-    return f"NSE:NIFTY{expiry}{strike}{opt_type}"
+    return f"{OPTION_PREFIX}{format_expiry()}{strike}{opt_type}"
 
 
 # =========================================================
@@ -197,7 +245,7 @@ def get_920_index_close(fyers_client, max_wait_sec=90):
                 dt = datetime.datetime.fromtimestamp(c[0])
                 if dt.date() == today and dt.time() == FIRST_CANDLE:
                     close = c[4]
-                    logger.info(f"[SPOT] NIFTY50 9:20 candle close = {close:.2f}")
+                    logger.info(f"[SPOT] {INDEX_NAME} 9:20 candle close = {close:.2f}")
                     return close
         except Exception as e:
             logger.warning(f"[SPOT] history fetch failed: {e}")
@@ -566,8 +614,8 @@ class LegStrategy:
 # MAIN
 # =========================================================
 if __name__ == "__main__":
-    logger.info("[BOOT] NIFTY ATM EMA21 OPTION-SELLING STRATEGY STARTED")
-    send_telegram("🚀 NIFTY ATM EMA21 OPTION-SELLING STRATEGY STARTED")
+    logger.info(f"[BOOT] ATM EMA21 OPTION-SELLING STRATEGY STARTED — {INDEX_NAME}")
+    send_telegram(f"🚀 ATM EMA21 OPTION-SELLING STRATEGY STARTED — {INDEX_NAME}")
 
     fyers = FyersClient()
 
@@ -591,7 +639,8 @@ if __name__ == "__main__":
         f"expiry_day={expiry_today} CE_hedge={ce_hedge} PE_hedge={pe_hedge}"
     )
     send_telegram(
-        f"📌 STRIKE SELECTION (9:20 candle close)\n"
+        f"📌 {INDEX_NAME} STRIKE SELECTION (9:20 candle close)\n"
+        f"Expiry = {get_next_expiry():%a %d %b} | Lot qty = {LOT_SIZE}\n"
         f"Spot = {spot:.2f} | ATM = {atm}\n"
         f"CE (sell): {ce_symbol}\nPE (sell): {pe_symbol}\n"
         + (f"Expiry day — hedges:\nCE: {ce_hedge}\nPE: {pe_hedge}"
