@@ -114,19 +114,23 @@ def send_telegram(msg):
 # =========================================================
 # EXPIRY / SYMBOL UTILS
 # =========================================================
-SPECIAL_MARKET_HOLIDAYS = {
-    datetime.date(2026, 1, 26),
-    datetime.date(2026, 3, 3),
-    datetime.date(2026, 3, 26),
-    datetime.date(2026, 3, 31),
-    datetime.date(2026, 4, 14),
-    datetime.date(2026, 5, 1),
-    datetime.date(2026, 5, 28),
-    datetime.date(2026, 6, 26),
-    datetime.date(2026, 9, 14),
-    datetime.date(2026, 10, 2),
-    datetime.date(2026, 11, 24),
-    datetime.date(2026, 12, 25),
+SPECIAL_MARKET_HOLIDAYS = {          # NSE trading holidays 2026
+    datetime.date(2026, 1, 15),      # Maharashtra municipal elections
+    datetime.date(2026, 1, 26),      # Republic Day
+    datetime.date(2026, 3, 3),       # Holi
+    datetime.date(2026, 3, 26),      # Ram Navami
+    datetime.date(2026, 3, 31),      # Mahavir Jayanti
+    datetime.date(2026, 4, 3),       # Good Friday
+    datetime.date(2026, 4, 14),      # Ambedkar Jayanti
+    datetime.date(2026, 5, 1),       # Maharashtra Day
+    datetime.date(2026, 5, 28),      # Bakri Id
+    datetime.date(2026, 6, 26),      # Muharram
+    datetime.date(2026, 9, 14),      # Ganesh Chaturthi
+    datetime.date(2026, 10, 2),      # Gandhi Jayanti
+    datetime.date(2026, 10, 20),     # Dussehra (Tue → expiry Mon 19 Oct)
+    datetime.date(2026, 11, 10),     # Diwali Balipratipada (Tue → expiry Mon 9 Nov)
+    datetime.date(2026, 11, 24),     # Guru Nanak Jayanti (Tue → expiry Mon 23 Nov)
+    datetime.date(2026, 12, 25),     # Christmas
 }
 
 
@@ -264,6 +268,7 @@ def fetch_historical_candles(fyers_client, symbol, wait_for_first=True, max_wait
     today    = datetime.date.today()
     deadline = time.time() + max_wait_sec
     candles  = []
+    r        = None
 
     while True:
         to_dt   = datetime.datetime.now()
@@ -297,8 +302,23 @@ def fetch_historical_candles(fyers_client, symbol, wait_for_first=True, max_wait
             break
         time.sleep(3)
 
-    logger.info(f"[PREFILL] {symbol}: {len(candles)} candles loaded")
-    return candles
+    today_c = [c for c in candles if c["time"].date() == today]
+    logger.info(
+        f"[PREFILL] {symbol}: {len(candles)} candles loaded "
+        f"({len(today_c)} today"
+        + (f", {today_c[0]['time']:%H:%M}–{today_c[-1]['time']:%H:%M}" if today_c else "")
+        + ")"
+    )
+
+    if not candles:
+        reason = (f"Fyers returned NO data for {symbol} — symbol probably wrong "
+                  f"(check expiry/holiday list). API response: {str(r)[:300]}")
+    elif not today_c:
+        reason = f"history has old candles but none for today for {symbol}"
+    else:
+        reason = (f"today's candles start at {today_c[0]['time']:%H:%M}, "
+                  f"no 9:15 candle for {symbol}")
+    return candles, reason
 
 
 # =========================================================
@@ -334,6 +354,11 @@ class LegStrategy:
         self.position     = None
         self.trades_taken = 0
         self.lock         = threading.RLock()
+
+        # While replaying today's already-closed candles at startup (e.g. a
+        # restart at 10:30) we only rebuild scenario / day high — no orders
+        # are placed on old candles. Live candles turn this off.
+        self.replaying    = False
 
     @property
     def max_trades(self):
@@ -516,6 +541,9 @@ class LegStrategy:
         if self.trades_taken >= self.max_trades:
             return
 
+        if self.replaying:
+            return   # never trade on a replayed (old) candle
+
         # A candle closing at 3:00 PM must not open a trade
         candle_close_time = (candle["time"] + datetime.timedelta(minutes=CANDLE_MINUTES)).time()
         if candle_close_time >= TRADING_END:
@@ -579,13 +607,14 @@ if __name__ == "__main__":
     # ── Prefill: past days warm up EMA21; today's closed candles go through
     #    the strategy (first candle → scenario, later ones → signals) ──
     today = datetime.date.today()
-    now   = datetime.datetime.now()
     for symbol, engine in engines.items():
-        hist = fetch_historical_candles(fyers.client, symbol)
+        hist, reason = fetch_historical_candles(fyers.client, symbol)
+        now = datetime.datetime.now()
         for c in hist:
             if c["time"].date() < today:
                 engine.candles.append(c)
 
+        engine.replaying = True
         for c in hist:
             if c["time"].date() != today:
                 continue
@@ -593,11 +622,12 @@ if __name__ == "__main__":
                 engine.on_closed_candle(c)
             else:
                 live_candle[symbol] = dict(c)   # still-forming candle
+        engine.replaying = False
 
         if engine.scenario is None:
             engine.scenario = 0
-            logger.warning(f"[{engine.label}] 9:15 option candle not found — no trade today")
-            send_telegram(f"⚠️ {engine.label} 9:15 option candle not found — no trade today")
+            logger.warning(f"[{engine.label}] 9:15 candle not found — no trade today. {reason}")
+            send_telegram(f"⚠️ {engine.label} 9:15 candle not found — no trade today.\n{reason}")
 
     # ── EOD watchdog (in case ticks dry up near 3:00 PM) ──
     def eod_watchdog():
