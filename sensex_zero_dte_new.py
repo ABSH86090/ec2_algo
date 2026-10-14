@@ -34,7 +34,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 INDEX_SYMBOL  = "BSE:SENSEX-INDEX"
 LOT_SIZE      = 20
-LOTS          = 4               # number of lots per leg
+LOTS          = 6               # number of lots per leg
 QTY           = LOT_SIZE * LOTS # total qty per leg = 80
 
 SL_MULT         = 2.00          # SL = 200% of entry price (2 x entry)
