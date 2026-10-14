@@ -55,19 +55,23 @@ ENTRY_TIME     = datetime.time(9, 16, 0)
 HARD_EXIT_TIME = datetime.time(15, 30, 0)
 LOG_FILE       = "sensex_dte0_otm4_trailing_strangle.log"
 
-SPECIAL_MARKET_HOLIDAYS = {
-    datetime.date(2026, 1, 26),
-    datetime.date(2026, 3, 3),
-    datetime.date(2026, 3, 26),
-    datetime.date(2026, 3, 31),
-    datetime.date(2026, 4, 14),
-    datetime.date(2026, 5, 1),
-    datetime.date(2026, 5, 28),
-    datetime.date(2026, 6, 26),
-    datetime.date(2026, 9, 14),
-    datetime.date(2026, 10, 2),
-    datetime.date(2026, 11, 24),
-    datetime.date(2026, 12, 25),
+SPECIAL_MARKET_HOLIDAYS = {          # NSE trading holidays 2026
+    datetime.date(2026, 1, 15),      # Maharashtra municipal elections
+    datetime.date(2026, 1, 26),      # Republic Day
+    datetime.date(2026, 3, 3),       # Holi
+    datetime.date(2026, 3, 26),      # Ram Navami
+    datetime.date(2026, 3, 31),      # Mahavir Jayanti
+    datetime.date(2026, 4, 3),       # Good Friday
+    datetime.date(2026, 4, 14),      # Ambedkar Jayanti
+    datetime.date(2026, 5, 1),       # Maharashtra Day
+    datetime.date(2026, 5, 28),      # Bakri Id
+    datetime.date(2026, 6, 26),      # Muharram
+    datetime.date(2026, 9, 14),      # Ganesh Chaturthi
+    datetime.date(2026, 10, 2),      # Gandhi Jayanti
+    datetime.date(2026, 10, 20),     # Dussehra (Tue → expiry Mon 19 Oct)
+    datetime.date(2026, 11, 10),     # Diwali Balipratipada (Tue → expiry Mon 9 Nov)
+    datetime.date(2026, 11, 24),     # Guru Nanak Jayanti (Tue → expiry Mon 23 Nov)
+    datetime.date(2026, 12, 25),     # Christmas
 }
 
 # ================= LOGGING =================
