@@ -1,11 +1,15 @@
 # =====================================================================
-# SENSEX FIRST-CANDLE EMA / EMA200 / CPR  ->  BUY ATM OPTION (LIVE)
+# SENSEX FIRST-CANDLE EMA / TREND-EMA / DAILY-EMA / CPR  ->  BUY ATM OPTION (LIVE)
 #
 # Entry logic  : identical to the backtest (5-min setup candles at 09:15 / 09:20)
+# Day filter   : trade only if previous-day CPR width <= MAX_CPR_WIDTH_PCT
 # BUY signal   : buy ATM CE      SELL signal : buy ATM PE
 # Expiry rule  : nearest expiry is DTE0 or DTE1 -> use the NEXT expiry,
 #                otherwise use the nearest expiry
-# SL / Target  : on the INDEX (SL = setup candle low/high, target = RR x risk)
+# SL / Target  : on the INDEX
+#                BUY  SL = setup low  + SL_CANDLE_FRACTION x range
+#                SELL SL = setup high - SL_CANDLE_FRACTION x range
+#                target = RR_MULTIPLE x risk
 # Hard exit    : HARD_EXIT_TIME
 # =====================================================================
 
@@ -41,17 +45,37 @@ INDEX_SYMBOL = "BSE:SENSEX-INDEX"
 TIMEFRAME = "5"
 CANDLE_MIN = 5
 
-EMA_PERIOD = 9
-EMA_TREND_PERIOD = 200
+EMA_PERIOD = 5                 # fast 5-min EMA (proximity + close filter)
+EMA_TREND_PERIOD = 20          # 5-min trend EMA (column key kept as "ema200" like the backtest)
+
+# Daily trend filter: BUY only if setup close > daily EMA, SELL only if < daily EMA.
+DAILY_EMA_PERIOD = 100
+# "live" -> yesterday's daily EMA updated with the setup candle's close (as a chart shows it)
+# "prev" -> yesterday's final daily EMA, unchanged
+DAILY_EMA_MODE = "live"
+
 MAX_WICK_PCT = 0.25
 EMA_PROXIMITY_PCT = 0.70
 SETUP_CANDLE_TIMES = [datetime.time(9, 15), datetime.time(9, 20)]
 MAX_TRADES_PER_DAY = 1
-RR_MULTIPLE = 2.0
+
+# SL inside the setup candle, measured from the end against the trade.
+SL_CANDLE_FRACTION = 0.3
+
+# Trade only on narrow-CPR days (TC - BC as % of pivot).
+MAX_CPR_WIDTH_PCT = 0.20
+
+RR_MULTIPLE = 2.5
 HARD_EXIT_TIME = datetime.time(15, 0)
 
-# 5-min history pulled for EMA200 warm-up and previous-day CPR (< 100-day API cap)
+# 5-min history pulled for the 5-min EMAs at each setup (single request, < 100-day API cap)
 HISTORY_DAYS = 35
+
+# 5-min history pulled once at startup to build daily OHLC (for CPR + daily EMA),
+# exactly like the backtest does. ~600 calendar days (~410 trading days) lets the
+# daily EMA100 fully converge to the backtest's value. Fetched in chunks.
+DAILY_HISTORY_DAYS = 600
+CHUNK_DAYS = 90               # Fyers caps intraday history at 100 days per request
 
 # ---------- execution ----------
 PAPER_TRADE = False          # True = no real orders, fills simulated at option LTP. Set False to go live.
@@ -134,39 +158,56 @@ def ema(series, period):
 
 
 def compute_cpr(day):
+    """CPR from the previous day's high, low and close."""
     h, l, c = day["high"], day["low"], day["close"]
     p = (h + l + c) / 3
     bc = (h + l) / 2
     tc = 2 * p - bc
-    return {"BC": min(bc, tc), "TC": max(bc, tc), "P": p}
+    top, bottom = max(bc, tc), min(bc, tc)
+    width_pct = (top - bottom) / p * 100
+    return {"BC": bottom, "TC": top, "P": p, "width_pct": width_pct}
 
 
-def check_setup(c, cpr):
+def daily_ema_at_setup(prev_daily_ema, setup_close):
+    """Daily EMA value as seen at the setup candle, without using today's final close."""
+    if DAILY_EMA_MODE == "prev":
+        return prev_daily_ema
+    alpha = 2 / (DAILY_EMA_PERIOD + 1)
+    return alpha * setup_close + (1 - alpha) * prev_daily_ema
+
+
+def check_setup(c, cpr, daily_ema):
     """Returns (side, reason): side is "BUY", "SELL" or None. Same rules as the backtest."""
     rng = c["high"] - c["low"]
     if rng <= 0:
         return None, "zero range"
 
+    # ---------- BUY ----------
     if c["close"] > c["open"]:
         if c["close"] <= c["ema200"]:
-            return None, "BUY: close not above EMA200"
+            return None, f"BUY: close not above EMA{EMA_TREND_PERIOD}"
+        if c["close"] <= daily_ema:
+            return None, f"BUY: close not above daily EMA{DAILY_EMA_PERIOD}"
         if c["close"] <= c["ema"]:
-            return None, "BUY: close not above EMA"
-        if c["close"] <= cpr["P"]:
-            return None, "BUY: close not above pivot"
+            return None, f"BUY: close not above EMA{EMA_PERIOD}"
+        if c["close"] <= cpr["TC"]:
+            return None, "BUY: close not above TC"
         if abs(c["low"] - c["ema"]) > EMA_PROXIMITY_PCT / 100 * c["ema"]:
             return None, "BUY: low not near EMA"
         if (c["high"] - c["close"]) > MAX_WICK_PCT * rng:
             return None, "BUY: upper wick too big"
         return "BUY", "ok"
 
+    # ---------- SELL ----------
     if c["close"] < c["open"]:
         if c["close"] >= c["ema200"]:
-            return None, "SELL: close not below EMA200"
+            return None, f"SELL: close not below EMA{EMA_TREND_PERIOD}"
+        if c["close"] >= daily_ema:
+            return None, f"SELL: close not below daily EMA{DAILY_EMA_PERIOD}"
         if c["close"] >= c["ema"]:
-            return None, "SELL: close not below EMA"
-        if c["close"] >= cpr["P"]:
-            return None, "SELL: close not below pivot"
+            return None, f"SELL: close not below EMA{EMA_PERIOD}"
+        if c["close"] >= cpr["BC"]:
+            return None, "SELL: close not below BC"
         if abs(c["high"] - c["ema"]) > EMA_PROXIMITY_PCT / 100 * c["ema"]:
             return None, "SELL: high not near EMA"
         if (c["close"] - c["low"]) > MAX_WICK_PCT * rng:
@@ -174,6 +215,20 @@ def check_setup(c, cpr):
         return "SELL", "ok"
 
     return None, "doji (close = open)"
+
+
+def sl_target(side, setup, entry):
+    """SL inside the setup candle, target = RR x risk. Same as backtest simulate_trade."""
+    rng = float(setup["high"]) - float(setup["low"])
+    if side == "BUY":
+        sl = float(setup["low"]) + SL_CANDLE_FRACTION * rng
+        risk = entry - sl
+        target = entry + RR_MULTIPLE * risk
+    else:
+        sl = float(setup["high"]) - SL_CANDLE_FRACTION * rng
+        risk = sl - entry
+        target = entry - RR_MULTIPLE * risk
+    return sl, risk, target
 
 
 # ======================================================
@@ -185,8 +240,8 @@ class Broker:
             client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path=""
         )
 
-    def history(self, symbol, start, end):
-        resp = self.client.history({
+    def _history_req(self, symbol, start, end):
+        return self.client.history({
             "symbol": symbol,
             "resolution": TIMEFRAME,
             "date_format": "1",
@@ -194,9 +249,30 @@ class Broker:
             "range_to": end.strftime("%Y-%m-%d"),
             "cont_flag": "1",
         })
+
+    def history(self, symbol, start, end):
+        resp = self._history_req(symbol, start, end)
         if resp.get("s") != "ok" or not resp.get("candles"):
             raise RuntimeError(f"history failed: {resp}")
         return resp["candles"]
+
+    def history_chunked(self, symbol, start, end):
+        """Long 5-min history in CHUNK_DAYS pieces. Any API error aborts (so the daily
+        EMA is never computed on a gappy series)."""
+        out = []
+        cur = start
+        while cur <= end:
+            chunk_end = min(cur + datetime.timedelta(days=CHUNK_DAYS), end)
+            resp = self._history_req(symbol, cur, chunk_end)
+            if resp.get("s") == "ok":
+                out.extend(resp.get("candles") or [])
+            elif resp.get("s") != "no_data":
+                raise RuntimeError(f"history failed for {cur} -> {chunk_end}: {resp}")
+            cur = chunk_end + datetime.timedelta(days=1)
+            time.sleep(0.3)
+        if not out:
+            raise RuntimeError("history returned no candles")
+        return out
 
     def ltp(self, symbol):
         r = self.client.quotes({"symbols": symbol})
@@ -327,9 +403,8 @@ class OptionMaster:
 # ======================================================
 # MARKET DATA
 # ======================================================
-def load_candles(broker, today):
-    """5-min index candles with EMA9 / EMA200, processed exactly like the backtest."""
-    candles = broker.history(INDEX_SYMBOL, today - datetime.timedelta(days=HISTORY_DAYS), today)
+def candles_to_df(candles):
+    """Same processing as the backtest's fetch_history."""
     df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
     df["time"] = (
         pd.to_datetime(df["ts"], unit="s", utc=True)
@@ -340,19 +415,43 @@ def load_candles(broker, today):
     df.sort_index(inplace=True)
     df = df.between_time("09:15", "15:30")
     df = df[~df.index.duplicated(keep="first")]
+    return df
+
+
+def load_candles(broker, today):
+    """5-min index candles with the fast EMA and trend EMA."""
+    candles = broker.history(INDEX_SYMBOL, today - datetime.timedelta(days=HISTORY_DAYS), today)
+    df = candles_to_df(candles)
     df["ema"] = ema(df["close"], EMA_PERIOD)
     df["ema200"] = ema(df["close"], EMA_TREND_PERIOD)
     return df
 
 
-def prev_day_cpr(df, today):
+def load_daily_context(broker, today):
+    """
+    Builds daily OHLC from 5-min candles (09:15-15:30) exactly like the backtest, then
+    returns the previous day's CPR and the previous day's final daily EMA.
+    """
+    candles = broker.history_chunked(
+        INDEX_SYMBOL, today - datetime.timedelta(days=DAILY_HISTORY_DAYS), today
+    )
+    df = candles_to_df(candles)
     past = df[df.index.date < today]
     daily = past.resample("1D").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last"}
     ).dropna()
-    if daily.empty:
-        raise RuntimeError("No previous trading day in history for CPR")
-    return compute_cpr(daily.iloc[-1]), daily.index[-1].date()
+    if len(daily) < DAILY_EMA_PERIOD * 2:
+        raise RuntimeError(
+            f"Only {len(daily)} daily bars for daily EMA{DAILY_EMA_PERIOD} - need more history"
+        )
+    daily["dema"] = ema(daily["close"], DAILY_EMA_PERIOD)
+    prev = daily.iloc[-1]
+    return {
+        "cpr": compute_cpr(prev),
+        "prev_dema": float(prev["dema"]),
+        "prev_day": daily.index[-1].date(),
+        "n_days": len(daily),
+    }
 
 
 # ======================================================
@@ -381,11 +480,12 @@ def save_state(state):
 # TRADER
 # ======================================================
 class LiveTrader:
-    def __init__(self, broker, master, today, cpr):
+    def __init__(self, broker, master, today, cpr, prev_dema):
         self.broker = broker
         self.master = master
         self.today = today
         self.cpr = cpr
+        self.prev_dema = prev_dema
         self.lock = threading.RLock()
         self.last_ltp = None
         self.last_tick = 0.0
@@ -446,12 +546,14 @@ class LiveTrader:
                 notify(f"⚠️ {tag}: setup candle not available from history - skipped", logging.WARNING)
                 continue
 
-            side, why = check_setup(candle, self.cpr)
+            daily_ema = daily_ema_at_setup(self.prev_dema, float(candle["close"]))
+            side, why = check_setup(candle, self.cpr, daily_ema)
             notify(
                 f"🔎 {tag} setup: {side or 'NO TRADE'} ({why})\n"
                 f"O={candle['open']:.2f} H={candle['high']:.2f} L={candle['low']:.2f} C={candle['close']:.2f}\n"
                 f"EMA{EMA_PERIOD}={candle['ema']:.2f} EMA{EMA_TREND_PERIOD}={candle['ema200']:.2f} "
-                f"P={self.cpr['P']:.2f}"
+                f"Daily EMA{DAILY_EMA_PERIOD}={daily_ema:.2f}\n"
+                f"TC={self.cpr['TC']:.2f} BC={self.cpr['BC']:.2f}"
             )
             if side:
                 self.enter(side, candle, tag)
@@ -476,17 +578,9 @@ class LiveTrader:
             notify(f"❌ ENTRY ABORTED: could not get index LTP ({e})", logging.ERROR)
             return
 
-        if side == "BUY":
-            sl = float(setup["low"])
-            risk = ltp - sl
-            target = ltp + RR_MULTIPLE * risk
-        else:
-            sl = float(setup["high"])
-            risk = sl - ltp
-            target = ltp - RR_MULTIPLE * risk
-
+        sl, risk, target = sl_target(side, setup, ltp)
         if risk <= 0:
-            notify(f"⏭ {tag} {side}: index {ltp} already past SL {sl} - skipped")
+            notify(f"⏭ {tag} {side}: index {ltp} already at/past SL {sl:.2f} - skipped")
             return
 
         try:
@@ -654,9 +748,27 @@ def main():
     broker = Broker()
 
     try:
+        ctx = load_daily_context(broker, today)
+    except Exception as e:
+        notify(f"❌ STARTUP FAILED: {e}", logging.ERROR)
+        raise
+
+    cpr, prev_dema, prev_day = ctx["cpr"], ctx["prev_dema"], ctx["prev_day"]
+
+    # A restart with an open position must keep monitoring it, even on a wide-CPR day
+    has_open_position = load_state(today)["position"] is not None
+
+    if cpr["width_pct"] > MAX_CPR_WIDTH_PCT and not has_open_position:
+        notify(
+            f"⏸ NO TRADE TODAY - wide CPR\n"
+            f"CPR from {prev_day}: width {cpr['width_pct']:.3f}% > {MAX_CPR_WIDTH_PCT}%\n"
+            f"P={cpr['P']:.2f} TC={cpr['TC']:.2f} BC={cpr['BC']:.2f}"
+        )
+        return
+
+    try:
         master = OptionMaster()
-        df = load_candles(broker, today)
-        cpr, prev_day = prev_day_cpr(df, today)
+        load_candles(broker, today)          # sanity check that intraday history works
         expiry, nearest, dte = master.choose_expiry(today)
     except Exception as e:
         notify(f"❌ STARTUP FAILED: {e}", logging.ERROR)
@@ -664,12 +776,15 @@ def main():
 
     notify(
         f"🚀 STRATEGY STARTED {'(PAPER)' if PAPER_TRADE else '(LIVE)'}\n"
-        f"CPR from {prev_day}: P={cpr['P']:.2f} TC={cpr['TC']:.2f} BC={cpr['BC']:.2f}\n"
+        f"CPR from {prev_day}: P={cpr['P']:.2f} TC={cpr['TC']:.2f} BC={cpr['BC']:.2f} "
+        f"width={cpr['width_pct']:.3f}%\n"
+        f"Daily EMA{DAILY_EMA_PERIOD} (prev close) = {prev_dema:.2f} [{ctx['n_days']} daily bars, mode={DAILY_EMA_MODE}]\n"
+        f"EMA{EMA_PERIOD} / EMA{EMA_TREND_PERIOD} | SL frac={SL_CANDLE_FRACTION} | RR={RR_MULTIPLE}\n"
         f"Nearest expiry {nearest} (DTE{dte}) -> trading {expiry}\n"
         f"Lots={LOTS}"
     )
 
-    trader = LiveTrader(broker, master, today, cpr)
+    trader = LiveTrader(broker, master, today, cpr, prev_dema)
     ws = start_websocket(trader)
 
     try:
