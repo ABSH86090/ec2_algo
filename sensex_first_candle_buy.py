@@ -60,10 +60,10 @@ SETUP_CANDLE_TIMES = [datetime.time(9, 15), datetime.time(9, 20)]
 MAX_TRADES_PER_DAY = 1
 
 # SL inside the setup candle, measured from the end against the trade.
-SL_CANDLE_FRACTION = 0.3
+SL_CANDLE_FRACTION = 0.45
 
 # Trade only on narrow-CPR days (TC - BC as % of pivot).
-MAX_CPR_WIDTH_PCT = 0.20
+MAX_CPR_WIDTH_PCT = 0.30
 
 RR_MULTIPLE = 2.5
 HARD_EXIT_TIME = datetime.time(15, 0)
