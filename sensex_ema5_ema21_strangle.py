@@ -125,6 +125,7 @@ NSE_HOLIDAYS = {                    # BSE follows the same trading holidays
     datetime.date(2026, 12, 25),
 }
 
+
 # ================= LOGGING =================
 logging.basicConfig(
     level=logging.INFO,
