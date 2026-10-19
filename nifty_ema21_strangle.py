@@ -96,7 +96,7 @@ HEDGE_DISTANCE_0DTE = 700           # CE hedge = CE strike + this, PE hedge = PE
 HEDGE_DISTANCE_OTHER = 1000
 
 # ---------- execution ----------
-PAPER_TRADE = True                  # True = no real orders (fills at LTP). Set False to go live.
+PAPER_TRADE = False                  # True = no real orders (fills at LTP). Set False to go live.
 PRODUCT_TYPE = "MARGIN"             # Fyers carry-forward (NRML) - no broker auto square-off
 
 MARKET_HOLIDAYS = {                 # NSE F&O holidays 2026 (weekdays) - keep updated
