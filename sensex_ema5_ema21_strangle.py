@@ -72,10 +72,10 @@ UNDERLYING = "SENSEX"
 STRIKE_STEP = 100
 
 # Strikes (same as backtest)
-CE_OTM_STEPS = 2                    # expiry day
-PE_OTM_STEPS = 2
-NONEXP_CE_OTM_STEPS = 5             # non-expiry days
-NONEXP_PE_OTM_STEPS = 5
+CE_OTM_STEPS = 3                    # expiry day
+PE_OTM_STEPS = 3
+NONEXP_CE_OTM_STEPS = 4             # non-expiry days
+NONEXP_PE_OTM_STEPS = 4
 HEDGE_DISTANCE = 2000               # hedge strikes this many points beyond the shorts
 STRIKE_TIME = datetime.time(9, 16)
 
@@ -88,8 +88,8 @@ SKIP_SAME_DAY_EXPIRY = False
 
 # Candles / indicators
 RESOLUTION = 5
-EMA_FAST = 5
-EMA_SLOW = 21
+EMA_FAST = 3
+EMA_SLOW = 15
 WARMUP_DAYS = 2
 
 # Pattern / entry
