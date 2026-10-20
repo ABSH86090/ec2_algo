@@ -51,10 +51,10 @@ IST = ZoneInfo("Asia/Kolkata")
 INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
 UNDERLYING = "NIFTY"
 STRIKE_STEP = 50
-CE_OTM_STEPS = 2                    # expiry day: OTM2 CE
-PE_OTM_STEPS = 3                    # expiry day: OTM3 PE
-NONEXP_CE_OTM_STEPS = 4             # other days: OTM4 CE
-NONEXP_PE_OTM_STEPS = 4             # other days: OTM4 PE
+CE_OTM_STEPS = 1                    # expiry day: OTM2 CE
+PE_OTM_STEPS = 1                    # expiry day: OTM3 PE
+NONEXP_CE_OTM_STEPS = 2             # other days: OTM4 CE
+NONEXP_PE_OTM_STEPS = 2             # other days: OTM4 PE
 STRIKE_TIME = datetime.time(9, 16)  # spot 1-min candle used to pick ATM ...
 STRIKE_PRICE_FIELD = "open"         # ... its open = the price at 09:16:00
 TRADE_DTE = {0, 1}                  # trading days to expiry to trade; None = every day
