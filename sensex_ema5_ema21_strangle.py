@@ -22,6 +22,9 @@
 #       - Minutes after that are built from live ticks (history fills any gaps).
 # 4. Pattern (evaluated at every 5-min candle close, exactly as the backtest):
 #       a. Day filter : 09:15 candle RED and closes BELOW EMA21, else no trade.
+#                       Strength  : its close must also be in the bottom
+#                       FIRST_CANDLE_CLOSE_PCT of its range,
+#                       (close - low) <= FIRST_CANDLE_CLOSE_PCT x (high - low).
 #       b. Setup      : later GREEN candle closing above EMA5 and EMA21.
 #       c. Trigger    : next RED candle closing below EMA5 and EMA21 with
 #                       EMA5 < EMA21 -> enter right after it closes.
@@ -94,6 +97,10 @@ WARMUP_DAYS = 2
 
 # Pattern / entry
 FIRST_CANDLE = datetime.time(9, 15)
+# Strong bearish first candle: its close must lie within this fraction of the
+# candle's range from its LOW, i.e. (close - low) <= FIRST_CANDLE_CLOSE_PCT x (high - low).
+# 0.10 -> close in the bottom 10% of the candle. None -> no strength check.
+FIRST_CANDLE_CLOSE_PCT = 0.10
 ENTRY_LATEST = datetime.time(15, 0)  # trigger candle must CLOSE by this time
 MAX_TRADES_PER_DAY = 1
 SL_BUFFER = 0.0
@@ -257,6 +264,16 @@ def build_combined(ce, pe):
     c["green"] = c["close"] > c["open"]
     c["red"] = c["close"] < c["open"]
     return c
+
+
+def first_candle_strength(row):
+    """Where the close sits inside the candle's range, 0 = at the low, 1 = at the high.
+    Returns (passed, fraction)."""
+    rng = float(row["high"] - row["low"])
+    if rng <= 0:
+        return False, 1.0
+    frac = float(row["close"] - row["low"]) / rng
+    return (row["close"] - row["low"]) <= FIRST_CANDLE_CLOSE_PCT * rng + 1e-9, frac
 
 
 def find_setup(d, start_ts):
@@ -564,11 +581,24 @@ class Bot:
             why = "not red" if not first["red"] else "closed above EMA21"
             return self.mark_done(f"Day filter failed: {FIRST_CANDLE:%H:%M} candle {why} "
                                   f"(C={first['close']:.2f}, EMA21={first['ema21']:.2f})")
+
+        # Strong bearish first candle: close within the bottom FIRST_CANDLE_CLOSE_PCT of its range
+        strength_txt = ""
+        if FIRST_CANDLE_CLOSE_PCT is not None:
+            ok, frac = first_candle_strength(first)
+            strength_txt = (f", close at {frac:.0%} of range "
+                            f"(<= {FIRST_CANDLE_CLOSE_PCT:.0%})")
+            if not ok:
+                return self.mark_done(
+                    f"Day filter failed: {FIRST_CANDLE:%H:%M} candle not strong enough -- "
+                    f"close at {frac:.0%} of range from low, need <= {FIRST_CANDLE_CLOSE_PCT:.0%} "
+                    f"(H={first['high']:.2f} L={first['low']:.2f} C={first['close']:.2f})")
+
         if not self.state["filter_passed"]:
             self.state["filter_passed"] = True
             self.save()
             alert(f"✅ Day filter passed: {FIRST_CANDLE:%H:%M} combined candle red, "
-                  f"C={first['close']:.2f} < EMA21={first['ema21']:.2f}")
+                  f"C={first['close']:.2f} < EMA21={first['ema21']:.2f}{strength_txt}")
 
         start = (pd.Timestamp(self.state["search_start"]) if self.state["search_start"]
                  else first_ts + self.candle_len)
