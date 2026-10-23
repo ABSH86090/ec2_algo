@@ -10,8 +10,10 @@
 #   * COMBINED chart (CE + PE) in 5-min candles built from 1-min data
 #     ("minute" method), EMA21 on the combined close, warmed up on the same
 #     two contracts over the previous WARMUP_DAYS trading days.
-#   * Entry: first RED combined candle of the day = reference. Then the first
-#     later RED candle that CLOSES below the reference LOW and below EMA21
+#   * Entry: first STRONG RED combined candle of the day = reference
+#     (red AND close within the bottom REF_CLOSE_PCT of its range;
+#     REF_CLOSE_PCT = None -> any red candle). Then the first later RED
+#     candle that CLOSES below the reference LOW and below EMA21
 #     -> SELL CE and PE at its close. One trade per day.
 #   * SL = entry (combined candle close) + 70% of the 09:15 candle's range,
 #     capped at MAX_SL_POINTS above entry.
@@ -51,8 +53,8 @@ IST = ZoneInfo("Asia/Kolkata")
 INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
 UNDERLYING = "NIFTY"
 STRIKE_STEP = 50
-CE_OTM_STEPS = 1                    # expiry day: OTM2 CE
-PE_OTM_STEPS = 1                    # expiry day: OTM3 PE
+CE_OTM_STEPS = 2                    # expiry day: OTM2 CE
+PE_OTM_STEPS = 3                    # expiry day: OTM3 PE
 NONEXP_CE_OTM_STEPS = 2             # other days: OTM4 CE
 NONEXP_PE_OTM_STEPS = 2             # other days: OTM4 PE
 STRIKE_TIME = datetime.time(9, 16)  # spot 1-min candle used to pick ATM ...
@@ -68,12 +70,16 @@ WARMUP_DAYS = 2
 FIRST_CANDLE = datetime.time(9, 15)
 ENTRY_LATEST = None                 # breakdown candle must CLOSE by this time; None = until EXIT_TIME
 REQUIRE_BELOW_EMA = True
+# Reference candle = first STRONG bearish candle of the day: red AND its close
+# within the bottom REF_CLOSE_PCT of its range (close <= low + pct x (high - low)).
+# None -> any red candle counts (original behaviour).
+REF_CLOSE_PCT = 0.075
 SL_MODE = "range"                   # "range" or "high" (see backtest)
 SL_RANGE_PCT = 0.70
 SL_FROM = "entry"                   # "entry" or "low"
 SL_CANDLE = "first"                 # for SL_MODE="high": "first" / "first_red" / "breakdown"
 SL_BUFFER = 0.0
-MAX_SL_POINTS = 60                  # None = no limit
+MAX_SL_POINTS = 40                  # None = no limit
 MAX_SL_MODE = "cap"                 # "cap" or "skip"
 SL_FROM_FILL = True                 # True -> SL = actual combined fill + the SL distance
                                     # (if the fill slips, the SL moves with it, so a bad
@@ -188,6 +194,16 @@ def trading_days_to_expiry(day, expiry):
 
 def hedge_distance(dte0):
     return HEDGE_DISTANCE_0DTE if dte0 else HEDGE_DISTANCE_OTHER
+
+
+def is_strong_red(o, h, l, cl):
+    """Red candle whose close sits in the bottom REF_CLOSE_PCT of its range.
+    With REF_CLOSE_PCT = None any red candle qualifies."""
+    if not cl < o:
+        return False
+    if REF_CLOSE_PCT is None:
+        return True
+    return cl <= l + REF_CLOSE_PCT * (h - l)
 
 
 def candles_to_df(candles):
@@ -418,7 +434,7 @@ def load_state(today):
     blank = {"date": today.isoformat(), "contract": None, "legs": {},
              "last_candle": None,       # start of the last processed 5-min candle
              "first": None,             # 09:15 combined candle {high, low}
-             "ref": None,               # first red combined candle {time, high, low}
+             "ref": None,               # first strong red combined candle {time, high, low}
              "signal_done": False, "note": "",
              "position": None, "trades": []}
     try:
@@ -593,11 +609,19 @@ class LiveTrader:
 
         red = cl < o
         if s["ref"] is None:
-            if red:
-                s["ref"] = {"time": tag, "high": h, "low": l}
+            # close position inside the candle's range: 0% = at the low, 100% = at the high
+            close_pos = (cl - l) / (h - l) if h > l else 0.0
+            if is_strong_red(o, h, l, cl):
+                s["ref"] = {"time": tag, "high": h, "low": l, "close_pos": round(close_pos, 4)}
                 save_state(s)
-                notify(f"🔴 First red combined candle {tag} - watching for a red close "
+                strong_txt = (f" (close at {close_pos:.1%} of range <= {REF_CLOSE_PCT:.1%})"
+                              if REF_CLOSE_PCT is not None else "")
+                notify(f"🔴 First {'strong ' if REF_CLOSE_PCT is not None else ''}red combined "
+                       f"candle {tag}{strong_txt} - watching for a red close "
                        f"< {l:.2f}{' and < EMA21' if REQUIRE_BELOW_EMA else ''}\n{info}")
+            elif red:
+                logger.info(f"{tag} red but not strong: close at {close_pos:.1%} of range "
+                            f"> {REF_CLOSE_PCT:.1%} - not a reference")
             return
 
         ref = s["ref"]
@@ -918,6 +942,8 @@ def main():
         return
 
     lots = EXPIRY_LOTS if ct["dte0"] else NONEXP_LOTS
+    ref_txt = (f"strong red (close in bottom {REF_CLOSE_PCT:.1%} of range)"
+               if REF_CLOSE_PCT is not None else "any red")
     notify(
         f"🚀 COMBINED EMA21 STRANGLE STARTED {'(PAPER)' if PAPER_TRADE else '(LIVE)'}\n"
         f"Nifty {ct['spot']} ({ct['spot_src']}) -> ATM {ct['atm']}\n"
@@ -925,6 +951,7 @@ def main():
         f"CE {legs['CE']['symbol']} (OTM{ct['ce_steps']}) + PE {legs['PE']['symbol']} "
         f"(OTM{ct['pe_steps']})\nQty {legs['CE']['lot']} x {lots} lots"
         f"{' | hedge ' + str(hedge_distance(ct['dte0'])) + ' pts OTM' if HEDGE_ENABLED else ' | no hedge'}\n"
+        f"Reference candle: {ref_txt}\n"
         f"SL {SL_RANGE_PCT:.0%} of 09:15 range (max {MAX_SL_POINTS}) | SL check {SL_CHECK} | "
         f"exit {EXIT_TIME:%H:%M}"
     )
