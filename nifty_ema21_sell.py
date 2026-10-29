@@ -85,7 +85,7 @@ def hedge_distance(dte0):
 
 # ---------- execution ----------
 PAPER_TRADE = False                        # LIVE: real orders. True = no real orders (fills at LTP).
-LOTS = 1                                   # qty = LOTS x lot size from the symbol master
+LOTS = 4                                   # qty = LOTS x lot size from the symbol master
 PRODUCT_TYPE = "INTRADAY"
 
 MARKET_HOLIDAYS = {                        # NSE F&O holidays 2026 (weekdays) - keep updated
