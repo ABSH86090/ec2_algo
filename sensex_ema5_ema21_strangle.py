@@ -110,8 +110,8 @@ EXIT_TIME = datetime.time(15, 29, 0)
 
 # Size  (verify the current Sensex lot size with your broker)
 LOT_SIZE = 20
-EXPIRY_LOTS = 3
-NONEXP_LOTS = 4
+EXPIRY_LOTS = 4
+NONEXP_LOTS = 5
 
 # Orders
 PRODUCT_TYPE = "MARGIN"             # carry-forward product -> no 15:20 auto square-off
