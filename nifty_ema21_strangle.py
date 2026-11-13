@@ -93,8 +93,8 @@ SL_CHECK = "minute"                 # "tick"   -> exit the moment CE LTP + PE LT
                                     #             backtest's "minute" candles, fewer wick hits)
 
 # ---------- size ----------
-EXPIRY_LOTS = 3                     # lots on expiry day
-NONEXP_LOTS = 4                     # lots on other days (lot size comes from the symbol master)
+EXPIRY_LOTS = 4                     # lots on expiry day
+NONEXP_LOTS = 5                     # lots on other days (lot size comes from the symbol master)
 
 # ---------- hedge ----------
 HEDGE_ENABLED = True                # buy far-OTM CE + PE before the sells (backtest had no hedge)
